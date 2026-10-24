@@ -11,5 +11,6 @@ WasmCodegen.with_trim_patches() do _, _
     include("exceptions.jl")
     include("coverage.jl")
     include("linalg.jl")
+    include("eachindex_trim.jl")
     include("juliac/runtests.jl")
 end
