@@ -703,6 +703,8 @@ function emit_expr!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return const_value(fc, fc.info.mi.sparam_vals[ex.args[1]::Int])
     elseif head === :foreigncall
         return emit_foreigncall!(fc, ex, typ)
+    elseif head === :cfunction
+        return emit_cfunction!(fc, ex, typ)
     elseif head in NOOP_HEADS
         return nothing
     elseif head === :gc_preserve_begin

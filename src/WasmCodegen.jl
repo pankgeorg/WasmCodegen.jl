@@ -35,6 +35,7 @@ include("runtime/types.jl")
 include("runtime/eqtable.jl")
 include("runtime/blas.jl")
 include("runtime/lapack.jl")
+include("runtime/fwrappers.jl")
 end
 include("interpreter.jl")
 include("collect.jl")

@@ -334,13 +334,16 @@ end
 function struct_global!(img::Image, @nospecialize(x), l::Layout)
     ts = types(img)
     T = typeof(x)
+    fwptrs = img.cgm.config.funcref_wrappers ? funcwrapper_ptr_fields!(img, x) : nothing
     push!(img.inprogress, x)
     back = Any[]
     init = Inst[Inst(:i32_const, typeid!(ts, T)), header_hash(img, x)]
     try
         for i in 1:fieldcount(T)
             FT = fieldtype(T, i)
-            if isdefined(x, i)
+            if fwptrs !== nothing && i <= 2
+                append!(init, fwptrs[i])
+            elseif isdefined(x, i)
                 append!(init, field_init!(img, getfield(x, i), FT, back, first(l.fields[i]) - 1))
             else
                 append!(init, Inst[default_inst(leaf.type) for leaf in field_leaves(ts, FT)])
@@ -622,4 +625,33 @@ function finish_image!(cgm::CGModule)
     end
     finish!(b)
     cgm.mod.start = f
+end
+
+"""
+    funcwrapper_ptr_fields!(img, x) -> Union{Nothing, Tuple{Vector{Inst}, Vector{Inst}}}
+
+For a `FunctionWrappers.FunctionWrapper` object built natively (`Config(funcref_wrappers = true)`):
+the leaves of its two pointer fields in the image. The code pointer becomes a pointer owned by a
+box holding the reference to the trampoline compiled for the wrapped object's type, the object
+pointer a pointer owned by the `Ref` of the object, as `emit_cfunction!` builds them at run time
+(`runtime/fwrappers.jl`). `nothing` for every other object.
+"""
+function funcwrapper_ptr_fields!(img::Image, @nospecialize(x))
+    FW = funcwrappers_module()
+    FW === nothing && return nothing
+    T = typeof(x)
+    (T isa DataType && T.name === FW.FunctionWrapper.body.body.name) || return nothing
+    cgm = img.cgm
+    ts = types(img)
+    Ret, Args = T.parameters
+    objT = x.objT
+    callee = FW.CallWrapper{Ret}()
+    argts = Any[Ref{objT}, (FW.map_cfunc_argtype(A) for A in Args.parameters)...]
+    rt = FW.map_rettype(Ret)
+    info = cfunc_trampoline!(cgm, callee, rt, argts)
+    bg = add_global!(cgm.mod, global_name(img, x) * "_fptr", RefType(funcptr_box_type!(ts, info.func.type), false),
+                     false, funcptr_box_init(ts, info.func, info.func.type))
+    objg = object_global!(img, x.obj)
+    return (Inst[Inst(:i64_const, 1), Inst(:global_get, bg)],
+            Inst[Inst(:i64_const, 1), Inst(:global_get, objg)])
 end

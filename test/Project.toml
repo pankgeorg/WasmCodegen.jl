@@ -1,6 +1,7 @@
 [deps]
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
+FunctionWrappers = "069b7b12-0de2-55c6-9aab-29f3d0a68a2e"
 IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 NodeJS_24_jll = "30a2228f-09fe-513d-9563-0d10bd40449a"
@@ -16,4 +17,5 @@ WasmBuilder = {rev = "main", url = "https://github.com/gbaraldi/WasmBuilder.jl"}
 WasmCodegen = {path = ".."}
 
 [compat]
+FunctionWrappers = "1.1"
 JSON = "1"

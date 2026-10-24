@@ -594,6 +594,9 @@ that is the first argument. With one thread, the loads and stores they are. Othe
 unsupported.
 """
 function emit_llvmcall!(fc::FnCtx, args::Vector{CGVal}, @nospecialize(R))
+    # `llvm.assume` (FunctionWrappers' `assume`) is an optimizer hint: nothing to compile
+    fc.cgm.config.funcref_wrappers && isconstant(args[1]) && llvm_assume_only(constant_value(args[1])) &&
+        return ghost(Nothing, nothing)
     ir = isconstant(args[1]) ? constant_value(args[1]) : nothing
     ir isa Tuple && (ir = ir[1])
     vals = args[4:end]
@@ -635,4 +638,17 @@ function emit_llvmcall!(fc::FnCtx, args::Vector{CGVal}, @nospecialize(R))
     end
     ptr_store!(fc, p, new, one_)
     return old
+end
+
+# whether an llvmcall (a body, or a (module, entry) pair) does nothing but `call @llvm.assume`
+# (with the `trunc` of its argument and `ret void`)
+function llvm_assume_only(code)
+    body = code isa Tuple && length(code) == 2 ? code[1] : code
+    body isa AbstractString || return false
+    occursin("@llvm.assume", body) || return false
+    m = match(r"\{\n(.*?)\n\s*\}"s, body)
+    lines = split(m === nothing ? body : m[1], '\n')
+    exec = filter(l -> !isempty(l) && !startswith(l, "declare ") && !startswith(l, "attributes "), strip.(lines))
+    return !isempty(exec) && all(l -> l == "ret void" || occursin("call void @llvm.assume", l) ||
+                                        (startswith(l, "%") && occursin(" = trunc ", l)), exec)
 end

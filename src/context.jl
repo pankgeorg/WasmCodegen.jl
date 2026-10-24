@@ -29,6 +29,9 @@ Base.@kwdef struct Config
     callee with arguments of known types compile to a direct call of the method the program world
     dispatches to (a closed world has one world)."
     direct_world_calls::Bool = false
+    "`cfunction` pointers and calls through them (`FunctionWrappers`) compile to typed Wasm
+    function references (`runtime/fwrappers.jl`)."
+    funcref_wrappers::Bool = false
 end
 
 """

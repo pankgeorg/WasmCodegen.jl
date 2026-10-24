@@ -14,5 +14,6 @@ WasmCodegen.with_trim_patches() do _, _
     include("eachindex_trim.jl")
     include("task_fields.jl")
     include("world_calls.jl")
+    include("function_wrappers.jl")
     include("juliac/runtests.jl")
 end

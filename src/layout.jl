@@ -494,6 +494,20 @@ end
 
 "The field of the array of the objects of `Memory`, `String` and `Symbol`."
 const DATA_FIELD = HEADER_FIELDS
+
+"""
+    funcptr_box_type!(ts, sig) -> TypeRef
+
+The Wasm struct type of the boxes that own function pointers: the header and a nullable
+reference to a function of type `sig` (field `DATA_FIELD`). See `runtime/fwrappers.jl`.
+"""
+function funcptr_box_type!(ts::Types, sig::TypeRef)
+    get!(ts.boxes, (:funcptr, sig)) do
+        add_type!(ts.mod, StructType([FieldType(I32, false), FieldType(I32, true),
+                                       FieldType(RefType(sig, true), false)]);
+                  final=true, super=ts.jlvalue)
+    end
+end
 "The index of the hash of a `Symbol` object (after its bytes)."
 const SYMBOL_HASH_FIELD = DATA_FIELD + 1
 

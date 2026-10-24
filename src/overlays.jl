@@ -41,6 +41,10 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
         push_val!(fc, convert_repr(fc, b, UInt8))
         call!(fc.b, host_import!(fc.cgm, "write_byte", ValType[I32, I32], ValType[]))
         return ghost(Nothing, nothing)
+    elseif fc.cgm.config.funcref_wrappers && m.module === funcwrappers_module() && m.name === :reinit_wrapper
+        # only reached when a wrapper's pointer is null, which the image and `emit_cfunction!` never produce
+        unreachable!(fc.b)
+        return bottom()
     elseif m.module === Runtime && m.name === :map_type
         f = mi.specTypes.parameters[2]
         return emit_map_type!(fc, f.instance, operand(fc, ex.args[4]))
