@@ -54,6 +54,10 @@ end
 The tuple of type `T` (concrete or not) of the values `vals`.
 """
 function make_tuple(fc::FnCtx, @nospecialize(T), vals::Vector{CGVal})
+    # a pair of constant strings (an `llvmcall`'s module IR and entry name) stays a constant: the
+    # `llvmcall` lowering reads the IR from it
+    (length(vals) == 2 && all(v -> isconstant(v) && constant_value(v) isa String, vals)) &&
+        return const_value(fc, (constant_value(vals[1]), constant_value(vals[2])))
     l = layout(fc, T)
     l.kind === Boxed && l.elements !== nothing && return new_tuple_array!(fc, T, vals)
     if !isconcretetype(T) && !is_inline_tuple(T)
