@@ -25,6 +25,10 @@ Base.@kwdef struct Config
     The code generator emits simple code (a local per value) and leaves allocating locals,
     putting values on the operand stack and the rest to it."
     optimize::Union{Nothing,Cmd} = `-O3`
+    "`Core._call_in_world` / `Core._call_latest` (`invoke_in_world`, `invokelatest`) of a constant
+    callee with arguments of known types compile to a direct call of the method the program world
+    dispatches to (a closed world has one world)."
+    direct_world_calls::Bool = false
 end
 
 """

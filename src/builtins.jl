@@ -376,6 +376,8 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
         return outlined_memorynew!(fc, constant_value(args[1]), args[2])
     elseif f === Core._apply_iterate
         return emit_apply_iterate!(fc, args, typ)
+    elseif f === Core._call_in_world || f === Core._call_latest
+        return emit_world_call!(fc, f, args, typ)
     elseif f === Core.apply_type
         all(a -> a isa CGVal && isconstant(a), args) &&
             return const_value(fc, Core.apply_type(map(constant_value, args)...))
@@ -851,6 +853,35 @@ end
 memory_type(@nospecialize(R)) = GenericMemory{R.parameters[1],R.parameters[2],R.parameters[3]}
 
 eltype_intersects(@nospecialize(A), @nospecialize(B)) = typeintersect(A, B) !== Union{}
+
+"""
+    emit_world_call!(fc, f, args, typ) -> CGVal
+
+`Core._call_in_world(world, f, args...)` and `Core._call_latest(f, args...)`, what
+`Base.invoke_in_world` and `Base.invokelatest` lower to. A closed-world module has one
+world, so with `Config(direct_world_calls = true)` a call whose callee is a constant and
+whose arguments have known types is the direct call of the method the program world
+dispatches to (added to the closed world as a runtime function is). Keyword calls arrive
+as `Core.kwcall` with the named tuple first and resolve the same way.
+"""
+function emit_world_call!(fc::FnCtx, @nospecialize(f), args::Vector{Any}, @nospecialize(typ))
+    fc.cgm.config.direct_world_calls || unsupported("the builtin ", f)
+    rest = f === Core._call_in_world ? args[2:end] : args
+    isempty(rest) && unsupported("a world call without a callee")
+    callee = rest[1]
+    (callee isa CGVal && isconstant(callee)) ||
+        unsupported("a world call of a function value of type ", callee isa CGVal ? callee.typ : callee)
+    cargs = CGVal[]
+    for a in rest[2:end]
+        a isa CGVal || unsupported("a world call with a multi-value argument")
+        (isconstant(a) || isconcretetype(a.typ)) ||
+            unsupported("a world call with an argument of abstract type ", a.typ)
+        push!(cargs, a)
+    end
+    argtypes = Tuple(isconstant(a) ? Core.Typeof(constant_value(a)) : a.typ for a in cargs)
+    info = runtime_function!(fc.cgm, constant_value(callee), argtypes)
+    return emit_call_info!(fc, info, CGVal[callee, cargs...])
+end
 
 """
     emit_apply_iterate!(fc, args, typ) -> CGVal
