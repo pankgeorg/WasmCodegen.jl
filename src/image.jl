@@ -241,6 +241,11 @@ function object_global!(img::Image, @nospecialize(x))
         return g
     elseif T === Core.SimpleVector
         return tuple_array_global!(img, x, l)
+    elseif any(R -> T === R, OPAQUE_RUNTIME_TYPES)
+        # an object the program holds but does not read (a CodeInstance kept in a build
+        # record): the header only, so that `===` and `typeof` work; a field read of it is
+        # reported by get_field
+        return opaque_object_global!(img, x)
     elseif any(R -> T === R, RUNTIME_TYPES)
         unsupported("serializing the runtime object ", x, " of type ", T)
     elseif T <: Ptr || T === Ptr
@@ -622,4 +627,15 @@ function finish_image!(cgm::CGModule)
     end
     finish!(b)
     cgm.mod.start = f
+end
+
+# runtime objects serialized with their header only (modules are named objects, above)
+const OPAQUE_RUNTIME_TYPES = Any[Core.CodeInstance, Core.MethodInstance, Method]
+
+function opaque_object_global!(img::Image, @nospecialize(x))
+    ts = types(img)
+    init = Inst[Inst(:i32_const, typeid!(ts, typeof(x))), header_hash(img, x), Inst(:struct_new, ts.jlvalue)]
+    g = add_global!(img.cgm.mod, global_name(img, x), RefType(ts.jlvalue, false), false, init)
+    img.globals[x] = g
+    return g
 end
