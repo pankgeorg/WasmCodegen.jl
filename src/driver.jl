@@ -122,6 +122,12 @@ function emit_module(w::ClosedWorld, mis::Vector{Core.MethodInstance}, entries::
         end
         process_worklist!(cgm)
         compile_runtime_cases!(cgm)
+        # serializing deferred image values can need functions and types of their own: to a fixed
+        # point of preparing them, emitting the functions and compiling the runtime cases
+        while prepare_image_patches!(cgm) || !isempty(cgm.worklist)
+            process_worklist!(cgm)
+            compile_runtime_cases!(cgm)
+        end
         # the runtime functions the code needed (added to the world as it was emitted) may
         # use exceptions more than the program did: then again, as they need
         m = exception_mode(w)
