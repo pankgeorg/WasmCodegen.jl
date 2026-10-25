@@ -67,9 +67,17 @@ The hash field of the header of the object `x`: of a mutable object, -k for its 
 """
 function header_hash(img::Image, @nospecialize(x))
     ismutable(x) && !(x isa String) || return Inst(:i32_const, 0)
-    push!(img.native_ids, objectid(x))
-    return Inst(:i32_const, -Int32(length(img.native_ids)))
+    return Inst(:i32_const, image_hash!(img, objectid(x)))
 end
+
+"A new identity hash of the image, for an object whose native `objectid` is `id`."
+function image_hash!(img::Image, id::UInt64)
+    push!(img.native_ids, id)
+    return -Int32(length(img.native_ids))
+end
+
+"The identity hash `header_hash` gave the serialized (or in progress) mutable object `x`."
+image_hash(img::Image, @nospecialize(x)) = -Int32(findfirst(==(objectid(x)), img.native_ids))
 
 types(img::Image) = img.cgm.types
 
@@ -384,12 +392,13 @@ end
 function struct_global!(img::Image, @nospecialize(x), l::Layout)
     ts = types(img)
     T = typeof(x)
-    fwptrs = img.cgm.config.funcref_wrappers ? funcwrapper_ptr_fields!(img, x) : nothing
-    img.cgm.config.shell_first_mutables && ismutabletype(T) && return mutable_global!(img, x, l, fwptrs)
+    img.cgm.config.shell_first_mutables && ismutabletype(T) && return mutable_global!(img, x, l)
     push!(img.inprogress, x)
     back = Any[]
     init = Inst[Inst(:i32_const, typeid!(ts, T)), header_hash(img, x)]
     try
+        # (after `x` is in progress, so that an object reached from the wrapped callable may refer back to it)
+        fwptrs = img.cgm.config.funcref_wrappers ? funcwrapper_ptr_fields!(img, x, l, back) : nothing
         for i in 1:fieldcount(T)
             FT = fieldtype(T, i)
             if fwptrs !== nothing && i <= 2
@@ -702,39 +711,62 @@ function finish_image!(cgm::CGModule)
     cgm.mod.start = f
 end
 
+"The callee, return type and argument types of the `cfunction` of a `FunctionWrapper{Ret,Args}` of an `objT`."
+function funcwrapper_cfunction(FW::Module, @nospecialize(Ret), @nospecialize(Args), @nospecialize(objT))
+    callee = FW.CallWrapper{Ret}()
+    argts = Any[Ref{objT}, (FW.map_cfunc_argtype(A) for A in Args.parameters)...]
+    return callee, FW.map_rettype(Ret), argts
+end
+
+function is_funcwrapper(@nospecialize(x))
+    FW = funcwrappers_module()
+    FW === nothing && return false
+    T = typeof(x)
+    return T isa DataType && T.name === Base.invokelatest(getglobal, FW, :FunctionWrapper).body.body.name
+end
+
 """
-    funcwrapper_ptr_fields!(img, x) -> Union{Nothing, Tuple{Vector{Inst}, Vector{Inst}}}
+    funcwrapper_ptr_fields!(img, x, l, back) -> Union{Nothing, Tuple{Vector{Inst}, Vector{Inst}}}
 
 For a `FunctionWrappers.FunctionWrapper` object built natively (`Config(funcref_wrappers = true)`):
 the leaves of its two pointer fields in the image. The code pointer becomes a pointer owned by a
 box holding the reference to the trampoline compiled for the wrapped object's type, the object
 pointer a pointer owned by the `Ref` of the object, as `emit_cfunction!` builds them at run time
-(`runtime/fwrappers.jl`). `nothing` for every other object.
+(`runtime/fwrappers.jl`). If that `Ref` is being serialized (the wrapper is reachable from its own
+callable), the owner is set afterwards, as for any field referring back (`back`, `l`: the
+wrapper's layout). `nothing` for every other object.
 """
-function funcwrapper_ptr_fields!(img::Image, @nospecialize(x))
+function funcwrapper_ptr_fields!(img::Image, @nospecialize(x), l::Layout, back::Vector{Any})
     FW = funcwrappers_module()
     FW === nothing && return nothing
     T = typeof(x)
-    (T isa DataType && T.name === FW.FunctionWrapper.body.body.name) || return nothing
+    # FunctionWrappers may have been loaded after WasmCodegen, so its bindings and methods are not in
+    # the compiler's world: they are read in the latest one
+    FWT = Base.invokelatest(getglobal, FW, :FunctionWrapper)
+    (T isa DataType && T.name === FWT.body.body.name) || return nothing
     cgm = img.cgm
     ts = types(img)
     Ret, Args = T.parameters
     objT = x.objT
-    callee = FW.CallWrapper{Ret}()
-    argts = Any[Ref{objT}, (FW.map_cfunc_argtype(A) for A in Args.parameters)...]
-    rt = FW.map_rettype(Ret)
+    callee, rt, argts = Base.invokelatest(funcwrapper_cfunction, FW, Ret, Args, objT)
     info = cfunc_trampoline!(cgm, callee, rt, argts)
-    bg = add_global!(cgm.mod, global_name(img, x) * "_fptr", RefType(funcptr_box_type!(ts, info.func.type), false),
-                     false, funcptr_box_init(ts, info.func, info.func.type))
-    objg = object_global!(img, x.obj)
-    return (Inst[Inst(:i64_const, 1), Inst(:global_get, bg)],
-            Inst[Inst(:i64_const, 1), Inst(:global_get, objg)])
+    bg, addr = funcptr_box!(cgm, info)
+    code = Inst[Inst(:i64_const, addr), Inst(:global_get, bg)]
+    # the object pointer: the `Ref`'s virtual address (its identity hash << 32, as a pointer made to it
+    # at run time) and the `Ref`, set once it exists if it is being serialized (field 2's second leaf)
+    o = x.obj
+    if o in img.inprogress
+        push!(back, (first(l.fields[2]), o, typeof(o)))
+        return (code, Inst[Inst(:i64_const, owner_address(image_hash(img, o))), Inst(:ref_null, ts.jlvalue)])
+    end
+    objg = object_global!(img, o)
+    return (code, Inst[Inst(:i64_const, owner_address(image_hash(img, o))), Inst(:global_get, objg)])
 end
 
 # With `Config(shell_first_mutables = true)` a mutable object exists before its fields: its global
 # holds a shell (header and default fields), so that any object reached from its fields may refer
 # back to it, and the start function sets its fields.
-function mutable_global!(img::Image, @nospecialize(x), l::Layout, fwptrs = nothing)
+function mutable_global!(img::Image, @nospecialize(x), l::Layout)
     ts = types(img)
     T = typeof(x)
     init = Inst[Inst(:i32_const, typeid!(ts, T)), header_hash(img, x)]
@@ -744,15 +776,14 @@ function mutable_global!(img::Image, @nospecialize(x), l::Layout, fwptrs = nothi
     push!(init, Inst(:struct_new, l.wtype))
     g = add_global!(img.cgm.mod, global_name(img, x), RefType(l.wtype, false), false, init)
     img.globals[x] = g
+    # a FunctionWrapper's two pointer fields: one deferred patch, prepared by `funcwrapper_ptr_fields!`
+    fw = img.cgm.config.funcref_wrappers && is_funcwrapper(x)
+    fw && push!(img.patches, (g, :fwptrs, l.wtype, 0, x, l, img.owner))
     for i in 1:fieldcount(T)
         isdefined(x, i) || continue
         FT = fieldtype(T, i)
         isempty(field_leaves(ts, FT)) && continue
-        if fwptrs !== nothing && i <= 2
-            # a FunctionWrapper's pointers: leaves prepared by `funcwrapper_ptr_fields!`
-            push!(img.patches, (g, :struct_insts, l.wtype, first(l.fields[i]) - 1, fwptrs[i], FT))
-            continue
-        end
+        fw && i <= 2 && continue
         push!(img.patches, (g, :struct, l.wtype, first(l.fields[i]) - 1, getfield(x, i), FT, img.owner))
     end
     return g
@@ -785,6 +816,28 @@ function prepare_image_patches!(cgm::CGModule)
         i += 1
         p = img.patches[i]
         g, kind, wtype, idx, v, FT = p
+        if kind === :fwptrs
+            x, l = v, FT
+            owner = length(p) >= 7 ? p[7] : nothing
+            back = Any[]
+            ptrs = try
+                with_image_owner(() -> funcwrapper_ptr_fields!(img, x, l, back), img, owner)
+            catch err
+                err isa Unsupported || rethrow()
+                deferred_value_failed!(cgm, err, owner, typeof(x))
+                nothing
+            end
+            isempty(back) || error("a FunctionWrapper's object in progress while deferred values are prepared")
+            T = typeof(x)
+            if ptrs === nothing
+                img.patches[i] = (g, :failed, wtype, idx, nothing, T)
+            else
+                img.patches[i] = (g, :struct_insts, wtype, first(l.fields[1]) - 1, ptrs[1], fieldtype(T, 1))
+                push!(img.patches, (g, :struct_insts, wtype, first(l.fields[2]) - 1, ptrs[2], fieldtype(T, 2)))
+            end
+            prepared = true
+            continue
+        end
         (kind === :struct || kind === :array) || continue
         owner = length(p) >= 7 ? p[7] : nothing
         leaves = try

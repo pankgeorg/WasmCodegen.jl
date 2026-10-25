@@ -23,10 +23,10 @@ end
 """
 `fw_trampoline` for arguments of singleton types, which FunctionWrappers passes as `Ref{T}` in the
 `cfunction` and as `Any` in the `ccall`: such an argument arrives as the object itself and is asserted
-back to its type. `S` holds the argument types after the object's `Ref` with each such `Ref{T}`
-replaced by `T` (a concrete tuple type, so `Type{S}` takes no parameter) and `M` marks those
-positions. One method per arity, so that every argument is a parameter of its own (a vararg tuple
-with an `Any` element would be one boxed parameter).
+back to its type. `S` holds, for the arguments after the object's `Ref`, each such argument's type
+`T` and `Nothing` for the others (a concrete tuple type, so `Type{S}` takes no parameter), and `M`
+marks the singleton positions. One method per arity, so that every argument is a parameter of its
+own (a vararg tuple with an `Any` element would be one boxed parameter).
 """
 function fw_trampoline_singletons end
 for n in 1:8
