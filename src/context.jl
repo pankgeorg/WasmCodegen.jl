@@ -27,7 +27,9 @@ Base.@kwdef struct Config
     optimize::Union{Nothing,Cmd} = `-O3`
     "`Core._call_in_world` / `Core._call_latest` (`invoke_in_world`, `invokelatest`) of a constant
     callee with arguments of known types compile to a direct call of the method the program world
-    dispatches to (a closed world has one world)."
+    dispatches to. A world known at compile time must be one in which that code is valid (else
+    unsupported); a world known only at run time is assumed to be (nothing the call runs
+    redefined after it)."
     direct_world_calls::Bool = false
     "`cfunction` pointers and calls through them (`FunctionWrappers`) compile to typed Wasm
     function references (`runtime/fwrappers.jl`)."

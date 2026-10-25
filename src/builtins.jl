@@ -866,7 +866,9 @@ eltype_intersects(@nospecialize(A), @nospecialize(B)) = typeintersect(A, B) !== 
 world, so with `Config(direct_world_calls = true)` a call whose callee is a constant and
 whose arguments have known types is the direct call of the method the program world
 dispatches to (added to the closed world as a runtime function is). Keyword calls arrive
-as `Core.kwcall` with the named tuple first and resolve the same way.
+as `Core.kwcall` with the named tuple first and resolve the same way. A world known at
+compile time must be one in which that code is valid (no method it runs redefined since),
+else the call is unsupported; a world known only at run time is assumed to be.
 """
 function emit_world_call!(fc::FnCtx, @nospecialize(f), args::Vector{Any}, @nospecialize(typ))
     fc.cgm.config.direct_world_calls || unsupported("the builtin ", f)
@@ -884,6 +886,24 @@ function emit_world_call!(fc::FnCtx, @nospecialize(f), args::Vector{Any}, @nospe
     end
     argtypes = Tuple(isconstant(a) ? Core.Typeof(constant_value(a)) : a.typ for a in cargs)
     info = runtime_function!(fc.cgm, constant_value(callee), argtypes)
+    if f === Core._call_in_world && args[1] isa CGVal && isconstant(args[1])
+        # a known world: the compiled call is the program world's, so in that world the callee
+        # must select the same method, and the world must be within the validity of the code
+        # compiled for it (which inference narrows for every method that code relies on)
+        w = UInt(constant_value(args[1]))
+        w <= fc.cgm.world.world || unsupported("a world call in a world newer than the program's")
+        mw = try
+            entry_instance(constant_value(callee), argtypes; world=w).def
+        catch
+            nothing
+        end
+        mw === info.mi.def ||
+            unsupported("a world call whose method in world ", w, " differs from the program's")
+        ci = fc.cgm.world.sources[info.mi][1]
+        ci.min_world <= w <= ci.max_world ||
+            unsupported("a world call in world ", w, ", outside the worlds ", ci.min_world, ":",
+                        ci.max_world, " in which its compiled code is valid")
+    end
     return emit_call_info!(fc, info, CGVal[callee, cargs...])
 end
 
