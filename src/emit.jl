@@ -26,7 +26,12 @@ the closed world.
 """
 function get_function!(cgm::CGModule, mi::Core.MethodInstance)
     info = get(cgm.funcs, mi, nothing)
-    info === nothing || return info
+    if info !== nothing
+        img = cgm.image
+        # an optional function that a program function needs too is no longer optional
+        info in img.optional && !(img.optional_mode || img.owner in img.optional) && promote_optional!(cgm, info)
+        return info
+    end
     src = get(cgm.world.sources, mi, nothing)
     src === nothing && unsupported("a call of ", mi, ", which is not in the closed world")
     ci, _ = src
@@ -40,8 +45,28 @@ function get_function!(cgm::CGModule, mi::Core.MethodInstance)
     func = add_func!(cgm.mod, function_name(cgm, mi), params, results)
     info = FuncInfo(mi, func, argtypes, rettype)
     cgm.funcs[mi] = info
+    # first needed by an optional function (or while its values are serialized): optional too
+    img = cgm.image
+    if img.optional_mode || img.owner in img.optional
+        push!(img.optional, info)
+        img.owner in img.optional && push!(get!(() -> Any[], img.optional_children, img.owner), info)
+    end
     push!(cgm.worklist, info)
     return info
+end
+
+# The errors an optional function had become the program's (its code stays as compiled: an
+# unsupported statement traps), and so do the optional functions it needed first.
+function promote_optional!(cgm::CGModule, info::FuncInfo)
+    img = cgm.image
+    info in img.optional || return
+    delete!(img.optional, info)
+    errs = pop!(img.suppressed, info, Any[])
+    append!(cgm.diagnostics, errs)
+    info in img.failed_owners && (img.failed = true)
+    for c in pop!(img.optional_children, info, Any[])
+        promote_optional!(cgm, c)
+    end
 end
 
 """
@@ -52,22 +77,31 @@ error, or with `on_unsupported = :trap`, a function that traps (recorded in
 `cgm.diagnostics`).
 """
 function process_worklist!(cgm::CGModule)
+    img = cgm.image
     while !isempty(cgm.worklist)
         info = popfirst!(cgm.worklist)
-        try
-            cgm.image.optional_mode && push!(cgm.image.optional, info)
-            with_image_owner(() -> emit_function!(cgm, info), cgm.image, info)
-        catch err
-            err isa Unsupported || rethrow()
-            push!(err.context, info.mi)
-            cgm.config.on_unsupported === :trap || rethrow()
-            push!(cgm.diagnostics, info.mi => err)
-            empty!(info.func.body)
-            empty!(info.func.locals)
-            b = Builder(cgm.mod, info.func)
-            unreachable!(b)
-            finish!(b)
+        img.optional_mode && push!(img.optional, info)
+        if info in img.optional && !img.optional_mode
+            with_optional_config(() -> emit_or_trap!(cgm, info), cgm)
+        else
+            emit_or_trap!(cgm, info)
         end
+    end
+end
+
+function emit_or_trap!(cgm::CGModule, info::FuncInfo)
+    try
+        with_image_owner(() -> emit_function!(cgm, info), cgm.image, info)
+    catch err
+        err isa Unsupported || rethrow()
+        push!(err.context, info.mi)
+        cgm.config.on_unsupported === :trap || rethrow()
+        push!(cgm.diagnostics, info.mi => err)
+        empty!(info.func.body)
+        empty!(info.func.locals)
+        b = Builder(cgm.mod, info.func)
+        unreachable!(b)
+        finish!(b)
     end
 end
 

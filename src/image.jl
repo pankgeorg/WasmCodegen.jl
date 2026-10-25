@@ -46,13 +46,17 @@ mutable struct Image
     dependents::IdDict{Any,Vector{Any}}
     "The optional functions whose deferred values failed."
     failed_owners::IdSet{Any}
+    "Per optional function: the errors not reported while it is optional, and the optional
+    functions it needed first."
+    suppressed::IdDict{Any,Vector{Any}}
+    optional_children::IdDict{Any,Vector{Any}}
 end
 
 Image(cgm) = Image(cgm, IdDict{Any,Global}(), IdDict{Any,Global}(), IdDict{Any,Global}(),
                    IdSet{Any}(), Inst[], Any[],
                    Dict{Tuple{Module,Symbol},Tuple{Any,Vector{Global},Union{Nothing,Global}}}(), IdDict{Any,Global}(), 0,
                    UInt64[], nothing, false, false, IdSet{Any}(), IdDict{Any,Any}(), IdDict{Any,Vector{Any}}(),
-                   IdSet{Any}())
+                   IdSet{Any}(), IdDict{Any,Vector{Any}}(), IdDict{Any,Vector{Any}}())
 
 """
     header_hash(img, x) -> Inst
@@ -163,7 +167,10 @@ function const_leaves(img::Image, @nospecialize(x), @nospecialize(FT))
     elseif lf.elements !== nothing && layout(ts, typeof(x)).elements === nothing
         # a tuple stored where the declared type is a tuple of unknown length (`VersionNumber`'s
         # `prerelease`): an array object of the declared element type
-        g = get!(() -> tuple_array_global!(img, x, lf; register=false), img.boxes, (x, lf.wtype))
+        key = (x, lf.wtype)
+        haskey(img.boxes, key) && (note_reach!(img, key); return Inst[Inst(:global_get, img.boxes[key])])
+        note_created!(img, key)
+        g = get!(() -> tuple_array_global!(img, x, lf; register=false), img.boxes, key)
         return Inst[Inst(:global_get, g)]
     end
     return Inst[Inst(:global_get, object_global!(img, x))]
@@ -188,6 +195,7 @@ function boxed_object_global!(img::Image, @nospecialize(x))
     end
     # isbits values are boxed once per value; others (Memory, String) per object
     haskey(img.boxes, x) && (note_reach!(img, x); return img.boxes[x])
+    note_created!(img, x)
     get!(img.boxes, x) do
         box = box_type!(ts, T)
         init = Inst[Inst(:i32_const, typeid!(ts, T)), Inst(:i32_const, 0)]
@@ -235,18 +243,21 @@ function object_global!(img::Image, @nospecialize(x))
         note_reach!(img, x)
         return g
     end
-    g = new_object_global!(img, x)
-    img.owner in img.optional && !haskey(img.created, x) && (img.created[x] = img.owner)
-    return g
+    note_created!(img, x)
+    return new_object_global!(img, x)
 end
 
-# an object serialized before by another function: an optional function's object makes the
-# function reaching it depend on that one's deferred values
+# `x` (an object, a box's value or a global variable's key) serialized first by an optional function
+note_created!(img::Image, @nospecialize(x)) =
+    img.owner in img.optional && !haskey(img.created, x) && (img.created[x] = img.owner)
+
+# an object, box or global variable serialized before by another function: an optional function's
+# makes the function reaching it depend on that one's deferred values
 function note_reach!(img::Image, @nospecialize(x))
     c = get(img.created, x, nothing)
     (c === nothing || c === img.owner) && return
     c in img.failed_owners &&
-        unsupported("an object whose deferred value could not be serialized (reached first by ", c.mi, ")")
+        unsupported("a value whose deferred value could not be serialized (reached first by ", c.mi, ")")
     push!(get!(() -> Any[], img.dependents, c), img.owner)
     return
 end
@@ -589,7 +600,8 @@ end
 
 function global_var!(img::Image, ref::GlobalRef)
     key = (ref.mod, ref.name)
-    haskey(img.vars, key) && return img.vars[key]
+    haskey(img.vars, key) && (note_reach!(img, key); return img.vars[key])
+    note_created!(img, key)
     T = Base.invoke_in_world(img.cgm.world.world, Core.get_binding_type, ref.mod, ref.name)
     ts = types(img)
     l = layout(ts, T)
@@ -805,6 +817,7 @@ function fail_owner!(cgm::CGModule, err::Unsupported, @nospecialize(owner))
     owner in img.failed_owners && return
     trap_function!(cgm, owner)
     push!(img.failed_owners, owner)
+    owner in img.optional && push!(get!(() -> Any[], img.suppressed, owner), owner.mi => err)
     if !(owner in img.optional)
         push!(err.context, owner.mi)
         push!(cgm.diagnostics, owner.mi => err)

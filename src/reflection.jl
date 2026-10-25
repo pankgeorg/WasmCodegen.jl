@@ -312,14 +312,7 @@ function compile_objectid_cases!(cgm::CGModule)
     ts = cgm.types
     # (compiled for every such type, whether or not its values are ever hashed: one whose
     # `objectid` cannot be compiled traps there, and is not an error of the program)
-    config, ndiag = cgm.config, length(cgm.diagnostics)
-    # the caller's options (serialization included), but an unsupported construct traps
-    kw = Dict{Symbol,Any}(n => getfield(config, n) for n in fieldnames(Config))
-    kw[:on_unsupported] = :trap
-    kw[:trim] = :unsafe
-    cgm.config = Config(; kw...)
-    cgm.image.optional_mode = true
-    try
+    with_optional_config(cgm) do
         while true
             n = length(cases)
             for (id, T) in enumerate(copy(ts.typelist))
@@ -329,9 +322,33 @@ function compile_objectid_cases!(cgm::CGModule)
             length(cases) == n && break
             process_worklist!(cgm)
         end
+    end
+end
+
+"""
+    with_optional_config(f, cgm)
+
+`f()` emitting optional functions: with the caller's options (serialization included), but an
+unsupported construct traps and is not an error of the program (its diagnostics are kept apart,
+for the case that a program function needs it later).
+"""
+function with_optional_config(f, cgm::CGModule)
+    config, ndiag, mode = cgm.config, length(cgm.diagnostics), cgm.image.optional_mode
+    kw = Dict{Symbol,Any}(n => getfield(config, n) for n in fieldnames(Config))
+    kw[:on_unsupported] = :trap
+    kw[:trim] = :unsafe
+    cgm.config = Config(; kw...)
+    cgm.image.optional_mode = true
+    try
+        return f()
     finally
-        cgm.image.optional_mode = false
+        cgm.image.optional_mode = mode
         cgm.config = config
+        # kept per function, in case a program function needs it later
+        for d in cgm.diagnostics[ndiag+1:end]
+            info = get(cgm.funcs, d.first, nothing)
+            info === nothing || push!(get!(() -> Any[], cgm.image.suppressed, info), d)
+        end
         resize!(cgm.diagnostics, ndiag)
     end
 end

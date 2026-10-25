@@ -102,6 +102,34 @@ module DeferredFailure
     nested(x::Float64) = x * OUTER.k
     VAR::Rec = Rec(TypeVar(:U), 4.0, nothing)
     fromvar(x::Float64) = x * VAR.k
+    # such an object reached through the box of a tuple held in an `Any` field, through a tuple stored
+    # as an array (a field of a tuple type of unknown length), and through a global variable, from two
+    # functions each: the second reaches only the cached box, array or variable
+    struct Holder
+        v::Any
+        id::Int
+    end
+    const TUP = (Rec(TypeVar(:V), 5.0, nothing), 1.0)
+    const SINK3 = Any[nothing]
+    const SINK4 = Any[nothing]
+    const HOLD3 = Holder(TUP, 3)
+    const HOLD4 = Holder(TUP, 4)
+    boxed3(x::Float64) = (SINK3[1] = HOLD3; x)
+    boxed4(x::Float64) = (SINK4[1] = HOLD4; x)
+    struct VHold
+        t::Tuple{Vararg{Rec}}
+        id::Int
+    end
+    const VTUP = (Rec(TypeVar(:X), 7.0, nothing),)
+    const SINK5 = Any[nothing]
+    const SINK6 = Any[nothing]
+    const VH5 = VHold(VTUP, 5)
+    const VH6 = VHold(VTUP, 6)
+    varr5(x::Float64) = (SINK5[1] = VH5; x)
+    varr6(x::Float64) = (SINK6[1] = VH6; x)
+    VAR2::Rec = Rec(TypeVar(:W), 6.0, nothing)
+    var3(x::Float64) = x * VAR2.k
+    var4(x::Float64) = x + VAR2.k
 end
 
 const SHELL_FIRST = WasmCodegen.Config(shell_first_mutables = true)
@@ -140,14 +168,17 @@ end
     W = WasmCodegen
     config = W.Config(shell_first_mutables = true, trim = :unsafe, verify = :off)
     world = Base.get_world_counter()
-    mis = [W.entry_instance(f, (Float64,); world) for f in (DeferredFailure.read, DeferredFailure.read2)]
-    for program_too in (false, true)
+    D = DeferredFailure
+    # the second function reaches the object directly, through the cached box, or through the global variable
+    for (fopt, fprog) in ((D.read, D.read2), (D.boxed3, D.boxed4), (D.varr5, D.varr6), (D.var3, D.var4)),
+            program_too in (false, true)
+        mis = [W.entry_instance(f, (Float64,); world) for f in (fopt, fprog)]
         cgm = W.CGModule(W.collect_world(mis; world, verify = :off), config)
         cgm.image.optional_mode = true
         opt = W.get_function!(cgm, mis[1])
         W.process_worklist!(cgm)
         cgm.image.optional_mode = false
-        prog = program_too ? W.get_function!(cgm, mis[2]) : nothing
+        program_too && W.get_function!(cgm, mis[2])
         W.process_worklist!(cgm)
         while W.prepare_image_patches!(cgm) || !isempty(cgm.worklist)
             W.process_worklist!(cgm)
@@ -157,4 +188,52 @@ end
         @test any(d -> d.first === mis[2], cgm.diagnostics) == program_too
         @test !any(d -> d.first === mis[1], cgm.diagnostics)
     end
+    # a function first needed while an optional function's values are serialized is optional too
+    mis = [W.entry_instance(f, (Float64,); world) for f in (D.read, D.fromvar)]
+    cgm = W.CGModule(W.collect_world(mis; world, verify = :off), config)
+    cgm.image.optional_mode = true
+    opt = W.get_function!(cgm, mis[1])
+    W.process_worklist!(cgm)
+    cgm.image.optional_mode = false
+    queued = W.with_image_owner(() -> W.get_function!(cgm, mis[2]), cgm.image, opt)
+    W.process_worklist!(cgm)
+    while W.prepare_image_patches!(cgm) || !isempty(cgm.worklist)
+        W.process_worklist!(cgm)
+    end
+    @test queued in cgm.image.optional
+    @test queued in cgm.image.failed_owners
+    @test !cgm.image.failed
+    @test isempty(cgm.diagnostics)
+end
+
+@testset "optional functions and the program's settings" begin
+    W = WasmCodegen
+    world = Base.get_world_counter()
+    # the caller's settings: an unsupported construct is an error of the program
+    config = W.Config(verify = :off)
+    cyc = W.entry_instance(ClosureCycle.run, (Float64,); world)
+    held = W.entry_instance(HoldsCodeInstance.run, (Float64,); world)
+    # a function queued while an optional function's values are serialized is emitted as optional:
+    # its unsupported construct (a cycle, without shell-first serialization) is not the program's
+    cgm = W.CGModule(W.collect_world([held, cyc]; world, verify = :off), config)
+    opt = W.with_optional_config(cgm) do
+        info = W.get_function!(cgm, held)
+        W.process_worklist!(cgm)
+        info
+    end
+    queued = W.with_image_owner(() -> W.get_function!(cgm, cyc), cgm.image, opt)
+    W.process_worklist!(cgm)
+    @test queued in cgm.image.optional
+    @test isempty(cgm.diagnostics)
+    # an optional function that a program function needs later: its error becomes the program's
+    cgm = W.CGModule(W.collect_world([cyc]; world, verify = :off), config)
+    first = W.with_optional_config(cgm) do
+        info = W.get_function!(cgm, cyc)
+        W.process_worklist!(cgm)
+        info
+    end
+    @test isempty(cgm.diagnostics)
+    @test W.get_function!(cgm, cyc) === first
+    @test !(first in cgm.image.optional)
+    @test any(d -> d.first === cyc, cgm.diagnostics)
 end
