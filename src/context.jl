@@ -55,6 +55,11 @@ Base.@kwdef struct Config
     patch_bindings::Vector{Pair{Symbol,Any}} = Pair{Symbol,Any}[]
     abi_version::Union{Nothing,Pair{String,Int32}} = nothing
     pre_image_hooks::Vector{Any} = Any[]
+    "Mutable objects of the image are created as shells (header and default fields) whose fields
+    the start function sets, so that a cycle back to a mutable object through closures or
+    immutable objects (an ODE integrator holding callbacks whose closures capture it) can be
+    serialized."
+    shell_first_mutables::Bool = false
 end
 
 """
