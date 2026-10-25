@@ -40,6 +40,9 @@ function get_function!(cgm::CGModule, mi::Core.MethodInstance)
     func = add_func!(cgm.mod, function_name(cgm, mi), params, results)
     info = FuncInfo(mi, func, argtypes, rettype)
     cgm.funcs[mi] = info
+    # first needed by an optional function (or while its values are serialized): optional too
+    img = cgm.image
+    (img.optional_mode || img.owner in img.optional) && push!(img.optional, info)
     push!(cgm.worklist, info)
     return info
 end
@@ -52,22 +55,31 @@ error, or with `on_unsupported = :trap`, a function that traps (recorded in
 `cgm.diagnostics`).
 """
 function process_worklist!(cgm::CGModule)
+    img = cgm.image
     while !isempty(cgm.worklist)
         info = popfirst!(cgm.worklist)
-        try
-            cgm.image.optional_mode && push!(cgm.image.optional, info)
-            with_image_owner(() -> emit_function!(cgm, info), cgm.image, info)
-        catch err
-            err isa Unsupported || rethrow()
-            push!(err.context, info.mi)
-            cgm.config.on_unsupported === :trap || rethrow()
-            push!(cgm.diagnostics, info.mi => err)
-            empty!(info.func.body)
-            empty!(info.func.locals)
-            b = Builder(cgm.mod, info.func)
-            unreachable!(b)
-            finish!(b)
+        img.optional_mode && push!(img.optional, info)
+        if info in img.optional && !img.optional_mode
+            with_optional_config(() -> emit_or_trap!(cgm, info), cgm)
+        else
+            emit_or_trap!(cgm, info)
         end
+    end
+end
+
+function emit_or_trap!(cgm::CGModule, info::FuncInfo)
+    try
+        with_image_owner(() -> emit_function!(cgm, info), cgm.image, info)
+    catch err
+        err isa Unsupported || rethrow()
+        push!(err.context, info.mi)
+        cgm.config.on_unsupported === :trap || rethrow()
+        push!(cgm.diagnostics, info.mi => err)
+        empty!(info.func.body)
+        empty!(info.func.locals)
+        b = Builder(cgm.mod, info.func)
+        unreachable!(b)
+        finish!(b)
     end
 end
 
