@@ -25,6 +25,11 @@ Base.@kwdef struct Config
     The code generator emits simple code (a local per value) and leaves allocating locals,
     putting values on the operand stack and the rest to it."
     optimize::Union{Nothing,Cmd} = `-O3`
+    "Mutable objects of the image are created as shells (header and default fields) whose fields
+    the start function sets, so that a cycle back to a mutable object through closures or
+    immutable objects (an ODE integrator holding callbacks whose closures capture it) can be
+    serialized."
+    shell_first_mutables::Bool = false
 end
 
 """
