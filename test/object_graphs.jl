@@ -102,6 +102,15 @@ module DeferredFailure
     nested(x::Float64) = x * OUTER.k
     VAR::Rec = Rec(TypeVar(:U), 4.0, nothing)
     fromvar(x::Float64) = x * VAR.k
+    # such an object reached through a boxed tuple, and through a global variable, from two functions each
+    const TUP = (Rec(TypeVar(:V), 5.0, nothing), 1.0)
+    const SINK3 = Any[nothing]
+    const SINK4 = Any[nothing]
+    boxed3(x::Float64) = (SINK3[1] = TUP; x)
+    boxed4(x::Float64) = (SINK4[1] = TUP; x)
+    VAR2::Rec = Rec(TypeVar(:W), 6.0, nothing)
+    var3(x::Float64) = x * VAR2.k
+    var4(x::Float64) = x + VAR2.k
 end
 
 const SHELL_FIRST = WasmCodegen.Config(shell_first_mutables = true)
@@ -140,14 +149,16 @@ end
     W = WasmCodegen
     config = W.Config(shell_first_mutables = true, trim = :unsafe, verify = :off)
     world = Base.get_world_counter()
-    mis = [W.entry_instance(f, (Float64,); world) for f in (DeferredFailure.read, DeferredFailure.read2)]
-    for program_too in (false, true)
+    D = DeferredFailure
+    # the second function reaches the object directly, through the cached box, or through the global variable
+    for (fopt, fprog) in ((D.read, D.read2), (D.boxed3, D.boxed4), (D.var3, D.var4)), program_too in (false, true)
+        mis = [W.entry_instance(f, (Float64,); world) for f in (fopt, fprog)]
         cgm = W.CGModule(W.collect_world(mis; world, verify = :off), config)
         cgm.image.optional_mode = true
         opt = W.get_function!(cgm, mis[1])
         W.process_worklist!(cgm)
         cgm.image.optional_mode = false
-        prog = program_too ? W.get_function!(cgm, mis[2]) : nothing
+        program_too && W.get_function!(cgm, mis[2])
         W.process_worklist!(cgm)
         while W.prepare_image_patches!(cgm) || !isempty(cgm.worklist)
             W.process_worklist!(cgm)
@@ -157,4 +168,20 @@ end
         @test any(d -> d.first === mis[2], cgm.diagnostics) == program_too
         @test !any(d -> d.first === mis[1], cgm.diagnostics)
     end
+    # a function first needed while an optional function's values are serialized is optional too
+    mis = [W.entry_instance(f, (Float64,); world) for f in (D.read, D.fromvar)]
+    cgm = W.CGModule(W.collect_world(mis; world, verify = :off), config)
+    cgm.image.optional_mode = true
+    opt = W.get_function!(cgm, mis[1])
+    W.process_worklist!(cgm)
+    cgm.image.optional_mode = false
+    queued = W.with_image_owner(() -> W.get_function!(cgm, mis[2]), cgm.image, opt)
+    W.process_worklist!(cgm)
+    while W.prepare_image_patches!(cgm) || !isempty(cgm.worklist)
+        W.process_worklist!(cgm)
+    end
+    @test queued in cgm.image.optional
+    @test queued in cgm.image.failed_owners
+    @test !cgm.image.failed
+    @test isempty(cgm.diagnostics)
 end
