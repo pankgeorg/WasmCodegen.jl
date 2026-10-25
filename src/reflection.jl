@@ -313,8 +313,12 @@ function compile_objectid_cases!(cgm::CGModule)
     # (compiled for every such type, whether or not its values are ever hashed: one whose
     # `objectid` cannot be compiled traps there, and is not an error of the program)
     config, ndiag = cgm.config, length(cgm.diagnostics)
-    cgm.config = Config(; on_unsupported=:trap, trim=:unsafe, verify=config.verify,
-                        trim_patches=config.trim_patches, optimize=config.optimize)
+    # the caller's options (serialization included), but an unsupported construct traps
+    kw = Dict{Symbol,Any}(n => getfield(config, n) for n in fieldnames(Config))
+    kw[:on_unsupported] = :trap
+    kw[:trim] = :unsafe
+    cgm.config = Config(; kw...)
+    cgm.image.optional_mode = true
     try
         while true
             n = length(cases)
@@ -326,6 +330,7 @@ function compile_objectid_cases!(cgm::CGModule)
             process_worklist!(cgm)
         end
     finally
+        cgm.image.optional_mode = false
         cgm.config = config
         resize!(cgm.diagnostics, ndiag)
     end

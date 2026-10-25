@@ -55,7 +55,8 @@ function process_worklist!(cgm::CGModule)
     while !isempty(cgm.worklist)
         info = popfirst!(cgm.worklist)
         try
-            emit_function!(cgm, info)
+            cgm.image.optional_mode && push!(cgm.image.optional, info)
+            with_image_owner(() -> emit_function!(cgm, info), cgm.image, info)
         catch err
             err isa Unsupported || rethrow()
             push!(err.context, info.mi)

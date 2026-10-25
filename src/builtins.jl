@@ -392,6 +392,8 @@ end
 
 function emit_isdefined!(fc::FnCtx, x::CGVal, i::Int)
     T = x.typ
+    any(R -> T === R, OPAQUE_RUNTIME_TYPES) &&
+        unsupported("isdefined on a field of the runtime object type ", T, " (serialized with its header only)")
     l = layout(fc, T)
     if l.kind === Boxed && !isempty(l.fields)
         FT = fieldtype(T, i)

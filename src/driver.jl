@@ -60,6 +60,12 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
         end
         process_worklist!(cgm)
         compile_objectid_cases!(cgm)
+        # serializing deferred image values can need functions and types of their own: to a fixed
+        # point of preparing them, emitting the functions and compiling the objectid cases
+        while prepare_image_patches!(cgm) || !isempty(cgm.worklist)
+            process_worklist!(cgm)
+            compile_objectid_cases!(cgm)
+        end
         # the runtime functions the code needed (added to the world as it was emitted) may
         # use exceptions more than the program did: then again, as they need
         m = exception_mode(w)

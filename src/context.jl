@@ -34,6 +34,11 @@ Base.@kwdef struct Config
     "`cfunction` pointers and calls through them (`FunctionWrappers`) compile to typed Wasm
     function references (`runtime/fwrappers.jl`)."
     funcref_wrappers::Bool = false
+    "Mutable objects of the image are created as shells (header and default fields) whose fields
+    the start function sets, so that a cycle back to a mutable object through closures or
+    immutable objects (an ODE integrator holding callbacks whose closures capture it) can be
+    serialized."
+    shell_first_mutables::Bool = false
 end
 
 """

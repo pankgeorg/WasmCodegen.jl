@@ -7,6 +7,7 @@ WasmCodegen.with_trim_patches() do _, _
     include("data.jl")
     include("random.jl")
     include("dicts.jl")
+    include("object_graphs.jl")
     include("globals.jl")
     include("exceptions.jl")
     include("coverage.jl")
