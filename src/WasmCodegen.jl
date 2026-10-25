@@ -72,6 +72,7 @@ include("host.jl")
 include("types_runtime.jl")
 include("patches.jl")
 include("driver.jl")
+include("precompile.jl")
 
 export compile, Entry, Config, UnsupportedConstructs
 

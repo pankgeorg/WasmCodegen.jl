@@ -7,6 +7,7 @@ authors = ["Gabriel Baraldi <gabriel.baraldi@juliahub.com>"]
 Binaryen_jll = "a54ac8ab-712d-5a0e-8e11-9296c0d3c20e"
 IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
 Parsers = "69de0a69-1ddd-5017-9359-2bf0b02dc9f0"
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 WasmBuilder = "c3e9a8f2-6b1d-4f7a-8e25-1a9d3b7c4e60"
 
 [sources]
@@ -17,5 +18,6 @@ WasmBuilder = {rev = "main", url = "https://github.com/gbaraldi/WasmBuilder.jl"}
 Binaryen_jll = "0.130.0"
 IRStructurizer = "0.7"
 Parsers = "3"
+PrecompileTools = "1"
 WasmBuilder = "0.1"
 julia = "1.12, 1.13"
