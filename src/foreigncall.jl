@@ -234,7 +234,7 @@ function emit_objectid!(fc::FnCtx, x::CGVal)
     h(fc) = const_value(fc, UInt64(reinterpret(UInt32, getfield(T, :hash))))
     layout(fc, T).kind === Boxed || return immut_id!(fc, x, T, h(fc))
     # an immutable object (which may refer to others of its type): by a helper per type
-    return call_outlined!(fc, (:objectid, T), "objectid_" * typename_str(T), CGVal[x], UInt64,
+    return call_outlined!(fc, (:objectid, T), () -> "objectid_" * typename_str(T), CGVal[x], UInt64,
                           (hfc, a) -> immut_id!(hfc, a[1], T, h(hfc)))
 end
 
