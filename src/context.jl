@@ -45,6 +45,12 @@ Base.@kwdef struct Config
     reduce constant propagation into capped callees (inference's size-dependent heuristic).
     (Julia 1.13 and later; ignored on 1.12, whose inlining policy does not see the callee.)"
     inline_cap::Int = 0
+    "The structured IR of each function is kept for the session (the process) and reused by every
+    later compilation that has the same function: keyed by its CodeInstance (which an inlining cap
+    owns: each cap its own) and the module's exception mode. Pays off when compilations share
+    code, e.g. a solver compiled for many models behind a model-independent interface. Emission
+    only reads the structured IR, so it is reused as it is. See `ir_cache_stats`, `empty_ir_cache!`."
+    ir_cache::Bool = false
 end
 
 """

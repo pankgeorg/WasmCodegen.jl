@@ -111,13 +111,7 @@ end
 Emit the body of the function `info` from the structured IR of its method instance.
 """
 function emit_function!(cgm::CGModule, info::FuncInfo)
-    ir = prepare_ir(cgm.world, info.mi, cgm.exceptions)
-    sci = try
-        structurize(ir)
-    catch err
-        err isa Unsupported && rethrow()
-        unsupported("structurizing the IR: ", sprint(showerror, err))
-    end
+    sci = structured_ir(cgm, info.mi)
     b = Builder(cgm.mod, info.func)
     fc = FnCtx(cgm, info, sci, b)
     collect_ssatypes!(fc.ssatypes, sci.entry)
@@ -129,6 +123,52 @@ function emit_function!(cgm::CGModule, info::FuncInfo)
     is_unreachable(b) || unreachable!(b)
     finish!(b)
     return info
+end
+
+"The structured IR of `mi` in the module's exception mode: from the session's cache with `ir_cache`."
+function structured_ir(cgm::CGModule, mi::Core.MethodInstance)
+    cgm.config.ir_cache || return structurize_prepared(cgm, mi)
+    key = (first(cgm.world.sources[mi]), cgm.exceptions)
+    sci = get(IR_CACHE, key, nothing)
+    if sci === nothing
+        t = time_ns()
+        sci = structurize_prepared(cgm, mi)
+        IR_CACHE_STATS.misses += 1
+        IR_CACHE_STATS.miss_ns += time_ns() - t
+        IR_CACHE[key] = sci
+    else
+        IR_CACHE_STATS.hits += 1
+    end
+    return sci
+end
+
+function structurize_prepared(cgm::CGModule, mi::Core.MethodInstance)
+    ir = prepare_ir(cgm.world, mi, cgm.exceptions)
+    try
+        structurize(ir)
+    catch err
+        err isa Unsupported && rethrow()
+        unsupported("structurizing the IR: ", sprint(showerror, err))
+    end
+end
+
+# (CodeInstance, exception mode) => structured IR, for the session (`Config(ir_cache = true)`)
+const IR_CACHE = IdDict{Any,Any}()
+mutable struct IRCacheStats
+    hits::Int
+    misses::Int
+    miss_ns::UInt64
+end
+const IR_CACHE_STATS = IRCacheStats(0, 0, 0)
+
+"The structured-IR cache's hits, misses, entries, and the time spent structurizing its misses."
+ir_cache_stats() = (; hits = IR_CACHE_STATS.hits, misses = IR_CACHE_STATS.misses, entries = length(IR_CACHE),
+                      miss_s = IR_CACHE_STATS.miss_ns / 1e9)
+"Empty the structured-IR cache and its counters."
+function empty_ir_cache!()
+    empty!(IR_CACHE)
+    IR_CACHE_STATS.hits = 0; IR_CACHE_STATS.misses = 0; IR_CACHE_STATS.miss_ns = 0
+    nothing
 end
 
 # Julia's IR does not require the values of a phi on an edge to be of the phi's type (a
