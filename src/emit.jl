@@ -122,6 +122,7 @@ function emit_function!(cgm::CGModule, info::FuncInfo)
     fc = FnCtx(cgm, info, sci, b)
     collect_ssatypes!(fc.ssatypes, sci.entry)
     analyze_uses!(fc, sci.entry)
+    analyze_ptr_carries!(fc, sci.entry)
     bind_arguments!(fc)
     bind_handler_args!(fc, sci.entry)
     emit_block!(fc, sci.entry)
@@ -296,13 +297,29 @@ function assign_all!(fc::FnCtx, dsts::Vector{CGVal}, vals)
     pairs = [(d, v) for (d, v) in zip(dsts, vals)
              if d.kind !== Bottom && !(v isa IRStructurizer.Undef) && !same_locals(fc, d, v)]
     srcs = CGVal[convert_repr(fc, operand(fc, v), d.typ) for (d, v) in pairs]
-    for s in srcs
+    for (s, (d, _)) in zip(srcs, pairs)
         s.kind === Bottom && continue
         push_val!(fc, s)
+        d.origin === nothing || push_origin_index!(fc, d.origin, s)
     end
     for i in reverse(eachindex(pairs))
         srcs[i].kind === Bottom && continue
-        pop_to!(fc, pairs[i][1])
+        d = pairs[i][1]
+        d.origin === nothing || emit!(fc.b, :local_set, d.origin.index::Int)
+        pop_to!(fc, d)
+    end
+end
+
+# push the byte offset of the pointer `s` into the array of the origin `o` of a carry: that of
+# its own origin into the same array, else the low bits of its address (it points into the same object)
+function push_origin_index!(fc::FnCtx, o::PtrOrigin, s::CGVal)
+    so = array_origin(s)
+    if so !== nothing && so.mem == o.mem && so.array == o.array
+        push_leaf!(fc, so.index)
+    else
+        # an object's addresses are its base (in the high 32 bits) plus the offset
+        push_leaf!(fc, s.leaves[1])
+        emit!(fc.b, :i32_wrap_i64)
     end
 end
 
@@ -451,8 +468,11 @@ struct Uses
     interm::Dict{Int,Tuple{Any,Int}}
     defblock::Dict{Int,Any}
     projections::Dict{Tuple{Int,Int},Vector{Int}}
+    "The pointer loop carries that keep the origin of their initial value (`analyze_ptr_carries!`)."
+    ptrcarries::Set{Int}
 end
-Uses() = Uses(Dict{Int,Int}(), Dict{Int,Tuple{Any,Int}}(), Dict{Int,Any}(), Dict{Tuple{Int,Int},Vector{Int}}())
+Uses() = Uses(Dict{Int,Int}(), Dict{Int,Tuple{Any,Int}}(), Dict{Int,Any}(), Dict{Tuple{Int,Int},Vector{Int}}(),
+              Set{Int}())
 
 """
     analyze_uses!(fc, block)
@@ -496,6 +516,100 @@ function analyze_uses!(fc::FnCtx, block)
         end
     end
 end
+
+"""
+    analyze_ptr_carries!(fc, block)
+
+Find the loop carries of pointer type that are always the same pointer, moved: every value
+flowing into the carry (initial, continued) is derived through `add_ptr`, `sub_ptr` and
+pointer-to-pointer `bitcast` from one pointer `r`, or from carries that are themselves
+derived only from `r`. Such a carry points into the object `r` points into, so it keeps the
+origin of its initial value, with the byte offset carried alongside (`fc.uses.ptrcarries`):
+accesses through it inside the loop compile to array accesses, as accesses through `r` do.
+"""
+function analyze_ptr_carries!(fc::FnCtx, block)
+    stmts = Dict{Int,Any}()
+    incoming = Dict{Int,Vector{Any}}()
+    carrytypes = Dict{Int,Any}()
+    collect_ptr_flow!(stmts, incoming, carrytypes, block, IRStructurizer.BlockArgument[])
+    ptrcarry(id) = haskey(carrytypes, id) && is_ptr_type(CC.widenconst(carrytypes[id]))
+    # the roots of the pointer carries: the least fixed point of
+    # roots(c) = union of the bases of its incoming values, where the base of a value is the
+    # pointer it is derived from, expanded to the roots of a carry
+    world = fc.cgm.world.world
+    bases = Dict{Int,Vector{Any}}(id => Any[ptr_base(fc, stmts, world, x) for x in xs
+                                            if !(x isa IRStructurizer.Undef)]
+                                  for (id, xs) in incoming if ptrcarry(id))
+    roots = Dict{Int,Set{Any}}(id => Set{Any}() for id in keys(bases))
+    changed = true
+    while changed
+        changed = false
+        for (id, bs) in bases, b in bs
+            add = b isa IRStructurizer.BlockArgument && haskey(roots, b.id) ? roots[b.id] : (b,)
+            for r in add
+                r in roots[id] && continue
+                push!(roots[id], r); changed = true
+            end
+        end
+    end
+    for (id, rs) in roots
+        length(rs) == 1 && only(rs) !== nothing && push!(fc.uses.ptrcarries, id)
+    end
+end
+
+function add_incoming!(incoming, carrytypes, args, vals)
+    for (a, v) in zip(args, vals)
+        push!(get!(Vector{Any}, incoming, a.id), v)
+        carrytypes[a.id] = a.type
+    end
+end
+
+# the values flowing into the carries of `LoopOp`s (the loops `structurize` makes): initial
+# values and the values of the `continue`s of the innermost enclosing loop; the carries of other
+# loops get no origin
+function collect_ptr_flow!(stmts, incoming, carrytypes, block, carries)
+    for inst in IRStructurizer.instructions(block)
+        st = inst[:stmt]
+        stmts[inst.ssa_idx] = st
+        if st isa IRStructurizer.LoopOp
+            add_incoming!(incoming, carrytypes, st.body.args, st.init_values)
+            collect_ptr_flow!(stmts, incoming, carrytypes, st.body, st.body.args)
+        elseif st isa IRStructurizer.ControlFlowOp
+            inner = st isa IRStructurizer.ForOp || st isa IRStructurizer.WhileOp ? IRStructurizer.BlockArgument[] : carries
+            for b in IRStructurizer.blocks(st)
+                collect_ptr_flow!(stmts, incoming, carrytypes, b, inner)
+            end
+        end
+    end
+    t = block.terminator
+    t isa IRStructurizer.ContinueOp && add_incoming!(incoming, carrytypes, carries, t.values)
+end
+
+# the pointer `v` is derived from through `add_ptr`, `sub_ptr` and pointer-to-pointer
+# `bitcast`s (`v` itself if none); `nothing` for a value that is not a known pointer
+function ptr_base(fc::FnCtx, stmts, world, @nospecialize(v))
+    while v isa Core.SSAValue
+        st = get(stmts, v.id, nothing)
+        (st isa Expr && st.head === :call && length(st.args) == 3) || break
+        f = st.args[1]
+        if f isa GlobalRef
+            c = const_global(world, f.mod, f.name)
+            f = c === nothing ? nothing : something(c)
+        end
+        if f === Core.Intrinsics.add_ptr || f === Core.Intrinsics.sub_ptr
+            v = st.args[2]
+        elseif f === Core.Intrinsics.bitcast && is_ptr_type(CC.widenconst(ptr_value_type(fc, st.args[3])))
+            v = st.args[3]
+        else
+            break
+        end
+    end
+    return v isa Core.SSAValue || v isa IRStructurizer.BlockArgument ? v : nothing
+end
+
+ptr_value_type(fc::FnCtx, @nospecialize(v)) =
+    v isa Core.SSAValue ? get(fc.ssatypes, v.id, Any) :
+    v isa IRStructurizer.BlockArgument ? v.type : Any
 
 # the locals of the result `i` of the control flow operation `opidx`: those of the
 # enclosing `if`'s result it is forwarded to, or new ones
@@ -558,12 +672,25 @@ end
 
 # the locals of the carries of a loop; a carry nothing reads has none (bottom: its
 # assignments are dropped)
-function carry_vals!(fc::FnCtx, args)
-    return CGVal[a.id in fc.usedargs ? new_val!(fc, CC.widenconst(a.type)) : bottom() for a in args]
+function carry_vals!(fc::FnCtx, args, inits=fill(nothing, length(args)))
+    return CGVal[a.id in fc.usedargs ? carry_val!(fc, a, init) : bottom() for (a, init) in zip(args, inits)]
+end
+
+# the locals of a carry, and for a pointer carry that keeps its origin, the byte offset
+# into the array of the origin of its initial value `init`
+function carry_val!(fc::FnCtx, a, @nospecialize(init))
+    v = new_val!(fc, CC.widenconst(a.type))
+    a.id in fc.uses.ptrcarries || return v
+    (init === nothing || init isa IRStructurizer.Undef) && return v
+    x = operand(fc, init)
+    o = x isa CGVal ? array_origin(x) : nothing
+    o === nothing && return v
+    return CGVal(v.typ, v.kind, v.leaves, nothing,
+                 PtrOrigin(o.mem, o.array, new_local!(fc, I32), o.eltype, o.terminated))
 end
 
 function emit_cfop!(fc::FnCtx, op::IRStructurizer.LoopOp, @nospecialize(typ))
-    carries = carry_vals!(fc, op.body.args)
+    carries = carry_vals!(fc, op.body.args, op.init_values)
     assign_all!(fc, carries, op.init_values)
     bind_block_args!(fc, op.body.args, carries)
     results = CGVal[result_val!(fc, fc.opidx, i, R) for (i, R) in enumerate(result_types(typ))]
