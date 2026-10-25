@@ -877,7 +877,7 @@ function box!(fc::FnCtx, v::CGVal, @nospecialize(T))
     lv.kind === Ghost && unsupported("boxing the ghost ", S, " without its value")
     is_union_tuple(S) && return CGVal(T, Boxed, box_union_tuple!(fc, v).leaves)
     # by a helper per type (outline.jl)
-    r = call_outlined!(fc, (:box, S), "box_" * typename_str(S), CGVal[v], Any, box_inline!)
+    r = call_outlined!(fc, (:box, S), () -> "box_" * typename_str(S), CGVal[v], Any, box_inline!)
     return CGVal(T, Boxed, r.leaves)
 end
 
@@ -908,7 +908,7 @@ function unbox!(fc::FnCtx, v::CGVal, @nospecialize(T))
         return pop_val!(fc, T)
     end
     # an inline value, a Memory or a String: in a box, unpacked by a helper per type
-    return call_outlined!(fc, (:unbox, T), "unbox_" * typename_str(T),
+    return call_outlined!(fc, (:unbox, T), () -> "unbox_" * typename_str(T),
                           CGVal[CGVal(Any, Boxed, v.leaves)], T, (h, a) -> unbox_inline!(h, a[1], T))
 end
 
