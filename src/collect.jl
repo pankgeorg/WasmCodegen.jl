@@ -16,6 +16,8 @@ struct ClosedWorld
     sources::IdDict{Core.MethodInstance,Tuple{Core.CodeInstance,Core.CodeInfo}}
     "What the trim verifier reported (empty if verification was off or clean)."
     trim_report::Base.RefValue{String}
+    "The inlining size cap the world was inferred with (`Config.inline_cap`)."
+    inline_cap::Int
 end
 
 """
@@ -46,10 +48,10 @@ inferred too, to a fixpoint. With `verify` (`:error`, `:warn` or `:off`), the re
 checked with juliac's trim verifier, which reports dynamic dispatch.
 """
 function collect_world(entries::Vector{Core.MethodInstance};
-                       world::UInt=Base.get_world_counter(), verify::Symbol=:warn)
+                       world::UInt=Base.get_world_counter(), verify::Symbol=:warn, inline_cap::Int=0)
     w = ClosedWorld(world, entries, Core.MethodInstance[],
                     IdDict{Core.MethodInstance,Tuple{Core.CodeInstance,Core.CodeInfo}}(),
-                    Ref(""))
+                    Ref(""), inline_cap)
     verify === :off || (w.trim_report[] = trim_check(entries; world, onlywarn=verify === :warn))
     extend_world!(w, entries)
     return w
@@ -98,7 +100,7 @@ Add the method instances `mis` and everything they call to the closed world `w` 
 code generator asks for the functions of its runtime this way).
 """
 function extend_world!(w::ClosedWorld, mis::Vector{Core.MethodInstance})
-    interp = WasmInterpreter(; world=w.world)
+    interp = WasmInterpreter(; world=w.world, inline_cap=w.inline_cap)
     codeinfos = Any[]
     wq = CC.CompilationQueue(; interp)
     ilq = CC.CompilationQueue(; interp)

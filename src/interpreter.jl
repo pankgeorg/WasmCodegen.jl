@@ -3,8 +3,12 @@
 # method definitions in a newer world (`patches.jl`), as juliac does, so inference (and its
 # concrete evaluation) is the native one.
 
-"The owner of the CodeInstances inferred for Wasm in Julia's code cache."
-struct WasmCacheOwner end
+"""The owner of the CodeInstances inferred for Wasm in Julia's code cache: one per inlining
+size cap (`Config.inline_cap`), since the cap changes the optimized code."""
+struct WasmCacheOwner
+    inline_cap::Int
+end
+WasmCacheOwner() = WasmCacheOwner(0)
 
 """
     CodegenSources
@@ -23,7 +27,7 @@ CodegenSources() = CodegenSources(IdDict{Core.CodeInstance,Core.CodeInfo}())
 function cached_source(d::CodegenSources, ci::Core.CodeInstance)
     src = get(d.dict, ci, nothing)
     src === nothing || return src
-    ci.owner === WasmCacheOwner() || return nothing
+    ci.owner isa WasmCacheOwner || return nothing
     inf = @atomic :monotonic ci.inferred
     inf isa String && (inf = CC._uncompressed_ir(ci, inf))
     inf isa Core.CodeInfo || return nothing
@@ -53,9 +57,13 @@ struct WasmInterpreter <: CC.AbstractInterpreter
     opt_params::CC.OptimizationParams
     "The uncompressed source of the CodeInstances inferred, for `CC.compile!`."
     codegen::CodegenSources
+    "Callees whose optimized code has more statements than this are not inlined (0: no cap)."
+    inline_cap::Int
+    "The statement counts of compressed sources seen by the inlining size cap."
+    src_lengths::IdDict{Any,Int}
 end
 
-function WasmInterpreter(; world::UInt=Base.get_world_counter())
+function WasmInterpreter(; world::UInt=Base.get_world_counter(), inline_cap::Int=0)
     mt = CC.CachedMethodTable(CC.InternalMethodTable(world))
     inf_params = CC.InferenceParams(; force_enable_inference=true)
     # calls target the method instance of their argument types, not the signature native
@@ -64,7 +72,7 @@ function WasmInterpreter(; world::UInt=Base.get_world_counter())
     # `down::Function`): a closed world has no dynamic dispatch to fall back on
     opt_params = CC.OptimizationParams(; compilesig_invokes=false)
     return WasmInterpreter(world, mt, CC.InferenceResult[], inf_params, opt_params,
-                           CodegenSources())
+                           CodegenSources(), inline_cap, IdDict{Any,Int}())
 end
 
 CC.InferenceParams(interp::WasmInterpreter) = interp.inf_params
@@ -72,7 +80,38 @@ CC.OptimizationParams(interp::WasmInterpreter) = interp.opt_params
 CC.get_inference_world(interp::WasmInterpreter) = interp.world
 CC.get_inference_cache(interp::WasmInterpreter) = interp.inf_cache
 CC.method_table(interp::WasmInterpreter) = interp.method_table
-CC.cache_owner(::WasmInterpreter) = WasmCacheOwner()
+CC.cache_owner(interp::WasmInterpreter) = WasmCacheOwner(interp.inline_cap)
+
+# the number of statements of a callee's optimized code, as inlining sees it (`nothing`: unknown)
+source_length(@nospecialize(src), ::Core.MethodInstance, ::WasmInterpreter) = nothing
+source_length(src::CC.OptimizationState, mi::Core.MethodInstance, interp::WasmInterpreter) =
+    src.optresult === nothing ? source_length(src.src, mi, interp) : length(src.optresult.ir.stmts)
+source_length(src::Core.CodeInfo, ::Core.MethodInstance, ::WasmInterpreter) = length(src.code)
+source_length(src::CC.IRCode, ::Core.MethodInstance, ::WasmInterpreter) = length(src.stmts)
+# (compressed code decodes only with its CodeInstance: the one cached for `mi`, if this is its code)
+function source_length(src::String, mi::Core.MethodInstance, interp::WasmInterpreter)
+    n = get(interp.src_lengths, src, -1)
+    n >= 0 && return n
+    ci = CC.get(CC.code_cache(interp), mi, nothing)
+    (ci isa Core.CodeInstance && (@atomic :monotonic ci.inferred) === src) || return nothing
+    code = CC._uncompressed_ir(ci, src)
+    code isa Core.CodeInfo || return nothing
+    return interp.src_lengths[src] = length(code.code)
+end
+
+# with an inlining size cap, a callee larger than the cap stays a call (an `@inline` one too):
+# the structurizer's and Binaryen's costs grow faster than the size of a function. A callee of
+# unknown size is not capped. (Inference asks this too, in its size-dependent heuristic for whether
+# constant propagation into a callee pays, so the cap can reduce constant propagation.)
+# This form of the policy, with the callee's method instance, is the one Julia 1.13 calls.
+function CC.src_inlining_policy(interp::WasmInterpreter, mi::Core.MethodInstance, @nospecialize(src),
+                                @nospecialize(info::CC.CallInfo), stmt_flag::UInt32)
+    inline = @invoke CC.src_inlining_policy(interp::CC.AbstractInterpreter, mi::Core.MethodInstance, src::Any,
+                                            info::CC.CallInfo, stmt_flag::UInt32)
+    (inline && interp.inline_cap > 0) || return inline
+    n = source_length(src, mi, interp)
+    return n === nothing || n <= interp.inline_cap
+end
 CC.codegen_cache(interp::WasmInterpreter) = interp.codegen
 CC.may_discard_trees(::WasmInterpreter) = false
 

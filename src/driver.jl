@@ -49,7 +49,7 @@ end
 
 function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool, world::UInt)
     mis = Core.MethodInstance[entry_instance(e.f, e.argtypes; world) for e in entries]
-    w = collect_world(mis; world, verify=config.verify)
+    w = collect_world(mis; world, verify=config.verify, inline_cap=config.inline_cap)
     mode = exception_mode(w)
     local cgm
     while true
