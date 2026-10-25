@@ -26,7 +26,12 @@ the closed world.
 """
 function get_function!(cgm::CGModule, mi::Core.MethodInstance)
     info = get(cgm.funcs, mi, nothing)
-    info === nothing || return info
+    if info !== nothing
+        img = cgm.image
+        # an optional function that a program function needs too is no longer optional
+        info in img.optional && !(img.optional_mode || img.owner in img.optional) && promote_optional!(cgm, info)
+        return info
+    end
     src = get(cgm.world.sources, mi, nothing)
     src === nothing && unsupported("a call of ", mi, ", which is not in the closed world")
     ci, _ = src
@@ -42,9 +47,26 @@ function get_function!(cgm::CGModule, mi::Core.MethodInstance)
     cgm.funcs[mi] = info
     # first needed by an optional function (or while its values are serialized): optional too
     img = cgm.image
-    (img.optional_mode || img.owner in img.optional) && push!(img.optional, info)
+    if img.optional_mode || img.owner in img.optional
+        push!(img.optional, info)
+        img.owner in img.optional && push!(get!(() -> Any[], img.optional_children, img.owner), info)
+    end
     push!(cgm.worklist, info)
     return info
+end
+
+# The errors an optional function had become the program's (its code stays as compiled: an
+# unsupported statement traps), and so do the optional functions it needed first.
+function promote_optional!(cgm::CGModule, info::FuncInfo)
+    img = cgm.image
+    info in img.optional || return
+    delete!(img.optional, info)
+    errs = pop!(img.suppressed, info, Any[])
+    append!(cgm.diagnostics, errs)
+    info in img.failed_owners && (img.failed = true)
+    for c in pop!(img.optional_children, info, Any[])
+        promote_optional!(cgm, c)
+    end
 end
 
 """

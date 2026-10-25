@@ -46,13 +46,17 @@ mutable struct Image
     dependents::IdDict{Any,Vector{Any}}
     "The optional functions whose deferred values failed."
     failed_owners::IdSet{Any}
+    "Per optional function: the errors not reported while it is optional, and the optional
+    functions it needed first."
+    suppressed::IdDict{Any,Vector{Any}}
+    optional_children::IdDict{Any,Vector{Any}}
 end
 
 Image(cgm) = Image(cgm, IdDict{Any,Global}(), IdDict{Any,Global}(), IdDict{Any,Global}(),
                    IdSet{Any}(), Inst[], Any[],
                    Dict{Tuple{Module,Symbol},Tuple{Any,Vector{Global},Union{Nothing,Global}}}(), IdDict{Any,Global}(), 0,
                    UInt64[], nothing, false, false, IdSet{Any}(), IdDict{Any,Any}(), IdDict{Any,Vector{Any}}(),
-                   IdSet{Any}())
+                   IdSet{Any}(), IdDict{Any,Vector{Any}}(), IdDict{Any,Vector{Any}}())
 
 """
     header_hash(img, x) -> Inst
@@ -163,7 +167,10 @@ function const_leaves(img::Image, @nospecialize(x), @nospecialize(FT))
     elseif lf.elements !== nothing && layout(ts, typeof(x)).elements === nothing
         # a tuple stored where the declared type is a tuple of unknown length (`VersionNumber`'s
         # `prerelease`): an array object of the declared element type
-        g = get!(() -> tuple_array_global!(img, x, lf; register=false), img.boxes, (x, lf.wtype))
+        key = (x, lf.wtype)
+        haskey(img.boxes, key) && (note_reach!(img, key); return Inst[Inst(:global_get, img.boxes[key])])
+        note_created!(img, key)
+        g = get!(() -> tuple_array_global!(img, x, lf; register=false), img.boxes, key)
         return Inst[Inst(:global_get, g)]
     end
     return Inst[Inst(:global_get, object_global!(img, x))]
@@ -773,6 +780,7 @@ function fail_owner!(cgm::CGModule, err::Unsupported, @nospecialize(owner))
     owner in img.failed_owners && return
     trap_function!(cgm, owner)
     push!(img.failed_owners, owner)
+    owner in img.optional && push!(get!(() -> Any[], img.suppressed, owner), owner.mi => err)
     if !(owner in img.optional)
         push!(err.context, owner.mi)
         push!(cgm.diagnostics, owner.mi => err)
