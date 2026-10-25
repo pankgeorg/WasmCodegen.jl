@@ -104,8 +104,19 @@ function extend_world!(w::ClosedWorld, mis::Vector{Core.MethodInstance})
     codeinfos = Any[]
     wq = CC.CompilationQueue(; interp)
     ilq = CC.CompilationQueue(; interp)
-    append!(wq, [mi for mi in mis if !haskey(w.sources, mi)])
+    initial = [mi for mi in mis if !haskey(w.sources, mi)]
+    append!(wq, initial)
+    # Each method instance is asked for once: one that comes back without a source would
+    # otherwise be missing, and asked for, again on every round, without end. Each round scans
+    # only the functions it added. A target left without a source is not in the world: a call
+    # to it that survives to emission is an unsupported construct there (get_function!).
+    requested = Base.IdSet{Core.MethodInstance}(initial)
+    scanned = length(w.order)
+    trace = get(ENV, "WCG_COLLECT_TRACE", "") == "1"
+    nround = 0
+    t0 = time()
     while true
+        nround += 1
         CC.compile!(codeinfos, wq; invokelatest_queue=ilq, COMPILE_KWARGS...)
         CC.compile!(codeinfos, ilq; invokelatest_queue=ilq, COMPILE_KWARGS...)
         for i in 1:2:length(codeinfos)
@@ -116,18 +127,31 @@ function extend_world!(w::ClosedWorld, mis::Vector{Core.MethodInstance})
             w.sources[mi] = (ci, src)
             push!(w.order, mi)
         end
-        # the targets of `:invoke`s that are not in the world yet
+        # the targets of `:invoke`s in the functions this round added that are not in the
+        # world yet and were not asked for before
         missing = Core.MethodInstance[]
-        for mi in w.order, stmt in w.sources[mi][2].code
+        for k in scanned+1:length(w.order), stmt in w.sources[w.order[k]][2].code
             Meta.isexpr(stmt, :invoke) || continue
             target = stmt.args[1]
             tmi = target isa Core.CodeInstance ? CC.get_ci_mi(target) : target
             tmi isa Core.MethodInstance || continue
-            haskey(w.sources, tmi) || tmi in missing || push!(missing, tmi)
+            haskey(w.sources, tmi) || tmi in requested || (push!(requested, tmi); push!(missing, tmi))
         end
+        trace && println(stderr, "extend_world! round ", nround, ": world ", length(w.order), " (+",
+                         length(w.order) - scanned, "), new :invoke targets ", length(missing), ", ",
+                         round(time() - t0; digits = 1), " s")
+        trace && flush(stderr)
+        scanned = length(w.order)
         isempty(missing) && break
         empty!(codeinfos)
         append!(wq, missing)
+    end
+    # asked for, but inference kept no source for them
+    unresolved = [mi for mi in requested if !haskey(w.sources, mi)]
+    if trace && !isempty(unresolved)
+        println(stderr, "extend_world!: ", length(unresolved), " :invoke targets without a source, e.g. ",
+                join((sprint(show, mi; context = :limit => true) for mi in first(unresolved, 5)), "; "))
+        flush(stderr)
     end
     return w
 end
