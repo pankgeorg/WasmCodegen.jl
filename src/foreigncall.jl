@@ -605,12 +605,15 @@ end
 """
     singleton_ref(T) -> Bool
 
-Whether `T` is `Ref{S}` of a singleton type `S`. FunctionWrappers declares such an argument as
-`Ref{S}` in the `cfunction` signature and passes it as `Any` in the `ccall`, so both sides
-carry it as a reference to the (only) object.
+Whether `T` is `Ref{S}` of a singleton type `S`, or of a concrete type `S` not stored inline (a
+mutable or boxed object, such as a `Vector`). FunctionWrappers declares such an argument as
+`Ref{S}` in the `cfunction` signature and passes it as `Any` in the `ccall` (its
+`map_cfunc_argtype`/`map_argtype`: everything not `allocatedinline`), so both sides carry it as a
+reference to the object.
 """
 singleton_ref(@nospecialize(T)) =
-    T isa DataType && T <: Ref && length(T.parameters) == 1 && Base.issingletontype(T.parameters[1])
+    T isa DataType && T <: Ref && length(T.parameters) == 1 && (S = T.parameters[1];
+        Base.issingletontype(S) || (S isa DataType && isconcretetype(S) && !Base.allocatedinline(S)))
 
 """
     cfunc_trampoline!(cgm, callee, rt, argts) -> FuncInfo
