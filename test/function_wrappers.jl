@@ -64,6 +64,13 @@ function fw_boxed(x::Float64)
     w(u, du, 1.0)
     return sum(du) + 10 * sum(u)
 end
+function fw_boxed_unwrapped(x::Float64)
+    u = [x, 2x, 3x]
+    du = zeros(3)
+    Rhs(2.0)(du, u, 0.5)
+    Rhs(x)(u, du, 1.0)
+    return sum(du) + 10 * sum(u)
+end
 
 # pointer identity, as natively: wrappers of one callable type built alike share a code pointer,
 # different callables have different ones, an object has one pointer (from the wrapper or from
@@ -150,7 +157,10 @@ end
     fwrapper_test(fw_bool, 0.5)
     fwrapper_test(fw_singleton_const, 1.5)
     fwrapper_test(fw_any_singleton, 2.0)
-    fwrapper_test(fw_boxed, 1.5)
+    # (fw_boxed builds a wrapper and calls it in one function, which natively on Julia 1.13 can return a
+    # wrong value, FunctionWrappers.jl#36: the module is compared with the unwrapped calls)
+    c = WasmCodegen.compile(fw_boxed, (Float64,); config = FWC, validate = isempty(DUMP))
+    @test wasm_run(c, "fw_boxed", 1.5; rettype = Float64) === fw_boxed_unwrapped(1.5)
     @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(fw_nine, (Float64,); config = FWC)
     fwrapper_test(fw_pointers, 4.0)
     fwrapper_test(fw_cycle, 1.5)
