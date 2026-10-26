@@ -49,6 +49,22 @@ struct Nine end
 const FW9 = FunctionWrapper{Float64, Tuple{ntuple(_ -> Float64, 8)..., NoParams}}(Nine())
 fw_nine(x::Float64) = FW9(x, x, x, x, x, x, x, x, NoParams())
 
+# boxed arguments (FunctionWrappers passes an argument that is not stored inline, such as a Vector, as
+# `Ref{T}` in the cfunction and `Any` in the ccall): an ODE right-hand side f(du, u, t) behind a wrapper
+struct Rhs
+    k::Float64
+end
+(r::Rhs)(du::Vector{Float64}, u::Vector{Float64}, t::Float64) = (du .= -r.k .* u .+ t; nothing)
+const FWR = FunctionWrapper{Nothing, Tuple{Vector{Float64}, Vector{Float64}, Float64}}(Rhs(2.0))
+function fw_boxed(x::Float64)
+    u = [x, 2x, 3x]
+    du = zeros(3)
+    FWR(du, u, 0.5)
+    w = FunctionWrapper{Nothing, Tuple{Vector{Float64}, Vector{Float64}, Float64}}(Rhs(x))
+    w(u, du, 1.0)
+    return sum(du) + 10 * sum(u)
+end
+
 # pointer identity, as natively: wrappers of one callable type built alike share a code pointer,
 # different callables have different ones, an object has one pointer (from the wrapper or from
 # `pointer_from_objref`), none is null. (Natively, a wrapper built inline in another function gets
@@ -134,6 +150,7 @@ end
     fwrapper_test(fw_bool, 0.5)
     fwrapper_test(fw_singleton_const, 1.5)
     fwrapper_test(fw_any_singleton, 2.0)
+    fwrapper_test(fw_boxed, 1.5)
     @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(fw_nine, (Float64,); config = FWC)
     fwrapper_test(fw_pointers, 4.0)
     fwrapper_test(fw_cycle, 1.5)
