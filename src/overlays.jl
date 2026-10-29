@@ -56,6 +56,16 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
         emit!(fc.b, op, align, 0)
         return ghost(Nothing, nothing)
     end
+    F = mi.specTypes.parameters[1]
+    impl = Base.issingletontype(F) ? Runtime.extension_impl(F.instance, fc.cgm.config.host_extensions) : nothing
+    if impl !== nothing
+        # a runtime function an extension of the host implements: its implementation (for the
+        # module's host)
+        args = CGVal[operand(fc, a) for a in ex.args[3:end]]
+        argtypes = Tuple(mi.specTypes.parameters[2:end])
+        args = CGVal[convert_repr(fc, a, T) for (a, T) in zip(args, argtypes)]
+        return call_runtime!(fc, impl, args)
+    end
     if m.module === Runtime.IO && m.name === :write_byte
         fd, b = CGVal[operand(fc, a) for a in ex.args[3:end]]
         push_val!(fc, convert_repr(fc, fd, Int32))

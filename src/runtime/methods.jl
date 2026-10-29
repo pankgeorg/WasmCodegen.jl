@@ -36,3 +36,27 @@ const PRE_PATCH_WORLD = Ref{UInt}(typemax(UInt))
 function a patch calls can call the method the patch replaced.
 """
 original(f, args...; kw...) = Base.invoke_in_world(PRE_PATCH_WORLD[], f, args...; kw...)
+
+"""
+The implementations of runtime functions for an extension of the host (see
+`Config(host_extensions = ...)`): `EXTENSION_IMPLS[ext][f]` is compiled in place of `f` only
+in modules whose host provides `ext`. (A function whose default implementation is right for
+hosts without the extension, `FS.path_mode` and the like.)
+"""
+const EXTENSION_IMPLS = Dict{Symbol,IdDict{Any,Any}}()
+
+"""
+    extension_impl(f, extensions) -> Union{Nothing,Function}
+
+The function compiled in place of the runtime function `f`, in a module whose host provides
+the extensions `extensions`, or `nothing`.
+"""
+function extension_impl(@nospecialize(f), extensions)
+    for ext in extensions
+        impls = get(EXTENSION_IMPLS, ext, nothing)
+        impls === nothing && continue
+        impl = get(impls, f, nothing)
+        impl === nothing || return impl
+    end
+    return nothing
+end

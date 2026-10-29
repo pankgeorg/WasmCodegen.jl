@@ -8,16 +8,38 @@ import NodeJS_24_jll
 # named by WASMCODEGEN_NODE
 node_cmd() = haskey(ENV, "WASMCODEGEN_NODE") ? `$(ENV["WASMCODEGEN_NODE"])` : NodeJS_24_jll.node()
 
-const RUNNER = Ref{Any}(nothing)
+"""
+The options Node needs for JavaScript Promise Integration (`WebAssembly.Suspending`, for
+modules that wait on the host's events): none if it has it by default, else
+`--experimental-wasm-jspi`.
+"""
+function jspi_flags()
+    JSPI_FLAGS[] === nothing || return JSPI_FLAGS[]
+    has = success(`$(node_cmd()) -e "process.exit(typeof WebAssembly.Suspending === 'function' ? 0 : 1)"`)
+    return JSPI_FLAGS[] = has ? String[] : ["--experimental-wasm-jspi"]
+end
+const JSPI_FLAGS = Ref{Any}(nothing)
+
+"""
+Whether the module imports the host's events (`julia_io` imports other than the file
+modes'): the runner gives it `poll`, which suspends, and calls its exports through
+`WebAssembly.promising`.
+"""
+suspends(c) = any(f -> f.imported !== nothing && f.imported[1] == "julia_io" &&
+                       !(f.imported[2] in ("path_mode", "path_chmod", "path_symlink")), c.cgm.mod.funcs)
+
+# the runners: one for modules whose exports may suspend (with JSPI), one for the others
+const RUNNER = Dict{Bool,Any}()
 const REQ_ID = Ref(0)
 
-function runner()
-    r = RUNNER[]
+function runner(jspi::Bool=false)
+    r = get(RUNNER, jspi, nothing)
     if r === nothing || !process_running(r)
         # (node:wasi, for modules compiled for WASI, warns that it is experimental)
-        r = open(`$(node_cmd()) --disable-warning=ExperimentalWarning $(joinpath(@__DIR__, "runner.mjs"))`, "r+")
+        flags = jspi ? jspi_flags() : String[]
+        r = open(`$(node_cmd()) --disable-warning=ExperimentalWarning $flags $(joinpath(@__DIR__, "runner.mjs"))`, "r+")
         readline(r)  # ready
-        RUNNER[] = r
+        RUNNER[jspi] = r
     end
     return r
 end
@@ -73,7 +95,7 @@ end
     wasm_run(c::Compilation, name, args...; rettype) -> value, or (:trap, msg)
 """
 function wasm_run(c, name::String, args...; rettype, wasi_env=nothing, wasi_args=nothing, preopens=nothing, wasi_faults=nothing)
-    r = runner()
+    r = runner(suspends(c))
     id = (REQ_ID[] += 1)
     wasmid = bytes2hex(sha1(c.bytes))
     leaves = reduce(vcat, [arg_leaves(a) for a in args]; init=Tuple{String,String}[])
