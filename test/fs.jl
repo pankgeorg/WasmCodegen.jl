@@ -1176,4 +1176,32 @@ io_seeks_print(k::Int) = (io_seeks(k, Core.stdout); Int32(0))
     @test LAST_OUTPUT[] == expected
     LAST_OUTPUT[] == expected || println(Core.stdout, "seeks: native ", repr(expected), "\n wasm ", repr(LAST_OUTPUT[]))
 end
+
+# `normalize` returns a path in normal form as it is, and normalizes the others as before
+function normalize_lexical(p::String)
+    parts = String[]
+    for c in eachsplit(p, '/')
+        (isempty(c) || c == ".") && continue
+        c == ".." ? (isempty(parts) || pop!(parts)) : push!(parts, String(c))
+    end
+    return "/" * join(parts, "/")
+end
+# (natively, of paths in normal form only: of others, `normalize` asks the host whether a
+# component before a `.` or `..` is a symbolic link; see `fs_edges`)
+@testset "normalize" begin
+    FS = WasmCodegen.Runtime.FS
+    comps = ["", ".", "..", "...", ".a", "..a", "a.", "a..", "a", "bc", "ü", "."^4]
+    bad, n = String[], 0
+    for len in 0:4, _ in 1:2000
+        p = "/" * join(rand(comps, len), "/")
+        rand(Bool) && (p *= "/")
+        q = normalize_lexical(p)
+        (FS.is_normal(p) == (q == p) && (!FS.is_normal(p) || FS.normalize(p) === p)) || push!(bad, p)
+        n += FS.is_normal(p)
+    end
+    @test isempty(bad)
+    @test n > 0
+    @test FS.is_normal("/") && FS.is_normal("/a/b.c/..d") && !FS.is_normal("a") && !FS.is_normal("")
+    @test !FS.is_normal("//") && !FS.is_normal("/a/") && !FS.is_normal("/a/./b") && !FS.is_normal("/..")
+end
 end

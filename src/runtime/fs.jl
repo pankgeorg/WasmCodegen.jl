@@ -202,6 +202,26 @@ function cwd()
     return CWD[]
 end
 
+# whether `p` is its own normal form: absolute, with no empty, `.` or `..` component (no
+# repeated or trailing separator), as most paths are (no splitting and joining them)
+function is_normal(p::String)
+    n = ncodeunits(p)
+    (n > 0 && codeunit(p, 1) == UInt8('/')) || return false
+    n == 1 && return true
+    i = 1   # a separator
+    while i <= n
+        j = i + 1
+        while j <= n && codeunit(p, j) != UInt8('/')
+            j += 1
+        end
+        len = j - i - 1
+        len == 0 && return false
+        len <= 2 && codeunit(p, i + 1) == UInt8('.') && (len == 1 || codeunit(p, i + 2) == UInt8('.')) && return false
+        i = j
+    end
+    return true
+end
+
 """
     normalize_path(path) -> String, or UV_ELOOP
 
@@ -215,6 +235,7 @@ would name another file). Without `links`, lexically (the preopens' own names, w
 looked up in none).
 """
 function normalize_path(path::String; links::Bool=true)
+    is_normal(path) && return path
     p = String(path)
     startswith(p, '/') || (p = string(cwd(), "/", p))
     # (the components to go, the next last)
