@@ -30,6 +30,41 @@
             (d <= 1 || cu[d] == UInt8('/') || cu[d-1] == UInt8('/')) && return (path, "")
             return a * String(cu[1:d-1]), String(cu[d:end])
         end
+        # `split(path, r"/+"; keepempty=false)`: the components, by the separator's byte
+        function normpath(path::String)
+            isabs = isabspath(path)
+            isdir = isdirpath(path)
+            drive, path = splitdrive(path)
+            # (Strings: deleting from a vector of SubStrings does not compile)
+            parts = String[String(p) for p in eachsplit(path, '/'; keepempty=false)]
+            filter!(!=("."), parts)
+            while true
+                clean = true
+                for j = 1:length(parts)-1
+                    if parts[j] != ".." && parts[j+1] == ".."
+                        deleteat!(parts, j:j+1)
+                        clean = false
+                        break
+                    end
+                end
+                clean && break
+            end
+            if isabs
+                while !isempty(parts) && parts[1] == ".."
+                    popfirst!(parts)
+                end
+            elseif isempty(parts)
+                push!(parts, ".")
+            end
+            path = join(parts, path_separator)
+            if isabs
+                path = path_separator*path
+            end
+            if isdir && !isdirpath(path)
+                path *= path_separator
+            end
+            string(drive, path)
+        end
         # `r"(?:^|/)\.{0,2}$"`
         function isdirpath(path::String)
             cu = codeunits(path)

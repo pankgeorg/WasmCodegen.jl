@@ -1,0 +1,80 @@
+# The filesystem functions of Base that read C structures (libuv's requests and dirents) or
+# use regular expressions or tasks, patched to call the runtime (`runtime/fs.jl`), whose
+# functions natively still do what Base does (the original methods, in the world before the
+# patches), and in Wasm what the host does (methods of `WASM_METHODS`). Applied with juliac's
+# trim patches (see `patches.jl`).
+
+let T = WasmCodegen.Runtime.BaseFS, E = WasmCodegen.Runtime.Errno
+    @eval Base begin
+        # libuv's and the C library's messages: tables (the same as native)
+        struverror(err::Int32) = $(E.uv_message)(err)
+        uverrorname(err::Int32) = $(E.uv_name)(err)
+        Libc.strerror(e::Integer) = $(E.strerror)(e)
+    end
+
+    @eval Base.Filesystem begin
+        function _readdir(dir::AbstractString; return_objects::Bool=false, join::Bool=false, sort::Bool=true)
+            raw = $(T.dir_entries)(String(dir))
+            if return_objects
+                objs = DirEntry[DirEntry(dir, name, rawtype) for (name, rawtype) in raw]
+                sort && sort!(objs)
+                return objs
+            end
+            names = String[join ? joinpath(dir, name) : name for (name, _) in raw]
+            sort && sort!(names)
+            return names
+        end
+        readlink(path::AbstractString) = $(T.readlink)(String(path))
+        realpath(path::AbstractString) = $(T.realpath)(String(path))
+        pwd() = $(T.pwd)()
+        cd(dir::AbstractString) = $(T.cd)(String(dir))
+        # (Base's, the working directory saved and restored by the runtime: an fd natively, its
+        # path in Wasm)
+        function cd(f::Function, dir::AbstractString)
+            h = $(T.cwd_save)()
+            try
+                cd(dir)
+                f()
+            finally
+                $(T.cwd_restore)(h)
+            end
+        end
+        tempdir() = $(T.tempdir)()
+        homedir() = $(T.homedir)()
+        _rand_filename(len = 10) = $(T.rand_filename)(Int(len))
+        # (without the regular expression of the separator)
+        function mktempdir(parent::AbstractString=tempdir(); prefix::AbstractString=temp_prefix, cleanup::Bool=true)
+            path = $(T.mkdtemp)(String(parent), String(prefix))
+            cleanup && temp_cleanup_later(path)
+            return path
+        end
+        function mktemp(parent::AbstractString=tempdir(); cleanup::Bool=true)
+            path, io = $(T.mkstemp)(String(parent))
+            cleanup && temp_cleanup_later(path)
+            return (path, io)
+        end
+
+        # (the mode of the copy from the source's path: the stat of an fd has no permissions
+        # in Wasm; natively the same mode)
+        function sendfile(src::AbstractString, dst::AbstractString)
+            src_file = nothing
+            dst_file = nothing
+            try
+                src_file = open(src, JL_O_RDONLY)
+                dst_file = open(dst, JL_O_CREAT | JL_O_TRUNC | JL_O_WRONLY, filemode(src))
+                bytes = filesize(stat(src_file))
+                sendfile(dst_file, src_file, Int64(0), Int(bytes))
+            finally
+                if src_file !== nothing && isopen(src_file)
+                    close(src_file)
+                end
+                if dst_file !== nothing && isopen(dst_file)
+                    close(dst_file)
+                end
+            end
+        end
+        # (without a task: see `Runtime.Walkdir`)
+        walkdir(path = pwd(); topdown=true, follow_symlinks=false, onerror=throw) =
+            $(WasmCodegen.Runtime.Walkdir)(String(path), topdown, follow_symlinks, onerror)
+    end
+end
