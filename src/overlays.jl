@@ -35,6 +35,26 @@ itself (a host call), or `nothing` for other calls.
 function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nospecialize(typ))
     m = mi.def
     m isa Method || return nothing
+    if m.module === Runtime.Staging && haskey(STAGING_OPS, m.name)
+        # a load or store of the linear memory (for WASI: see `staging.jl`), checked first as
+        # natively (a Julia error, not a trap)
+        fc.cgm.config.host === :wasi ||
+            unsupported("the linear memory (`Runtime.Staging`) in a module for JavaScript (`Config(host = :wasi)`)")
+        staging_memory!(fc.cgm)
+        op, T = STAGING_OPS[m.name]
+        args = CGVal[operand(fc, a) for a in ex.args[3:end]]
+        off = convert_repr(fc, args[1], UInt32)
+        call_runtime!(fc, Runtime.Staging.check, CGVal[off, const_value(fc, sizeof(T))])
+        push_val!(fc, off)
+        align = trailing_zeros(sizeof(T))
+        if length(args) == 1
+            emit!(fc.b, op, align, 0)
+            return pop_val!(fc, T)
+        end
+        push_val!(fc, convert_repr(fc, args[2], T))
+        emit!(fc.b, op, align, 0)
+        return ghost(Nothing, nothing)
+    end
     if m.module === Runtime.IO && m.name === :write_byte
         fd, b = CGVal[operand(fc, a) for a in ex.args[3:end]]
         push_val!(fc, convert_repr(fc, fd, Int32))
@@ -88,3 +108,10 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
     end
     return nothing
 end
+
+# the loads and stores of `Runtime.Staging`: the instruction, and the type loaded or stored
+const STAGING_OPS = Dict{Symbol,Tuple{Symbol,Any}}(
+    :load8 => (:i32_load8_u, UInt8), :load16 => (:i32_load16_u, UInt16),
+    :load32 => (:i32_load, UInt32), :load64 => (:i64_load, UInt64),
+    :store8 => (:i32_store8, UInt8), :store16 => (:i32_store16, UInt16),
+    :store32 => (:i32_store, UInt32), :store64 => (:i64_store, UInt64))

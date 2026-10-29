@@ -17,10 +17,69 @@ function foreigncall_name(@nospecialize(x))
     return nothing
 end
 
+# the library of a foreign call `ccall((name, library), ...)` given as a constant string, in
+# the forms `foreigncall_name` accepts
+function foreigncall_library(@nospecialize(x))
+    x isa QuoteNode && (x = x.value)
+    x isa Tuple && return length(x) == 2 && x[2] isa String ? x[2] : nothing
+    x isa GlobalRef && isconst(x.mod, x.name) && return foreigncall_library(getglobal(x.mod, x.name))
+    lib = if x isa Expr && x.head === :call && length(x.args) == 3 && x.args[1] === Core.tuple
+        # `Core.tuple(name, library)` (Julia 1.12)
+        x.args[3]
+    elseif x isa Expr && x.head === :tuple && length(x.args) == 2
+        # (name, library) (Julia 1.13)
+        x.args[2]
+    else
+        nothing
+    end
+    lib isa QuoteNode && (lib = lib.value)
+    return lib isa String ? lib : nothing
+end
+
+"The libraries whose functions are the host's: a `ccall` of one is a call of a Wasm import."
+const IMPORT_LIBRARIES = ("wasi_snapshot_preview1",)
+
+# the types of the arguments and results of host imports
+const IMPORT_SCALARS = (Int32, UInt32, Int64, UInt64)
+
+"""
+    emit_import_ccall!(fc, lib, name, ex, args, typ) -> CGVal
+
+`ccall((name, lib), RT, (ArgT...), args...)` of a host library: a call of the Wasm import
+`lib.name`. The types must be 32- and 64-bit integers (or `Cvoid` for no result). WASI's
+functions are imported only by modules for WASI (`Config(host = :wasi)`), which have the
+linear memory their pointers address.
+"""
+function emit_import_ccall!(fc::FnCtx, lib::String, name::Symbol, ex::Expr, args::Vector{Any})
+    lib == "wasi_snapshot_preview1" && fc.cgm.config.host !== :wasi &&
+        unsupported("the WASI function ", name, " in a module for JavaScript (file IO, the environment and ",
+                    "the like need `Config(host = :wasi)`)")
+    RT = ex.args[2]
+    ATs = ex.args[3]::Core.SimpleVector
+    bad = filter(T -> !(T in IMPORT_SCALARS), collect(Any, ATs))
+    (RT === Cvoid || RT in IMPORT_SCALARS) && isempty(bad) ||
+        error("WasmCodegen: the host import $lib.$name has a type other than Int32, UInt32, Int64, " *
+              "UInt64 (or Cvoid as its result): $RT ($(join(ATs, ", ")))")
+    # (its pointers are offsets of the runtime's part of the memory: `Runtime.Staging`)
+    lib == "wasi_snapshot_preview1" && staging_memory!(fc.cgm)
+    wt(T) = sizeof(T) == 8 ? I64 : I32
+    params = ValType[wt(T) for T in ATs]
+    results = RT === Cvoid ? ValType[] : ValType[wt(RT)]
+    for (a, T) in zip(args, ATs)
+        push_val!(fc, convert_repr(fc, a::CGVal, T))
+    end
+    call!(fc.b, add_import!(fc.cgm.mod, lib, String(name), params, results))
+    return RT === Cvoid ? ghost(Nothing, nothing) : pop_val!(fc, RT)
+end
+
 function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     name = foreigncall_name(ex.args[1])
     nargs = length(ex.args[3]::Core.SimpleVector)
     args = Any[operand(fc, a) for a in ex.args[6:5+nargs]]
+    lib = foreigncall_library(ex.args[1])
+    if lib !== nothing && lib in IMPORT_LIBRARIES && name !== nothing
+        return emit_import_ccall!(fc, lib, name, ex, args)
+    end
     if name === nothing && is_llvmcall(ex.args[5])
         iname = llvm_intrinsic_name(ex.args[1])
         iname === nothing || return emit_llvm_intrinsic!(fc, iname, args, typ)
