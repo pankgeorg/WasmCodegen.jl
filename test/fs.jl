@@ -1066,4 +1066,114 @@ end
     end
 end
 
+
+# seeks and skips of an `IOStream` relative to its 64 KiB read buffer (inside it, before and
+# after it, at and after the end), with writes between them, and reads into byte arrays,
+# arrays of other types and views; paths not in normal form
+function io_seeks(k::Int, out::IO)
+    dir = joinpath(ROOT, string("io", k))
+    rec(xs...) = (print(out, xs...); println(out))
+    attempt(f, what) = try
+        rec(what, " => ", f())
+    catch e
+        rec(what, " !! ", err_text(e, dir))
+    end
+    mkpath(dir)
+    n = 150_000   # (three buffers)
+    f = joinpath(dir, "data.bin")
+    write(f, UInt8[i % 251 for i in 0:n-1])
+    at(io) = (position(io), eof(io))
+    open(f) do io
+        rec("start ", read(io, UInt8), " ", at(io))
+        seek(io, 1000); rec("in fwd ", read(io, UInt8), " ", at(io))
+        seek(io, 10); rec("in back ", read(io, UInt8), " ", at(io))
+        seek(io, 0); rec("buffer start ", read(io, UInt8), " ", at(io))
+        seek(io, 65535); rec("buffer last ", read(io, UInt8), " ", at(io))
+        seek(io, 65536); rec("buffer end ", read(io, UInt8), " ", at(io))
+        seek(io, 140_000); rec("after ", read(io, UInt8), " ", at(io))
+        seek(io, 5); rec("before ", read(io, UInt8), " ", at(io))
+        skip(io, 100); rec("skip in ", read(io, UInt8), " ", at(io))
+        skip(io, -50); rec("skip back ", read(io, UInt8), " ", at(io))
+        skip(io, 100_000); rec("skip after ", read(io, UInt8), " ", at(io))
+        skip(io, -100_000); rec("skip before ", read(io, UInt8), " ", at(io))
+        attempt(() -> skip(io, -10_000), "skip before 0")
+        rec("after failed skip ", at(io))
+        mark(io); skip(io, 30); reset(io); rec("mark/reset ", read(io, UInt8), " ", at(io))
+        # at and after the end
+        seekend(io); rec("seekend ", at(io))
+        seek(io, n - 3); rec("tail ", read(io, 3), " ", at(io))
+        seek(io, n - 2); rec("in after eof ", read(io, UInt8), " ", at(io))
+        seek(io, n); rec("at end ", at(io))
+        attempt(() -> read(io, UInt8), "read at end")
+        seek(io, n + 10); rec("past end ", at(io))
+        attempt(() -> read(io, UInt8), "read past end")
+        seek(io, n - 1); rec("back from past end ", read(io, UInt8), " ", at(io))
+        attempt(() -> seek(io, -1), "seek before 0")
+        # reads into a byte array, a view, an array of other bytes; spanning buffers
+        seek(io, 65_000)
+        b = Vector{UInt8}(undef, 2000); read!(io, b)
+        rec("bytes ", sum(b), " ", b[1], " ", b[end], " ", at(io))
+        skip(io, -1500)
+        v = zeros(UInt8, 300); read!(io, view(v, 101:200))
+        rec("view ", sum(v), " ", v[100], " ", v[101], " ", v[200], " ", v[201], " ", at(io))
+        u = Vector{UInt32}(undef, 40); read!(io, u)
+        rec("uint32 ", sum(u), " ", u[1], " ", at(io))
+        r = Ref{UInt64}(0); unsafe_read(io, r, 8)
+        rec("ref ", r[], " ", at(io))
+        rec("readbytes ", readbytes!(io, b, 70_000), " ", length(b), " ", sum(b), " ", at(io))
+        seek(io, n - 100); rec("readbytes at end ", readbytes!(io, b, 500), " ", at(io))
+        # scalars across the end of a full buffer (its compaction), then back by a seek and a skip
+        seek(io, 0); read(io, UInt8); skip(io, 65_533)
+        rec("scalar across ", read(io, UInt64), " ", at(io))
+        seek(io, 65_534); rec("scalar again ", read(io, UInt64), " ", at(io))
+        skip(io, -8); rec("scalar skip back ", read(io, UInt32), " ", at(io))
+        # the rest, with bytes buffered (its compaction)
+        seek(io, 70_000); read(io, UInt8); x = read(io)
+        rec("read rest ", length(x), " ", sum(x), " ", at(io))
+        # into the bytes of a String (not a memory of bytes)
+        seek(io, 7)
+        s = Base._string_n(4)
+        got = GC.@preserve s ccall(:ios_readall, Csize_t, (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), io.ios, pointer(s), 4)
+        rec("string ", Int(got), " ", Vector{UInt8}(codeunits(s)), " ", at(io))
+    end
+    # writes and reads mixed, on a read/write stream
+    open(f, "r+") do io
+        rec("rw read ", read(io, 100) == UInt8[i % 251 for i in 0:99], " ", at(io))
+        seek(io, 50); write(io, "XYZ"); rec("rw write in buffer ", at(io))
+        rec("rw read after write ", read(io, UInt8), " ", at(io))
+        seek(io, 45); rec("rw read back ", String(read(io, 10)), " ", at(io))
+        skip(io, -5); write(io, 0xee); rec("rw skip write ", at(io))
+        seek(io, 40); rec("rw again ", read(io, 20), " ", at(io))
+        seek(io, 70_000); write(io, "far"); seek(io, 69_998); rec("rw far ", read(io, 7), " ", at(io))
+        seekend(io); write(io, "tail"); rec("rw append ", at(io))
+        seek(io, n - 2); rec("rw end ", read(io), " ", at(io))
+        seek(io, n + 4 + 3); write(io, 0x01); rec("rw hole ", at(io), " ", filesize(io))
+        seek(io, n); rec("rw hole read ", read(io), " ", at(io))
+    end
+    rec("file ", filesize(f), " ", sum(read(f)))
+    # another handle changes buffered bytes: a seek reads them again, a skip keeps the buffer
+    open(f) do io
+        read(io, UInt8)
+        open(w -> (seek(w, 1); write(w, 0x5a)), f, "r+")
+        seek(io, 1); rec("seek after change ", read(io, UInt8), " ", at(io))
+        open(w -> (seek(w, 3); write(w, 0x5b)), f, "r+")
+        skip(io, 1); rec("skip after change ", read(io, UInt8), " ", at(io))
+    end
+    # paths not in normal form
+    p = string(dir, "/./sub//x/../")
+    mkpath(joinpath(dir, "sub", "x"))
+    rec("paths ", isdir(p), " ", isfile(string(dir, "//data.bin")), " ", isfile(string(dir, "/sub/../data.bin")),
+        " ", filesize(string(dir, "/.//data.bin")), " ", isdir(string(dir, "/sub/.")), " ", ispath(string(dir, "/sub/x/../../nope")))
+    rm(dir; recursive=true)
+    return nothing
+end
+io_seeks(k::Int) = (out = IOBuffer(); io_seeks(k, out); String(take!(out)))
+io_seeks_print(k::Int) = (io_seeks(k, Core.stdout); Int32(0))
+
+@testset "IOStream seeks and the read buffer" begin
+    expected = io_seeks(1)
+    @test run_fs(io_seeks_print, 2) == 0
+    @test LAST_OUTPUT[] == expected
+    LAST_OUTPUT[] == expected || println(Core.stdout, "seeks: native ", repr(expected), "\n wasm ", repr(LAST_OUTPUT[]))
+end
 end
