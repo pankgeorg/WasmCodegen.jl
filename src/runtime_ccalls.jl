@@ -36,6 +36,8 @@ for (name, f, kinds) in (
         # the scheduler's random state (`Base.Partr`): one thread's
         (:jl_get_ptls_rng, Runtime.get_ptls_rng, Symbol[]),
         (:jl_set_ptls_rng, Runtime.set_ptls_rng, [:val]),
+        # the next task to switch to (`Config(tasks = :jspi)`, `runtime/tasks.jl`)
+        (:jl_set_next_task, Runtime.Tasks.set_next_task_wasm, [:val]),
         (:jl_gc_new_weakref_th, Runtime.new_weakref, [:val, :val]),
         (:jl_gc_get_total_bytes, Runtime.gc_get_total_bytes, [:val]),
         (:jl_gc_num, Runtime.gc_num, Symbol[]),

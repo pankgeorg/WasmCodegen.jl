@@ -137,7 +137,8 @@ function current_task_global!(cgm::CGModule)
         push!(init, default_inst(st isa PackedType ? I32 : st))
     end
     push!(init, Inst(:struct_new, l.wtype))
-    g = add_global!(cgm.mod, "jl_current_task", RefType(l.wtype, false), false, init)
+    # (mutable with tasks: a task switch sets it, `Runtime.Tasks.set_current!`)
+    g = add_global!(cgm.mod, "jl_current_task", RefType(l.wtype, false), cgm.config.tasks === :jspi, init)
     cgm.helpers[:current_task] = g
     # the root task holds `nothing` (not a null reference) in the fields `jl_init_root_task` sets,
     # so that `task_local_storage` creates its IdDict as natively; `code` stays undefined
@@ -145,6 +146,11 @@ function current_task_global!(cgm::CGModule)
     for name in (:next, :queue, :storage, :donenotify, :result, :scope)
         w = first(l.fields[Base.fieldindex(Task, name)]) - 1
         push!(cgm.image.init, Inst(:global_get, g), Inst(:global_get, nothing_g), Inst(:struct_set, l.wtype, w))
+    end
+    if cgm.config.tasks === :jspi
+        # (sticky, as natively: the tasks it schedules run on its thread)
+        w = first(l.fields[Base.fieldindex(Task, :sticky)]) - 1
+        push!(cgm.image.init, Inst(:global_get, g), Inst(:i32_const, 1), Inst(:struct_set, l.wtype, w))
     end
     entropy = host_func!(cgm, :entropy)
     for i in 0:4
