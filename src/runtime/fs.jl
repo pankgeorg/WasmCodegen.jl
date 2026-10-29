@@ -1022,10 +1022,13 @@ getpid() = Int32(1)
 ## reads and writes of a file descriptor, a staging chunk at a time (see `_os_read` and
 ## `_os_write_all`, below)
 
-# copy `n` bytes of the linear memory at `off` to `dst` (a `Vector{UInt8}` or a pointer)
-# from `i` (0-based), and of `src` from `i` to the linear memory at `off`
+# copy `n` bytes of the linear memory at `off` to `dst` (a `Vector{UInt8}`, a `MemoryRef` to
+# a memory of bytes, or a pointer) from `i` (0-based), and of `src` from `i` to the linear
+# memory at `off`
 copy_out!(dst::Vector{UInt8}, i::Int, off::UInt32, n::Int) =
     Staging.copy_from_linear!(dst, i + 1, off, n)
+copy_out!(dst::MemoryRef{UInt8}, i::Int, off::UInt32, n::Int) =
+    Staging.copy_from_linear!(dst.mem, Base.memoryrefoffset(dst) + i, off, n)
 function copy_out!(dst::Ptr{UInt8}, i::Int, off::UInt32, n::Int)
     for k in 1:n
         unsafe_store!(dst, Staging.load8(off + UInt32(k - 1)), i + k)
@@ -1340,10 +1343,13 @@ function ftruncate(fd::Int, length::Int64)
     return Cint(0)
 end
 
-# `memcpy` between the buffer and a caller's bytes (a `Vector{UInt8}` or a pointer), and
-# `memmove` within the buffer: `n` bytes, offsets 0-based
+# `memcpy` between the buffer and a caller's bytes (a `Vector{UInt8}`, a `MemoryRef` to a
+# memory of bytes, or a pointer), and `memmove` within the buffer: `n` bytes, offsets 0-based
 memcpy!(dst::Vector{UInt8}, di::Int, src::Vector{UInt8}, si::Int, n::Int) =
     (copyto!(dst, di + 1, src, si + 1, n); nothing)
+# (one `array.copy`)
+memcpy!(dst::MemoryRef{UInt8}, di::Int, src::Vector{UInt8}, si::Int, n::Int) =
+    (unsafe_copyto!(memoryref(dst, di + 1), memoryref(src.ref, si + 1), n); nothing)
 function memcpy!(dst::Ptr{UInt8}, di::Int, src::Vector{UInt8}, si::Int, n::Int)
     for k in 1:n
         unsafe_store!(dst, src[si+k], di + k)
@@ -1395,9 +1401,9 @@ function _write_update_pos(s::IOS)
     return nothing
 end
 
-# `_ios_read`: up to `n` bytes into `dest` (a pointer or a `Vector{UInt8}`); with `all`, until
-# `n` or the end of the input. What does not fit comfortably in the buffer is read directly,
-# leaving it empty.
+# `_ios_read`: up to `n` bytes into `dest` (a pointer, a `MemoryRef` to a memory of bytes, or
+# a `Vector{UInt8}`); with `all`, until `n` or the end of the input. What does not fit
+# comfortably in the buffer is read directly, leaving it empty.
 function _ios_read(s::IOS, dest, n::Int, all::Bool)
     tot = 0
     didread = false
@@ -1770,10 +1776,14 @@ function ios_file(s::Ptr{UInt8}, fname::Cstring, rd::Cint, wr::Cint, create::Cin
     return p
 end
 
-ios_read(s::Ptr{Cvoid}, dest::Ptr{Cvoid}, n::Csize_t) =
-    with_ios(st -> Csize_t(_ios_read(st, Ptr{UInt8}(dest), Int(n), false)), s)
-ios_readall(s::Ptr{Cvoid}, dest::Ptr{Cvoid}, n::Csize_t) =
-    with_ios(st -> Csize_t(_ios_read(st, Ptr{UInt8}(dest), Int(n), true)), s)
+# (the destination: a `MemoryRef` where the code generator knows it is a memory of bytes,
+# else a pointer: `:bytes` of `RUNTIME_CCALLS`)
+ios_read(s::Ptr{Cvoid}, dest::Union{Ptr,MemoryRef{UInt8}}, n::Csize_t) =
+    with_ios(st -> Csize_t(_ios_read(st, bytes_dest(dest), Int(n), false)), s)
+ios_readall(s::Ptr{Cvoid}, dest::Union{Ptr,MemoryRef{UInt8}}, n::Csize_t) =
+    with_ios(st -> Csize_t(_ios_read(st, bytes_dest(dest), Int(n), true)), s)
+bytes_dest(dest::Ptr) = Ptr{UInt8}(dest)
+bytes_dest(dest::MemoryRef{UInt8}) = dest
 ios_fillbuf(s::Ptr{Cvoid}) = with_ios(ios_fillbuf, s)
 ios_write(s::Ptr{Cvoid}, p::Ptr{Cvoid}, n::Csize_t) =
     with_ios(st -> Csize_t(ios_write(st, Ptr{UInt8}(p), 0, Int(n))), s)
