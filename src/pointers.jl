@@ -294,16 +294,24 @@ function ptr_store!(fc::FnCtx, p::CGVal, v::CGVal, i::CGVal)
         (isconstant(v) && constant_value(v) == C_NULL && !Base.allocatedinline(o.eltype)) ||
             unsupported("storing a ", v.typ, " through a pointer into a memory of ", o.eltype)
         ml = memory_layout(fc.cgm.types, o.eltype)
-        push_leaf!(fc, o.array)
+        # (natively one pointer per element, the `i`-th pointer the `i`-th element; here an
+        # element is `stride` reference leaves, all null: undefined, as `unset_element!`)
+        el = new_local!(fc, I32)
         push_leaf!(fc, o.index)
         emit!(fc.b, :i32_const, elem_unit(o.eltype)); emit!(fc.b, :i32_div_u)
         if !(isconstant(i) && constant_value(i) == 1)
-            # (the `i`-th pointer: the `i`-th reference)
             push_val!(fc, convert_repr(fc, i, Int)); emit!(fc.b, :i32_wrap_i64)
             emit!(fc.b, :i32_const, 1); emit!(fc.b, :i32_sub); emit!(fc.b, :i32_add)
         end
-        emit!(fc.b, :ref_null, (ml.storage::RefType).heap)
-        emit!(fc.b, :array_set, ml.array)
+        ml.stride != 1 && (emit!(fc.b, :i32_const, ml.stride); emit!(fc.b, :i32_mul))
+        emit!(fc.b, :local_set, el)
+        for k in 0:ml.stride-1
+            push_leaf!(fc, o.array)
+            emit!(fc.b, :local_get, el)
+            k != 0 && (emit!(fc.b, :i32_const, k); emit!(fc.b, :i32_add))
+            emit!(fc.b, :ref_null, (ml.storage::RefType).heap)
+            emit!(fc.b, :array_set, ml.array)
+        end
         return p
     end
     if o !== nothing && !is_object_origin(o) && T === o.eltype && !byte_addressable(fc, T)
