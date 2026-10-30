@@ -170,30 +170,37 @@ end
 ## preopened directories and the working directory
 
 "The preopened directories: (fd, absolute path), read from the host on first use."
-const PREOPENS = Tuple{Int32,String}[]
+const PREOPENS = Ref(Tuple{Int32,String}[])
 const PREOPENS_READ = Ref(false)
 "The working directory (absolute, normalized; empty: not set yet)."
 const CWD = Ref("")
 
+# Preview 1 hosts conventionally assign contiguous preopens starting at fd 3.
+# EBADF ends enumeration; other failures leave the table unpublished.
 function preopens()
-    PREOPENS_READ[] && return PREOPENS
-    PREOPENS_READ[] = true
+    PREOPENS_READ[] && return PREOPENS[]
+    found = Tuple{Int32,String}[]
     fd = Int32(3)
     while true
         r = fd_prestat_get(fd, Staging.SCRATCH_OUT)
-        r == 0 || break     # EBADF: the end of the preopens
-        if Staging.load8(Staging.SCRATCH_OUT) == 0x00   # a directory
+        r == 8 && break # EBADF
+        Runtime.wasi_check(r, "fd_prestat_get")
+        if Staging.load8(Staging.SCRATCH_OUT) == 0x00
             name = prestat_name(fd, Staging.load32(Staging.SCRATCH_OUT + UInt32(4)))
-            isempty(name) || push!(PREOPENS, (fd, normalize(name)))
+            startswith(name, '/') || throw(Base.IOError("preopen name must be absolute", Int32(Base.UV_EINVAL)))
+            push!(found, (fd, normalize(name)))
         end
         fd += Int32(1)
     end
-    return PREOPENS
+    PREOPENS[] = found
+    PREOPENS_READ[] = true
+    return found
 end
 
 prestat_name(fd::Int32, n::UInt32) = Staging.with_scope() do
     off = Staging.alloc_record(n; align=1)
-    fd_prestat_dir_name(fd, off, n) == 0 ? get_raw(off, n) : ""
+    Runtime.wasi_check(fd_prestat_dir_name(fd, off, n), "fd_prestat_dir_name")
+    get_raw(off, n)
 end
 
 "The value of the variable `name` of the environment (`ENV`, see `Env`), or `nothing`."

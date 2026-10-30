@@ -339,6 +339,32 @@ function errno_fault(k::Int)
     return code
 end
 
+function preopen_retry(k::Int)
+    code = try
+        WasmCodegen.Runtime.FS.preopens()
+        Int32(0)
+    catch e
+        e isa Base.IOError ? e.code : Int32(1)
+    end
+    unpublished = !WasmCodegen.Runtime.FS.PREOPENS_READ[] && isempty(WasmCodegen.Runtime.FS.PREOPENS[])
+    ps = WasmCodegen.Runtime.FS.preopens()
+    return Int32(code == Base.UV_EIO && unpublished && length(ps) == 2 &&
+        WasmCodegen.Runtime.FS.resolve(ROOT)[1] != WasmCodegen.Runtime.FS.resolve(ROOT * "/nested")[1] &&
+        WasmCodegen.Runtime.FS.resolve(ROOT * "-near-miss")[1] == -1)
+end
+
+preopen_empty(k::Int) = Int32(isempty(WasmCodegen.Runtime.FS.preopens()))
+function preopen_relative(k::Int)
+    try
+        WasmCodegen.Runtime.FS.preopens()
+        Int32(0)
+    catch e
+        e isa Base.IOError ? e.code : Int32(1)
+    end
+end
+
+
+
 @testset "filesystem over WASI" begin
     expected = fs_ops(1)
     @test run_fs(fs_print, 2) == 0
@@ -412,6 +438,17 @@ end
             (4, "fd_seek", 1, 62, 130), (7, "fd_seek", 1, 76, 13))
         @test fault_run(errno_fault, k, [Dict("call" => call, "at" => at, "errno" => errno)]) == expected
     end
+    # Discovery failures must neither publish partial state nor prevent a retry.
+    nested = Dict(ROOT => ROOT, ROOT * "/nested" => ROOT)
+    for call in ("fd_prestat_get", "fd_prestat_dir_name")
+        c = WasmCodegen.compile(preopen_retry, (Int,); config=cfg)
+        @test wasm_run(c, "preopen_retry", 1; rettype=Int32, preopens=nested,
+            wasi_faults=[Dict("call" => call, "at" => 2, "errno" => 29)]) == 1
+    end
+    c = WasmCodegen.compile(preopen_empty, (Int,); config=cfg)
+    @test wasm_run(c, "preopen_empty", 1; rettype=Int32, preopens=Dict{String,String}()) == 1
+    c = WasmCodegen.compile(preopen_relative, (Int,); config=cfg)
+    @test wasm_run(c, "preopen_relative", 1; rettype=Int32, preopens=Dict("relative" => ROOT)) == Base.UV_EINVAL
     # (for JavaScript, unsupported)
     @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(fs_print, (Int,))
 end
