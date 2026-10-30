@@ -86,6 +86,17 @@ function st_wasi_error()
     end
 end
 st_wasi_error_ok() = st_wasi_error() == "ok"
+# Every WASI error goes through the same check and formatting natively and in Wasm.
+function st_errno(e::Int32)
+    try
+        R.wasi_check(e, "probe")
+        return (Int32(0), UInt64(0))
+    catch err
+        err isa Base.IOError || return (Int32(1), UInt64(0))
+        h = foldl((h, b) -> h * 31 + b, codeunits(err.msg); init=UInt64(0))
+        return (Int32(err.code), h)
+    end
+end
 plain(x::Int) = x + 1
 # a WASI call whose pointer is in the runtime's part, without a load or store of it
 scratch_only() = R.WASI.clock_time_get(R.WASI.CLOCK_REALTIME, UInt64(1000), S.SCRATCH_OUT)
@@ -117,8 +128,29 @@ scratch_only() = R.WASI.clock_time_get(R.WASI.CLOCK_REALTIME, UInt64(1000), S.SC
     @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(st_clock, (); config=WasmCodegen.Config(host=:js))
     # the errno tables, as libuv's and the C library's
     E = R.Errno
-    @test E.uv_code(8) == Base.UV_EBADF && E.uv_message(Base.UV_ENOENT) == Base.struverror(Int32(Base.UV_ENOENT))
-    @test E.strerror(Base.Libc.EACCES) == Base.Libc.strerror(Base.Libc.EACCES)
+    c = wcomp(st_errno, (Int32,))
+    for e in vcat(Int32.(-1:76), Int32[77, typemax(Int32)])
+        expected = if e == 0
+            Int32(0)
+        elseif 1 <= e <= 76
+            name = e == 76 ? :EACCES : E.WASI_NAMES[e+1]
+            uv = Symbol(:UV_, name)
+            isdefined(Base, uv) ? Int32(getglobal(Base, uv)) : Int32(Base.UV_EIO)
+        else
+            Int32(Base.UV_EIO)
+        end
+        @test E.uv_code(e) == expected
+        native = st_errno(e)
+        @test native[1] == expected
+        @test wasm_run(c, "st_errno", e; rettype=Tuple{Int32,UInt64}) == native
+        if e != 0
+            @test E.uv_message(expected) == Base.struverror(expected)
+            @test E.uv_name(expected) == Base.uverrorname(expected)
+        end
+    end
+    @test E.uv_message(Base.UV_EOF) == "end of file"
+    @test E.uv_name(Base.UV_EOF) == "EOF"
+    @test E.strerror(13) == Base.Libc.strerror(Base.Libc.EACCES)
 end
 
 end

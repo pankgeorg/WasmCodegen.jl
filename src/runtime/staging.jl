@@ -17,6 +17,11 @@ runtime's starts at the second:
 - `[DATA_BASE, DATA_END)` = `[1 MiB + 64 KiB, 6 MiB + 64 KiB)`: the data arena (at most 1 MiB
   per allocation).
 
+The memory is fixed at compile time when staging is used; allocations do not grow it.
+Scopes share one pair of arena tops and support a single synchronous call stack, including
+nested scopes. Pointers must not escape their scope. Threads, suspension inside a scope,
+and reentrant host callbacks that reuse staging require separate ownership and are unsupported.
+
 Hosts get offsets of this memory only as arguments of their functions, never as constants
 of their own, so the layout can change.
 
@@ -102,7 +107,8 @@ end
 """
     with_scope(f)
 
-Call `f()`; what it allocates in the arenas is released when it returns or throws.
+Call `f()` synchronously; what it allocates is released when it returns or throws.
+Nested scopes are supported; pointers must not outlive the scope (see [`Staging`](@ref)).
 """
 function with_scope(f::F) where {F}
     record, data = load32(RECORD_USED), load32(DATA_USED)
@@ -244,12 +250,10 @@ end # WASI
 """
     Errno
 
-WASI errnos (preview 1 numbering), the libuv codes Base compares against (negated Linux
-errnos, `Base.UV_E*`) and their messages: the tables are made natively when
-WasmCodegen is loaded, from libuv's and the C library's own messages (`uv_strerror`,
-`uv_err_name`, `strerror`), so errors read as natively. (The numbering of the C library's
-errnos is Linux's: a build host with another numbering gives other codes.) ENOTCAPABLE (76, of WASI only) is
-EACCES.
+WASI errnos (preview 1 numbering) mapped by name to the build platform's `Base.UV_E*`
+codes. ENOTCAPABLE becomes EACCES; errors without a libuv equivalent and unknown WASI
+codes become EIO. Guest libc errno numbers are a separate, fixed Linux ABI, independent
+of the build host. Messages are captured natively when the package loads.
 """
 module Errno
 
@@ -265,38 +269,53 @@ const WASI_NAMES = (:SUCCESS, :E2BIG, :EACCES, :EADDRINUSE, :EADDRNOTAVAIL, :EAF
     :EPROTOTYPE, :ERANGE, :EROFS, :ESPIPE, :ESRCH, :ESTALE, :ETIMEDOUT, :ETXTBSY, :EXDEV,
     :ENOTCAPABLE)
 
-# Linux errnos of the names (Base.Libc has most; the others from <errno.h>)
-const LINUX_EXTRA = Dict(:ENOTSUP => 95, :ENOTCAPABLE => 13, :ECANCELED => 125,
-                         :ENOTRECOVERABLE => 131, :EOWNERDEAD => 130, :EMULTIHOP => 72,
-                         :ENOLINK => 67, :EBADMSG => 74, :EPROTO => 71, :EDQUOT => 122,
-                         :ESTALE => 116, :EIDRM => 43, :ENOMSG => 42, :EOVERFLOW => 75,
-                         :ETXTBSY => 26, :ENOLCK => 37, :EILSEQ => 84)
-linux_errno(name::Symbol) = isdefined(Base.Libc, name) ? Int(getglobal(Base.Libc, name)) :
-                            get(LINUX_EXTRA, name, 5)
+"The fixed guest libc errno of each WASI errno (index: the WASI errno + 1)."
+const LINUX = Int32[0, 7, 13, 98, 99, 97, 11, 114, 9, 74, 16, 125, 10, 103, 111,
+    104, 35, 89, 33, 122, 17, 14, 27, 113, 43, 84, 115, 4, 22, 5, 106, 21, 40, 24,
+    31, 90, 72, 36, 100, 102, 101, 23, 105, 19, 2, 8, 37, 67, 12, 42, 92, 28, 38,
+    107, 20, 39, 131, 88, 95, 25, 6, 75, 130, 1, 32, 71, 93, 91, 34, 30, 29, 3,
+    116, 110, 26, 18, 13]
 
-"The Linux errno of each WASI errno (index: the WASI errno + 1)."
-const LINUX = Int32[name === :SUCCESS ? 0 : linux_errno(name) for name in WASI_NAMES]
+# Resolve by libuv name, never by negating a libc errno. Some WASI/POSIX errors
+# (e.g. EDOM, EOWNERDEAD) have no libuv name; report EIO for those.
+const UV = Int32[name === :SUCCESS ? 0 :
+    getglobal(Base, isdefined(Base, Symbol(:UV_, name === :ENOTCAPABLE ? :EACCES : name)) ?
+        Symbol(:UV_, name === :ENOTCAPABLE ? :EACCES : name) : :UV_EIO) for name in WASI_NAMES]
 
-# the messages, by Linux errno (index: errno + 1), up to 133
-const NERR = 134
-"glibc's `strerror`."
-const STRERROR = String[Base.Libc.strerror(Int32(e)) for e in 0:NERR-1]
-"libuv's `uv_strerror` and `uv_err_name` of the code `-errno`."
-const UV_STRERROR = String[e == 0 ? "" : Base.struverror(Int32(-e)) for e in 0:NERR-1]
-const UV_NAME = String[e == 0 ? "" : Base.uverrorname(Int32(-e)) for e in 0:NERR-1]
+# Include all of Base's libuv codes, including Windows's non-libc numbering and EOF.
+const UV_CODES = Int32[v for (_, v) in Base.uv_err_vals]
+const UV_STRERROR = String[Base.struverror(c) for c in UV_CODES]
+const UV_NAME = String[Base.uverrorname(c) for c in UV_CODES]
 
-"The libuv code of the WASI errno `e` (`UV_EIO` for one not WASI's)."
-uv_code(e::Integer) = 0 <= e < length(LINUX) ? -LINUX[e+1] : Int32(-5)
-
-"`strerror(errno)` (a Linux errno), as glibc's."
-strerror(e::Integer) = 0 <= e < NERR ? STRERROR[e+1] : string("Unknown error ", e)
+"The libuv code of WASI errno `e` (`UV_EIO` for unknown or unrepresentable errors)."
+uv_code(e::Integer) = 0 <= e < length(UV) ? UV[e+1] : Int32(Base.UV_EIO)
 
 "`uv_strerror(code)`, as libuv's."
-uv_message(code::Integer) = 0 < -code < NERR ? UV_STRERROR[-code+1] :
-                            code == Base.UV_EOF ? "end of file" : string("Unknown system error ", code)
+function uv_message(code::Integer)
+    i = findfirst(==(code), UV_CODES)
+    return i === nothing ? string("Unknown system error ", code) : UV_STRERROR[i]
+end
 "`uv_err_name(code)`, as libuv's."
-uv_name(code::Integer) = 0 < -code < NERR ? UV_NAME[-code+1] :
-                         code == Base.UV_EOF ? "EOF" : string("Unknown system error ", code)
+function uv_name(code::Integer)
+    i = findfirst(==(code), UV_CODES)
+    return i === nothing ? string("Unknown system error ", code) : UV_NAME[i]
+end
+
+# Guest libc numbers stay fixed even when the build libc uses different numbers.
+const NERR = 134
+const STRERROR = let messages = String[string("Unknown error ", e) for e in 0:NERR-1]
+    messages[1] = Base.Libc.strerror(Int32(0))
+    for (i, name) in enumerate(WASI_NAMES)
+        name === :SUCCESS && continue
+        native_name = name === :ENOTCAPABLE ? :EACCES : name
+        messages[LINUX[i]+1] = isdefined(Base.Libc, native_name) ?
+            Base.Libc.strerror(Int32(getglobal(Base.Libc, native_name))) : uv_message(UV[i])
+    end
+    messages
+end
+
+"`strerror(errno)` for the guest's fixed Linux libc errno ABI."
+strerror(e::Integer) = 0 <= e < NERR ? STRERROR[e+1] : string("Unknown error ", e)
 
 end # Errno
 
