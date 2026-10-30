@@ -137,23 +137,9 @@ end
 "The platform libuv code of the WASI errno `e`."
 uv(e::Integer) = Errno.uv_code(e)
 
-# The pre-helper runtime is supported while this change is restacked. New runtimes
-# provide explicit WASI/libuv-to-guest-libc conversions in Errno.
-@static if isdefined(Errno, :guest_errno)
-    libc_errno(e::Integer) = Errno.guest_errno(e)
-    libc_from_uv(code::Integer) = Errno.uv_to_guest_errno(code)
-else
-    libc_errno(e::Integer) = 0 <= e < length(Errno.LINUX) ? Errno.LINUX[e+1] : Int32(5)
-    function libc_from_uv(code::Integer)
-        code == 0 && return Int32(0)
-        name = Errno.uv_name(code)
-        for (i, n) in enumerate(Errno.WASI_NAMES)
-            string(n) == name && return Errno.LINUX[i]
-        end
-        return Int32(5)
-    end
-end
-
+# WASI and libuv results have distinct conversions to the fixed guest libc ABI.
+libc_errno(e::Integer) = Errno.guest_errno(e)
+libc_from_uv(code::Integer) = Errno.uv_to_guest_errno(code)
 
 "The `n` bytes at `off` of the linear memory, as a string."
 get_raw(off::UInt32, n::Integer) = String(get_bytes(off, Int(n)))
