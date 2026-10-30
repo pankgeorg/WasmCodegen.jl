@@ -77,21 +77,52 @@ end
 ## the time of day: the host's clock; local time is UTC in Wasm
 
 module TimeTests
-tm(t::Int) = (x = Base.Libc.TmStruct(t); (x.sec, x.min, x.hour, x.mday, x.month, x.year, x.wday, x.yday, x.isdst))
-timeval_sec() = Base.Libc.TimeVal().sec
+tm(t::Real) = (x = Base.Libc.TmStruct(t); (x.sec, x.min, x.hour, x.mday, x.month, x.year, x.wday, x.yday, x.isdst))
+timeval_fields() = (x = Base.Libc.TimeVal(); (x.sec, x.usec))
 end
 
 @testset "time" begin
     T = TimeTests
     cfg = WasmCodegen.Config(host=:wasi)
+    # Fixed UTC calendar tuples, independent of Runtime.Time.utc_fields. Include
+    # century leap rules, weekday/year-day rollover, and pre-epoch fractions.
+    integer_cases = (
+        (0, (0, 0, 0, 1, 0, 70, 4, 0, 0)), # 1970-01-01T00:00:00+00:00
+        (-2203891201, (59, 59, 23, 28, 1, 0, 3, 58, 0)), # 1900-02-28T23:59:59+00:00
+        (-2203891200, (0, 0, 0, 1, 2, 0, 4, 59, 0)), # 1900-03-01T00:00:00+00:00
+        (951782399, (59, 59, 23, 28, 1, 100, 1, 58, 0)), # 2000-02-28T23:59:59+00:00
+        (951782400, (0, 0, 0, 29, 1, 100, 2, 59, 0)), # 2000-02-29T00:00:00+00:00
+        (951868800, (0, 0, 0, 1, 2, 100, 3, 60, 0)), # 2000-03-01T00:00:00+00:00
+        (4107542399, (59, 59, 23, 28, 1, 200, 0, 58, 0)), # 2100-02-28T23:59:59+00:00
+        (4107542400, (0, 0, 0, 1, 2, 200, 1, 59, 0)), # 2100-03-01T00:00:00+00:00
+        (946684799, (59, 59, 23, 31, 11, 99, 5, 364, 0)), # 1999-12-31T23:59:59+00:00
+        (946684800, (0, 0, 0, 1, 0, 100, 6, 0, 0)), # 2000-01-01T00:00:00+00:00
+        (-2522892345, (15, 34, 20, 19, 0, -10, 0, 18, 0)), # 1890-01-19T20:34:15+00:00
+        (1730000000, (20, 33, 3, 27, 9, 124, 0, 300, 0)), # 2024-10-27T03:33:20+00:00
+        (4102444799, (59, 59, 23, 31, 11, 199, 4, 364, 0)), # 2099-12-31T23:59:59+00:00
+        (1709251199, (59, 59, 23, 29, 1, 124, 4, 59, 0)), # 2024-02-29T23:59:59+00:00
+    )
     c = WasmCodegen.compile(T.tm, (Int,); config=cfg)
-    for t in (0, 951782400, 951868800, -2522892345, 1730000000, 4102444799, 1709251199)
-        f = WasmCodegen.Runtime.Time.utc_fields(Int64(t))
-        @test wasm_run(c, "tm", t; rettype=NTuple{9,Int32}) == (f..., Int32(0))
+    for (t, expected) in integer_cases
+        @test wasm_run(c, "tm", t; rettype=NTuple{9,Int32}) == expected
     end
-    c = WasmCodegen.compile(T.timeval_sec, (); config=cfg)
-    @test abs(wasm_run(c, "timeval_sec"; rettype=Int64) - Base.Libc.TimeVal().sec) <= 5
-    # natively, Base's own (local time)
-    @test T.tm(0)[6] == Base.Libc.TmStruct(0).year
+    c = WasmCodegen.compile(T.tm, (Float64,); config=cfg)
+    for (t, expected) in (
+        (-0.25, (59, 59, 23, 31, 11, 69, 3, 364, 0)),
+        (-86400.25, (59, 59, 23, 30, 11, 69, 2, 363, 0)),
+        (951868799.75, (59, 59, 23, 29, 1, 100, 2, 59, 0)))
+        @test wasm_run(c, "tm", t; rettype=NTuple{9,Int32}) == expected
+    end
+    c = WasmCodegen.compile(T.timeval_fields, (); config=cfg)
+    # Native time() bounds around each call, including the Wasm call. The
+    # integer-second bounds allow for TimeVal's microsecond truncation.
+    for get_time in (T.timeval_fields,
+                     () -> wasm_run(c, "timeval_fields"; rettype=Tuple{Int64,Int64}))
+        before = time()
+        sec, usec = get_time()
+        after = time()
+        @test floor(Int64, before) <= sec <= floor(Int64, after)
+        @test 0 <= usec < 1_000_000
+        @test before - 1e-6 <= sec + usec / 1_000_000 <= after
+    end
 end
-
