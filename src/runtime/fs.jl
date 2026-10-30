@@ -230,7 +230,7 @@ function resolve(path::String)
             best, rel, len = fd, isempty(r) ? "." : r, n
         end
     end
-    return (best, rel)
+    return (best, trailing_sep(path) ? rel * "/" : rel)
 end
 
 const UV_ENOENT = Int32(-2)
@@ -521,7 +521,15 @@ uv_fs_rmdir(loop::Ptr{Cvoid}, req::Ptr{Cvoid}, path::Cstring, cb::Ptr{Cvoid}) =
     simple(path_remove_directory, unsafe_string(path))
 jl_fs_unlink(path::Cstring) = simple(path_unlink_file, unsafe_string(path))
 
+# A final dot is meaningful to destructive operations, even though lookup normalizes it.
+terminal_dot(path::String) = (c = basename(rstrip(path, '/')); c == "." || c == "..")
+
 function simple(f::F, path::String) where {F}
+    c = check_path(path)
+    c == 0 || return c
+    if terminal_dot(path)
+        return f === path_remove_directory ? (basename(rstrip(path, '/')) == "." ? Int32(-22) : Int32(-39)) : Int32(-21)
+    end
     r = with_path((fd, off, len) -> f(fd, off, len), path)
     return r <= 0 ? r : uv(r)
 end
@@ -532,12 +540,19 @@ function jl_fs_rename(old::Cstring, new::Cstring)
     c == 0 || return c
     c = check_path(n)
     c == 0 || return c
+    (terminal_dot(o) || terminal_dot(n)) && return Int32(-16) # EBUSY
+    # A slash-terminated destination can name a new directory, but never a file.
+    if trailing_sep(n)
+        ft = filetype(o, false)
+        ft isa Int32 && return ft
+        ft == FT_DIR || return UV_ENOTDIR
+    end
     ofd, orel = resolve(o)
     nfd, nrel = resolve(n)
     r = Staging.with_scope() do
-        o, ol = Staging.raw_path(orel)
-        n, nl = Staging.raw_path(nrel)
-        path_rename(ofd, o, ol, nfd, n, nl)
+        oldoff, ol = Staging.raw_path(orel)
+        newoff, nl = Staging.raw_path(nrel)
+        path_rename(ofd, oldoff, ol, nfd, newoff, nl)
     end
     return r == 0 ? Int32(0) : uv(r)
 end
@@ -550,6 +565,10 @@ the preopen), else WASI's.
 function jl_fs_symlink(target::Cstring, link::Cstring, flags::Cint)
     t = unsafe_string(target)
     l = unsafe_string(link)
+    if trailing_sep(l)
+        ft = filetype(String(rstrip(l, '/')), false)
+        return ft isa Int32 ? ft : Int32(-17)
+    end
     c = check_path(l)
     c == 0 || return c
     r = Staging.with_scope() do
@@ -573,14 +592,20 @@ function jl_fs_hardlink(src::Cstring, dst::Cstring)
     o, n = unsafe_string(src), unsafe_string(dst)
     c = check_path(o)
     c == 0 || return c
+    if trailing_sep(n)
+        ft = filetype(o, false)
+        ft isa Int32 && return ft
+        ft = filetype(String(rstrip(n, '/')), false)
+        return ft isa Int32 ? ft : Int32(-17)
+    end
     c = check_path(n)
     c == 0 || return c
     ofd, orel = resolve(o)
     nfd, nrel = resolve(n)
     r = Staging.with_scope() do
-        o, ol = Staging.raw_path(orel)
-        n, nl = Staging.raw_path(nrel)
-        path_link(ofd, UInt32(0), o, ol, nfd, n, nl)
+        oldoff, ol = Staging.raw_path(orel)
+        newoff, nl = Staging.raw_path(nrel)
+        path_link(ofd, UInt32(0), oldoff, ol, nfd, newoff, nl)
     end
     return r == 0 ? Int32(0) : uv(r)
 end
