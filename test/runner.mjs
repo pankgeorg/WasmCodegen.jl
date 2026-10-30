@@ -39,6 +39,7 @@ async function instantiate(mod, opts = {}) {
         if (calls > 32 && rules.some((r) => r.repeat)) throw new Error('fault host: no progress');
         const rule = rules.find((r) => r.at === calls || (r.repeat && calls >= r.at));
         if (!rule) return original(...args);
+        if (rule.trap) throw new Error(rule.trap);
         if (rule.errno !== undefined) return rule.errno;
         const memory = new DataView(inst.exports.memory.buffer);
         if (rule.maxBytes !== undefined) {

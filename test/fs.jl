@@ -1211,4 +1211,117 @@ end
     @test FS.is_normal("/") && FS.is_normal("/a/b.c/..d") && !FS.is_normal("a") && !FS.is_normal("")
     @test !FS.is_normal("//") && !FS.is_normal("/a/") && !FS.is_normal("/a/./b") && !FS.is_normal("/..")
 end
+function all_false_once(k::Int)
+    p = joinpath(ROOT, string("all-false", k))
+    write(p, UInt8[i % 251 for i in 0:149_999])
+    io = open(p)
+    b = fill(UInt8(0xa5), 100_000)
+    n = readbytes!(io, b, 100_000; all=false)
+    ok = 0 < n <= 100_000 && position(io) == n &&
+        all(i -> b[i] == UInt8((i - 1) % 251), 1:n) && all(==(0xa5), b[n+1:end])
+    close(io); rm(p)
+    return Int32(ok)
+end
+
+# An all=false read may return a different positive short count on each host.
+# Every returned byte and the logical position must agree with that count.
+function byte_offsets(k::Int)
+    p = joinpath(ROOT, string("byte-offsets", k))
+    write(p, UInt8[i % 251 for i in 0:149_999])
+    io = open(p)
+    b = fill(UInt8(0xa5), 100_020)
+    n = readbytes!(io, b, 100_000; all=false)
+    ok = 0 < n <= 100_000 && position(io) == n
+    ok &= all(i -> b[i] == UInt8((i - 1) % 251), 1:n)
+    ok &= all(==(0xa5), b[n+1:end])
+    seekstart(io)
+    c = fill(UInt8(0xa5), 48)
+    got = GC.@preserve c ccall(:ios_readall, Csize_t,
+        (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), io.ios, Ptr{Cvoid}(pointer(c) + 7), 20)
+    ok &= got == 20 && c[8:27] == UInt8.(0:19)
+    ok &= all(==(0xa5), c[1:7]) && all(==(0xa5), c[28:end])
+    before = copy(c)
+    zero = GC.@preserve c ccall(:ios_read, Csize_t,
+        (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), io.ios, Ptr{Cvoid}(pointer(c) + 11), 0)
+    ok &= zero == 0 && c == before && position(io) == 20
+    # Keep byte-memory provenance through a non-byte pointer cast in this function.
+    got = GC.@preserve c ccall(:ios_read, Csize_t,
+        (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), io.ios, Ptr{UInt32}(pointer(c) + 3), 9)
+    ok &= got == 9 && c[4:12] == UInt8.(20:28)
+    ok &= c[1:3] == before[1:3] && c[13:end] == before[13:end]
+    # popfirst! can shift an Array's storage start within its Memory.
+    shifted = fill(UInt8(0xa5), 80)
+    for _ in 1:17
+        popfirst!(shifted)
+    end
+    ok &= Core.memoryrefoffset(shifted.ref) > 1
+    seekstart(io)
+    got = GC.@preserve shifted ccall(:ios_readall, Csize_t,
+        (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), io.ios, Ptr{Cvoid}(pointer(shifted) + 5), 13)
+    ok &= got == 13 && shifted[6:18] == UInt8.(0:12)
+    ok &= all(==(0xa5), shifted[1:5]) && all(==(0xa5), shifted[19:end])
+    # A byte pointer cast over word storage must retain the pointer fallback.
+    words = fill(UInt32(0xa5a5a5a5), 10)
+    seekstart(io)
+    got = GC.@preserve words ccall(:ios_readall, Csize_t,
+        (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), io.ios, Ptr{UInt8}(pointer(words)) + 5, 7)
+    ok &= got == 7 && words[1] == 0xa5a5a5a5 && words[2] == 0x020100a5 && words[3] == 0x06050403
+    ok &= all(==(0xa5a5a5a5), words[4:end])
+    close(io); rm(p)
+    return Int32(ok)
+end
+
+# Keep the direct call small enough to inspect the selected IO helper in the output.
+function direct_byte_read(k::Int)
+    io = open(joinpath(ROOT, "direct-bytes"))
+    b = fill(UInt8(0xa5), 32)
+    got = GC.@preserve b ccall(:ios_readall, Csize_t,
+        (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), io.ios, Ptr{Cvoid}(pointer(b) + 7), 10)
+    close(io)
+    return Int32(got == 10 && b[8:17] == UInt8.(0:9) &&
+        all(==(0xa5), b[1:7]) && all(==(0xa5), b[18:end]))
+end
+
+@testset "short byte reads and explicit offsets" begin
+    @test all_false_once(1) == 1
+    short = WasmCodegen.compile(all_false_once, (Int,); config=cfg)
+    @test wasm_run(short, "all_false_once", 2; rettype=Int32, preopens=Dict(ROOT => ROOT),
+        wasi_faults=[Dict("call" => "fd_read", "at" => 2, "trap" => "all=false read twice")]) == 1
+    @test any(mi -> mi.def isa Method && mi.def.module === WasmCodegen.Runtime.FS && mi.def.name === :ios_read &&
+        MemoryRef{UInt8} in mi.specTypes.parameters, keys(short.cgm.funcs))
+    @test byte_offsets(1) == 1
+    @test run_fs(byte_offsets, 2) == 1
+    write(joinpath(ROOT, "direct-bytes"), UInt8.(0:31))
+    @test direct_byte_read(1) == 1
+    c = WasmCodegen.compile(direct_byte_read, (Int,); config=cfg)
+    @test wasm_run(c, "direct_byte_read", 2; rettype=Int32, preopens=Dict(ROOT => ROOT)) == 1
+    @test any(mi -> mi.def isa Method && mi.def.module === WasmCodegen.Runtime.FS && mi.def.name === :ios_readall &&
+        MemoryRef{UInt8} in mi.specTypes.parameters, keys(c.cgm.funcs))
+    @test occursin("array.copy", sprint(WasmCodegen.WasmBuilder.print_wat, c.cgm.mod))
+end
+
+const FIXED_NORMALIZE = (("", ROOT), (".", ROOT), ("a/../b", ROOT * "/b"),
+    ("α/.", ROOT * "/α"), (String(UInt8[0x2f, 0xff]), String(UInt8[0x2f, 0xff])),
+    (String(UInt8[0x2f, 0xff, 0x2f, 0x2e]), String(UInt8[0x2f, 0xff])), ("/a\0", "/a\0"))
+# (in Wasm, where `normalize` asks the host whether a component before `.` or `..` is a
+# symbolic link: none here)
+function fixed_normalize(k::Int)
+    F = WasmCodegen.Runtime.FS
+    F.CWD[] = ROOT
+    ok = true
+    for (path, expected) in FIXED_NORMALIZE
+        ok &= F.normalize(path) == expected
+    end
+    return Int32(ok)
+end
+@testset "normalize fixed inputs" begin
+    F = WasmCodegen.Runtime.FS
+    for (path, expected) in FIXED_NORMALIZE
+        @test F.is_normal(path) == (path == expected)
+        # (natively, of paths in normal form only: they ask the host nothing)
+        F.is_normal(path) && @test F.normalize(path) == expected
+    end
+    @test run_fs(fixed_normalize, 1) == 1
+end
+
 end
