@@ -98,6 +98,22 @@ function fs_ops(k::Int, out::IO)
     symlink("destination", d)
     attempt(() -> Base.rename(joinpath(dir, "f"), d * "/"), "rename file to link/")
     rec("unchanged ", islink(d), " ", isdir(dst), " ", isfile(joinpath(dir, "f")))
+    ds = joinpath(dir, "directory-source")
+    mkdir(ds)
+    attempt(() -> Base.rename(ds, d * "/"), "rename directory to link/")
+    rec("directory/link survive ", isdir(ds), " ", islink(d), " ", isdir(dst))
+    plain = joinpath(dir, "plain")
+    write(plain, "destination")
+    attempt(() -> Base.rename(joinpath(dir, "f"), plain * "/"), "rename file to file/")
+    attempt(() -> Base.rename(ds, plain * "/"), "rename directory to file/")
+    attempt(() -> symlink("f", plain * "/"), "symlink file/")
+    attempt(() -> hardlink(joinpath(dir, "f"), plain * "/"), "hardlink file/")
+    rec("plain survives ", read(plain, String), " ", isdir(ds))
+    target = joinpath(dir, "replace-directory")
+    mkdir(target)
+    Base.rename(ds, target * "/")
+    rec("replace directory/ ", !ispath(ds), " ", isdir(target))
+
     rm(dir; recursive=true)
     return nothing
 end
@@ -299,6 +315,66 @@ function sendfile_fault(k::Int)
     return Int32(ok)
 end
 
+@noinline query_error(path::UInt32, len::UInt32, follow::Int32) = Int32(-29) # WASI EIO
+function mode_query_fault(k::Int)
+    p = joinpath(ROOT, string("mode-query", k))
+    code = try
+        if k == 1
+            mkdir(p; mode=0o700)
+        else
+            f = Base.Filesystem.open(p, Base.Filesystem.JL_O_CREAT | Base.Filesystem.JL_O_RDWR, 0o600)
+            close(f)
+        end
+        Int32(0)
+    catch e
+        e isa Base.IOError ? e.code : Int32(1)
+    end
+    # The created object remains; use readdir to avoid the failing mode provider.
+    exists = basename(p) in readdir(ROOT)
+    # A leaked file descriptor would occupy the next slot. Opening this existing file
+    # gets the same slot as a normal closed File open (fd 4 with one preopen).
+    fdok = true
+    if k == 2
+        f = Base.Filesystem.open(p, Base.Filesystem.JL_O_RDONLY)
+        fdok = reinterpret(Int32, f.handle) == 4
+        close(f)
+    end
+    return Int32(code == Base.UV_EIO && exists && fdok)
+end
+
+function preopen_retry(k::Int)
+    code = try
+        WasmCodegen.Runtime.FS.preopens()
+        Int32(0)
+    catch e
+        e isa Base.IOError ? e.code : Int32(1)
+    end
+    unpublished = !WasmCodegen.Runtime.FS.PREOPENS_READ[] && isempty(WasmCodegen.Runtime.FS.PREOPENS[])
+    ps = WasmCodegen.Runtime.FS.preopens()
+    return Int32(code == Base.UV_EIO && unpublished && length(ps) == 2 &&
+        WasmCodegen.Runtime.FS.resolve(ROOT)[1] != WasmCodegen.Runtime.FS.resolve(ROOT * "/nested")[1] &&
+        WasmCodegen.Runtime.FS.resolve(ROOT * "-near-miss")[1] == -1)
+end
+
+function realpath_root(k::Int)
+    try
+        realpath(ROOT) == ROOT ? Int32(0) : Int32(1)
+    catch e
+        e isa Base.IOError ? e.code : Int32(1)
+    end
+end
+
+preopen_empty(k::Int) = Int32(isempty(WasmCodegen.Runtime.FS.preopens()))
+function preopen_relative(k::Int)
+    try
+        WasmCodegen.Runtime.FS.preopens()
+        Int32(0)
+    catch e
+        e isa Base.IOError ? e.code : Int32(1)
+    end
+end
+
+
 # Check both WASI -> libc (even without a libuv equivalent) and UV -> libc paths.
 function errno_maps(k::Int)
     F = WasmCodegen.Runtime.FS
@@ -339,31 +415,24 @@ function errno_fault(k::Int)
     return code
 end
 
-function preopen_retry(k::Int)
-    code = try
-        WasmCodegen.Runtime.FS.preopens()
-        Int32(0)
-    catch e
-        e isa Base.IOError ? e.code : Int32(1)
+function public_file_errors(k::Int, out::IO)
+    for reading in (false, true)
+        # An invalid descriptor exercises the same raw error on both hosts; a missing
+        # WASI right can deliberately be EACCES where a native access mode is EBADF.
+        f = Base.Filesystem.File(RawFD(-1))
+        try
+            reading ? read(f, UInt8) : write(f, UInt8('y'))
+            println(out, "unexpected success")
+        catch e
+            println(out, err_text(e, "/unused-test-path"))
+        end
+        f.open = false
     end
-    unpublished = !WasmCodegen.Runtime.FS.PREOPENS_READ[] && isempty(WasmCodegen.Runtime.FS.PREOPENS[])
-    ps = WasmCodegen.Runtime.FS.preopens()
-    return Int32(code == Base.UV_EIO && unpublished && length(ps) == 2 &&
-        WasmCodegen.Runtime.FS.resolve(ROOT)[1] != WasmCodegen.Runtime.FS.resolve(ROOT * "/nested")[1] &&
-        WasmCodegen.Runtime.FS.resolve(ROOT * "-near-miss")[1] == -1)
+    return nothing
 end
-
-preopen_empty(k::Int) = Int32(isempty(WasmCodegen.Runtime.FS.preopens()))
-function preopen_relative(k::Int)
-    try
-        WasmCodegen.Runtime.FS.preopens()
-        Int32(0)
-    catch e
-        e isa Base.IOError ? e.code : Int32(1)
-    end
-end
-
-
+public_file_errors(k::Int) = (out = IOBuffer(); public_file_errors(k, out); String(take!(out)))
+public_file_errors_print(k::Int) = (public_file_errors(k, Core.stdout); Int32(0))
+strerror_sum(k::Int) = Int32(sum(codeunits(Base.Libc.strerror(k))))
 
 @testset "filesystem over WASI" begin
     expected = fs_ops(1)
@@ -429,15 +498,6 @@ end
         Dict("call" => "fd_write", "at" => 2, "errno" => 51)])
         @test fault_run(sendfile_fault, k, [rule]) == 1
     end
-    @test errno_maps(1) == 1
-    @test run_fs(errno_maps, 2) == 1
-    @test errno_fault(5) == 20
-    @test run_fs(errno_fault, 5) == 20
-    for (k, call, at, errno, expected) in ((1, "fd_seek", 1, 62, 130),
-            (2, "path_open", 2, 62, 130), (3, "fd_filestat_set_size", 1, 62, 130),
-            (4, "fd_seek", 1, 62, 130), (7, "fd_seek", 1, 76, 13))
-        @test fault_run(errno_fault, k, [Dict("call" => call, "at" => at, "errno" => errno)]) == expected
-    end
     # Discovery failures must neither publish partial state nor prevent a retry.
     nested = Dict(ROOT => ROOT, ROOT * "/nested" => ROOT)
     for call in ("fd_prestat_get", "fd_prestat_dir_name")
@@ -449,6 +509,45 @@ end
     @test wasm_run(c, "preopen_empty", 1; rettype=Int32, preopens=Dict{String,String}()) == 1
     c = WasmCodegen.compile(preopen_relative, (Int,); config=cfg)
     @test wasm_run(c, "preopen_relative", 1; rettype=Int32, preopens=Dict("relative" => ROOT)) == Base.UV_EINVAL
+    @test realpath_root(1) == 0
+    @test run_fs(realpath_root, 2) == 0
+    @test fault_run(realpath_root, 1, [Dict("call" => "path_filestat_get", "at" => 1, "errno" => 29)]) == Base.UV_EIO
+    # (a method of `WASM_METHODS` for this test only; a deleted method stays visible, so the
+    # methods before it are taken again)
+    before_query = methods_of(WasmCodegen.Runtime.WASM_METHODS)
+    @eval WasmCodegen.Runtime.@wasm_method $F.path_mode(path::UInt32, len::UInt32, follow::Int32) =
+        $query_error(path, len, follow)
+    try
+        @test run_fs(mode_query_fault, 1) == 1
+        @test run_fs(mode_query_fault, 2) == 1
+    finally
+        foreach(Base.delete_method, setdiff(methods_of(WasmCodegen.Runtime.WASM_METHODS), before_query))
+    end
+    @test errno_maps(1) == 1
+    @test run_fs(errno_maps, 2) == 1
+    @test errno_fault(5) == 20
+    @test run_fs(errno_fault, 5) == 20
+    for (k, call, at, errno, expected) in ((1, "fd_seek", 1, 62, 130),
+            (2, "path_open", 2, 62, 130), (3, "fd_filestat_set_size", 1, 62, 130),
+            (4, "fd_seek", 1, 62, 130), (7, "fd_seek", 1, 76, 13))
+        @test fault_run(errno_fault, k, [Dict("call" => call, "at" => at, "errno" => errno)]) == expected
+    end
+    expected_errors = public_file_errors(1)
+    @test run_fs(public_file_errors_print, 2) == 0
+    @test LAST_OUTPUT[] == expected_errors
+    # Simulate a platform where the host's libc text differs from the guest table.
+    E = WasmCodegen.Runtime.Errno
+    native_text = WasmCodegen.Runtime.original(Base.Libc.strerror, Int32(13))
+    old_text = E.STRERROR[14]
+    try
+        E.STRERROR[14] = "guest error text"
+        @test Base.Libc.strerror(13) == native_text
+        c = WasmCodegen.compile(strerror_sum, (Int,); config=cfg)
+        @test wasm_run(c, "strerror_sum", 13; rettype=Int32, preopens=Dict(ROOT => ROOT)) ==
+            Int32(sum(codeunits("guest error text")))
+    finally
+        E.STRERROR[14] = old_text
+    end
     # (for JavaScript, unsupported)
     @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(fs_print, (Int,))
 end

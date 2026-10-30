@@ -9,7 +9,7 @@ let T = WasmCodegen.Runtime.BaseFS, E = WasmCodegen.Runtime.Errno
         # libuv's and the C library's messages: tables (the same as native)
         struverror(err::Int32) = $(E.uv_message)(err)
         uverrorname(err::Int32) = $(E.uv_name)(err)
-        Libc.strerror(e::Integer) = $(E.strerror)(e)
+        Libc.strerror(e::Integer) = $(T.libc_strerror)(Int32(e))
     end
 
     @eval Base.Filesystem begin

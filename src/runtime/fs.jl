@@ -105,11 +105,11 @@ const NO_MODES = Int32(52)
 # callers: a replacement must still be called)
 const NO_MODES_RESULT = Ref(NO_MODES)
 
-"The mode of the file at the absolute path (following a link if `follow`), or a negated errno."
+"The mode at the absolute path (following a link if `follow`), or a negated WASI errno."
 @noinline path_mode(path::UInt32, len::UInt32, follow::Int32) = -NO_MODES_RESULT[]
-"Give the file at the absolute path the mode `mode`: 0, or an errno."
+"Give the file at the absolute path the mode `mode`: 0, or a positive WASI errno."
 @noinline path_chmod(path::UInt32, len::UInt32, mode::Int32) = NO_MODES_RESULT[]
-"A symbolic link at the absolute path `link` to `target` (any string): 0, or an errno."
+"A link at the absolute path `link` to `target` (any string): 0, or a positive WASI errno."
 @noinline path_symlink_io(target::UInt32, tlen::UInt32, link::UInt32, llen::UInt32) = NO_MODES_RESULT[]
 
 """
@@ -176,7 +176,7 @@ const PREOPENS_READ = Ref(false)
 const CWD = Ref("")
 
 # Preview 1 hosts conventionally assign contiguous preopens starting at fd 3.
-# EBADF ends enumeration; other failures leave the table unpublished.
+# EBADF ends that enumeration; other failures leave the previous table unpublished.
 function preopens()
     PREOPENS_READ[] && return PREOPENS[]
     found = Tuple{Int32,String}[]
@@ -484,10 +484,17 @@ free(p::Ptr{Cvoid}) = nothing
 req_cleanup(req::Ptr{Cvoid}) = nothing
 
 # the permission bits (and setuid/setgid/sticky) of the absolute path `path` (that exists,
-# followed), or nothing
+# followed), nothing without mode support, or a negative libuv error
 function perm_bits(path::String)
-    m = with_abspath((off, len) -> path_mode(off, len, Int32(1)), path)
-    return m === nothing || m < 0 ? nothing : UInt32(m) & UInt32(0o7777)
+    c = check_path(path)
+    c == 0 || return c
+    m = Staging.with_scope() do
+        off, len = Staging.raw_path(normalize(path))
+        path_mode(off, len, Int32(1))
+    end
+    m == -NO_MODES && return nothing
+    m < 0 && return uv(-m)
+    return UInt32(m) & UInt32(0o7777)
 end
 
 """
@@ -510,6 +517,7 @@ function apply_mode!(path::String, mode::Integer, now::UInt32; dir::Bool)
         # allows in the directory the file is in: the target's, through a link)
         real = Runtime.BaseFS.realpath_wasm_or_nothing(path)
         a = real === nothing ? nothing : host_allowed(dirname(real))
+        a isa Int32 && return a
         allowed = (now & UInt32(0o666)) | (a === nothing ? UInt32(0) : a & UInt32(0o111))
     end
     want = (now & UInt32(0o7000)) | (m & UInt32(0o7000)) | (m & allowed)
@@ -544,8 +552,10 @@ function mkdir_path(path::String, mode::Integer)
         path_create_directory(fd, off, len)
     end
     r == 0 || return r < 0 ? r : uv(r)
+    # A mode failure leaves the created directory at its host mode.
     now = perm_bits(path)
     now === nothing && return Int32(0)
+    now isa Int32 && return now
     return apply_mode!(path, mode, now; dir=true)
 end
 uv_fs_rmdir(loop::Ptr{Cvoid}, req::Ptr{Cvoid}, path::Cstring, cb::Ptr{Cvoid}) =
@@ -577,6 +587,12 @@ function jl_fs_rename(old::Cstring, new::Cstring)
         ft = filetype(o, false)
         ft isa Int32 && return ft
         ft == FT_DIR || return UV_ENOTDIR
+        ft = filetype(String(rstrip(n, '/')), false)
+        if ft isa Int32
+            ft == UV_ENOENT || return ft
+        else
+            ft == FT_LINK && return UV_ENOTDIR
+        end
     end
     ofd, orel = resolve(o)
     nfd, nrel = resolve(n)
@@ -802,8 +818,11 @@ function open_path(path::String, flags::Int32, mode::Int32)
     r < 0 && return r
     if creating
         now = perm_bits(path)
-        e = now === nothing ? Int32(0) : apply_mode!(path, mode, now; dir=false)
-        # (the mode could not be given: the error, the file not left open)
+        e = now === nothing ? Int32(0) : now isa Int32 ? now : apply_mode!(path, mode, now; dir=false)
+        # Creation and mode adjustment are not atomic. On failure the created file
+        # remains at its host mode, but the new descriptor is closed. A path-based
+        # provider must handle replacement races; atomic create-with-mode needs a
+        # stronger host interface.
         e == 0 || (fd_close(r); return e)
     end
     return r
@@ -1286,6 +1305,10 @@ function uv_dirent(ft::UInt8)
     return Cint(0)
 end
 
+# Keep the build process's libc formatter native; only the guest uses the fixed ABI.
+@noinline libc_strerror(e::Int32) = original(Base.Libc.strerror, e)::String
+@wasm_method libc_strerror(e::Int32) = Errno.strerror(e)
+
 throw_uv(prefix::String, code::Integer) = throw(Base.IOError(string(prefix, ": ", Errno.uv_message(code), " (",
                                                                     Errno.uv_name(code), ")"), Int32(code)))
 
@@ -1348,8 +1371,8 @@ function realpath_wasm(path::String)
         end
         changed && continue
         # (it must exist)
-        FS.with_path((fd, off, len) -> FS.path_filestat_get(fd, FS.SYMLINK_FOLLOW, off, len, FS.Staging.SCRATCH_OUT), p) == 0 ||
-            err(Int32(Base.UV_ENOENT))
+        r = FS.with_path((fd, off, len) -> FS.path_filestat_get(fd, FS.SYMLINK_FOLLOW, off, len, FS.Staging.SCRATCH_OUT), p)
+        r == 0 || err(r < 0 ? r : FS.uv(r))
         return p
     end
 end
