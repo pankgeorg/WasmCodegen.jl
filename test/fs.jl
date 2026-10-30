@@ -488,7 +488,8 @@ strerror_sum(k::Int) = Int32(sum(codeunits(Base.Libc.strerror(k))))
     finally
         foreach(Base.delete_method, setdiff(methods_of(WasmCodegen.Runtime.WASM_METHODS), before))
     end
-    @test methods_of(WasmCodegen.Runtime.WASM_METHODS) == before
+    # (and without them, the defaults again: the code inferred with them is not reused)
+    @test run_fs(fs_modes, 1) == 15
     @test file_wrappers(1) == 1
     @test run_fs(file_wrappers, 2) == 1
     @test retry_write(1) == 1
