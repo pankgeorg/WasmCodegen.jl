@@ -3,6 +3,10 @@
 # `EnvDict` API is kept: `getenv`, `setenv` and `unsetenv` are these functions
 # (`RUNTIME_CCALLS`), and iterating `ENV` is a method the module compiles in place of Base's
 # (`iterate` below). Wasm only.
+# The initial snapshot supports at most 1 MiB of NUL-terminated name=value bytes and
+# 1 MiB of wasm32 pointers (262144 entries). Oversize snapshots throw ArgumentError
+# before environ_get; nothing is truncated or published. Later snapshot mutations
+# use Julia storage and do not consume these staging allocations.
 
 module Env
 
@@ -42,16 +46,28 @@ function entry(raw::String)
     return Entry(String(codeunits(raw)[1:i-1]), String(codeunits(raw)[i+1:end]), raw)
 end
 
-"The entries, read from the host on first use (a host error is thrown, and read again next time)."
+"Maximum bytes in each staging allocation of the initial environment snapshot."
+const MAX_BYTES = Staging.CHUNK
+
+# Widen before multiplying: count is an untrusted wasm32 host result.
+function snapshot_size(count::UInt32, size::UInt32)
+    ptr_bytes = UInt64(count) * UInt64(4)
+    ptr_bytes <= MAX_BYTES || throw(ArgumentError("WASI environment pointer table exceeds 1 MiB (262144 entries)"))
+    size <= MAX_BYTES || throw(ArgumentError("WASI environment strings exceed 1 MiB (including NUL terminators)"))
+    return Int(ptr_bytes)
+end
+
+"The entries, read on first use; host/size errors leave the snapshot unloaded for retry."
 function entries()
     LOADED[] && return ENTRIES
     read = Staging.with_scope() do
         wasi_check(environ_sizes_get(Staging.SCRATCH_OUT, Staging.SCRATCH_OUT + UInt32(4)), "environ_sizes_get")
         count = Staging.load32(Staging.SCRATCH_OUT)
         size = Staging.load32(Staging.SCRATCH_OUT + UInt32(4))
+        ptr_bytes = snapshot_size(count, size)
         # (an empty environment: nothing to read, and some hosts refuse buffers of no bytes)
         count == 0 && return Entry[]
-        ptrs = Staging.alloc_data(4 * count; align=4)
+        ptrs = Staging.alloc_data(ptr_bytes; align=4)
         buf = Staging.alloc_data(size; align=1)
         wasi_check(environ_get(ptrs, buf), "environ_get")
         return Entry[entry(cstring_at(Staging.load32(ptrs + UInt32(4i)))) for i in 0:Int(count)-1]

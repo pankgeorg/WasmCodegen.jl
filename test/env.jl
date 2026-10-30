@@ -58,6 +58,42 @@ env_check() = checksum(env_ops())
 env_from_host() = Int32(length(get(ENV, "FROM_HOST", "")) + haskey(ENV, "NOT_SET") * 10)
 env_print() = (print(Core.stdout, env_ops()); Int32(0))
 
+# The same size validation and error text natively and in Wasm, including counts
+# whose pointer-table multiplication would wrap in UInt32.
+function env_size(count::UInt32, size::UInt32)
+    try
+        bytes = Main.WasmCodegen.Runtime.Env.snapshot_size(count, size)
+        return string("ok ", bytes)
+    catch err
+        return err isa ArgumentError ? (err.msg::String) : "other error"
+    end
+end
+env_size_print(count::UInt32, size::UInt32) = (print(Core.stdout, env_size(count, size)); Int32(0))
+
+# A real WASI environment must fail explicitly on every attempt, with no partial
+# snapshot or leaked arena allocation. The loader must not silently truncate it.
+@noinline function env_oversize_once()
+    try
+        length(ENV)
+        return false
+    catch err
+        return err isa ArgumentError &&
+            (err.msg::String) == "WASI environment strings exceed 1 MiB (including NUL terminators)"
+    end
+end
+function env_oversize()
+    E = Main.WasmCodegen.Runtime.Env
+    S = Main.WasmCodegen.Runtime.Staging
+    used = (S.load32(S.RECORD_USED), S.load32(S.DATA_USED))
+    first = env_oversize_once()
+    clean_first = !E.LOADED[] && isempty(E.ENTRIES) &&
+        (S.load32(S.RECORD_USED), S.load32(S.DATA_USED)) == used
+    second = env_oversize_once()
+    clean_second = !E.LOADED[] && isempty(E.ENTRIES) &&
+        (S.load32(S.RECORD_USED), S.load32(S.DATA_USED)) == used
+    return first && second && clean_first && clean_second
+end
+
 end # EnvTests
 
 @testset "environment" begin
@@ -72,6 +108,26 @@ end # EnvTests
     @test wasm_run(c, "env_from_host"; rettype=Int32, wasi_env=Dict("FROM_HOST" => "abc", "X" => "")) == 3
     # (an empty host environment)
     @test wasm_run(c, "env_from_host"; rettype=Int32, wasi_env=Dict{String,String}()) == 0
+    # Exactly 1 MiB including the name, equals sign, and final NUL is supported.
+    limit_value = (1 << 20) - sizeof("FROM_HOST") - 2
+    @test wasm_run(c, "env_from_host"; rettype=Int32,
+                   wasi_env=Dict("FROM_HOST" => repeat("x", limit_value))) == limit_value
+    cfg = WasmCodegen.Config(host=:wasi)
+    c = WasmCodegen.compile(E.env_size_print, (UInt32, UInt32); config=cfg)
+    for (count, size, expected) in (
+        (0x00000000, 0x00000000, "ok 0"),
+        (0x00040000, 0x00100000, "ok 1048576"),
+        (0x00000001, 0x00100001, "WASI environment strings exceed 1 MiB (including NUL terminators)"),
+        (0x00040001, 0x00000000, "WASI environment pointer table exceeds 1 MiB (262144 entries)"),
+        (0x40000000, 0x00000000, "WASI environment pointer table exceeds 1 MiB (262144 entries)"),
+        (0xffffffff, 0x00000000, "WASI environment pointer table exceeds 1 MiB (262144 entries)"))
+        @test E.env_size(count, size) == expected
+        @test wasm_run(c, "env_size_print", count, size; rettype=Int32) == 0
+        @test LAST_OUTPUT[] == expected
+    end
+    c = WasmCodegen.compile(E.env_oversize, (); config=cfg)
+    @test wasm_run(c, "env_oversize"; rettype=Bool,
+                   wasi_env=Dict("LARGE" => repeat("x", 1 << 20)))
 end
 
 ## the time of day: the host's clock; local time is UTC in Wasm
