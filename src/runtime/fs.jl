@@ -55,6 +55,12 @@ fd_fdstat_get(fd::Int32, buf::UInt32) =
 fd_close(fd::Int32) = ccall((:fd_close, "wasi_snapshot_preview1"), Int32, (Int32,), fd)
 fd_read(fd::Int32, iovs::UInt32, n::UInt32, nread::UInt32) =
     ccall((:fd_read, "wasi_snapshot_preview1"), Int32, (Int32, UInt32, UInt32, UInt32), fd, iovs, n, nread)
+fd_write(fd::Int32, iovs::UInt32, n::UInt32, nwritten::UInt32) =
+    ccall((:fd_write, "wasi_snapshot_preview1"), Int32, (Int32, UInt32, UInt32, UInt32), fd, iovs, n, nwritten)
+fd_pread(fd::Int32, iovs::UInt32, n::UInt32, offset::UInt64, nread::UInt32) =
+    ccall((:fd_pread, "wasi_snapshot_preview1"), Int32, (Int32, UInt32, UInt32, UInt64, UInt32), fd, iovs, n, offset, nread)
+fd_pwrite(fd::Int32, iovs::UInt32, n::UInt32, offset::UInt64, nwritten::UInt32) =
+    ccall((:fd_pwrite, "wasi_snapshot_preview1"), Int32, (Int32, UInt32, UInt32, UInt64, UInt32), fd, iovs, n, offset, nwritten)
 fd_seek(fd::Int32, offset::Int64, whence::UInt32, newoffset::UInt32) =
     ccall((:fd_seek, "wasi_snapshot_preview1"), Int32, (Int32, Int64, UInt32, UInt32), fd, offset, whence, newoffset)
 fd_filestat_set_size(fd::Int32, size::UInt64) =
@@ -128,8 +134,26 @@ function open_rights(fd::Int32, read::Bool, write::Bool)
     return r
 end
 
-"The libuv code (a negated Linux errno) of the WASI errno `e`."
+"The platform libuv code of the WASI errno `e`."
 uv(e::Integer) = Errno.uv_code(e)
+
+# The pre-helper runtime is supported while this change is restacked. New runtimes
+# provide explicit WASI/libuv-to-guest-libc conversions in Errno.
+@static if isdefined(Errno, :guest_errno)
+    libc_errno(e::Integer) = Errno.guest_errno(e)
+    libc_from_uv(code::Integer) = Errno.uv_to_guest_errno(code)
+else
+    libc_errno(e::Integer) = 0 <= e < length(Errno.LINUX) ? Errno.LINUX[e+1] : Int32(5)
+    function libc_from_uv(code::Integer)
+        code == 0 && return Int32(0)
+        name = Errno.uv_name(code)
+        for (i, n) in enumerate(Errno.WASI_NAMES)
+            string(n) == name && return Errno.LINUX[i]
+        end
+        return Int32(5)
+    end
+end
+
 
 "The `n` bytes at `off` of the linear memory, as a string."
 get_raw(off::UInt32, n::Integer) = String(get_bytes(off, Int(n)))
@@ -233,8 +257,8 @@ function resolve(path::String)
     return (best, trailing_sep(path) ? rel * "/" : rel)
 end
 
-const UV_ENOENT = Int32(-2)
-const UV_ENOTDIR = Int32(-20)
+const UV_ENOENT = Int32(Base.UV_ENOENT)
+const UV_ENOTDIR = Int32(Base.UV_ENOTDIR)
 
 """
     check_path(path) -> 0, or a libuv error code
@@ -309,13 +333,13 @@ function open_check(path::String, create::Bool, write::Bool)
         pft = filetype(isempty(parent) ? "." : parent, true)
         pft isa Int32 && return pft
         pft == FT_DIR || return UV_ENOTDIR
-        return Int32(-21)
+        return Int32(Base.UV_EISDIR)
     end
     ft = filetype(path, true)
-    ft == UV_ENOENT && return create ? Int32(-21) : UV_ENOENT
+    ft == UV_ENOENT && return create ? Int32(Base.UV_EISDIR) : UV_ENOENT
     ft isa Int32 && return ft
     ft == FT_DIR || return UV_ENOTDIR
-    return write || create ? Int32(-21) : Int32(0)
+    return write || create ? Int32(Base.UV_EISDIR) : Int32(0)
 end
 
 """
@@ -528,7 +552,7 @@ function simple(f::F, path::String) where {F}
     c = check_path(path)
     c == 0 || return c
     if terminal_dot(path)
-        return f === path_remove_directory ? (basename(rstrip(path, '/')) == "." ? Int32(-22) : Int32(-39)) : Int32(-21)
+        return f === path_remove_directory ? (basename(rstrip(path, '/')) == "." ? Int32(Base.UV_EINVAL) : Int32(Base.UV_ENOTEMPTY)) : Int32(Base.UV_EISDIR)
     end
     r = with_path((fd, off, len) -> f(fd, off, len), path)
     return r <= 0 ? r : uv(r)
@@ -540,7 +564,7 @@ function jl_fs_rename(old::Cstring, new::Cstring)
     c == 0 || return c
     c = check_path(n)
     c == 0 || return c
-    (terminal_dot(o) || terminal_dot(n)) && return Int32(-16) # EBUSY
+    (terminal_dot(o) || terminal_dot(n)) && return Int32(Base.UV_EBUSY) # EBUSY
     # A slash-terminated destination can name a new directory, but never a file.
     if trailing_sep(n)
         ft = filetype(o, false)
@@ -567,7 +591,7 @@ function jl_fs_symlink(target::Cstring, link::Cstring, flags::Cint)
     l = unsafe_string(link)
     if trailing_sep(l)
         ft = filetype(String(rstrip(l, '/')), false)
-        return ft isa Int32 ? ft : Int32(-17)
+        return ft isa Int32 ? ft : Int32(Base.UV_EEXIST)
     end
     c = check_path(l)
     c == 0 || return c
@@ -596,7 +620,7 @@ function jl_fs_hardlink(src::Cstring, dst::Cstring)
         ft = filetype(o, false)
         ft isa Int32 && return ft
         ft = filetype(String(rstrip(n, '/')), false)
-        return ft isa Int32 ? ft : Int32(-17)
+        return ft isa Int32 ? ft : Int32(Base.UV_EEXIST)
     end
     c = check_path(n)
     c == 0 || return c
@@ -633,7 +657,7 @@ function jl_fs_access(path::Cstring, mode::Cint)
     m < 0 && return uv(-m)
     # (R_OK 4, W_OK 2, X_OK 1: the owner's bits, as for the process's own files)
     want = UInt32(mode) & 0x7
-    return (UInt32(m) >> 6) & want == want ? Int32(0) : Int32(-13)
+    return (UInt32(m) >> 6) & want == want ? Int32(0) : Int32(Base.UV_EACCES)
 end
 
 "The target of the symbolic link `path`, or an error code (a negative `Int32`)."
@@ -643,7 +667,7 @@ function readlink_path(path::String)
     # (`link/` is what the link names, if it is a directory: not a link)
     if trailing_sep(path)
         ft = filetype(path, true)
-        return ft isa Int32 ? ft : Int32(-22)
+        return ft isa Int32 ? ft : Int32(Base.UV_EINVAL)
     end
     fd, rel = resolve(path)
     return Staging.with_scope() do
@@ -742,7 +766,7 @@ function open_path(path::String, flags::Int32, mode::Int32)
     c = check_path(path)
     c == 0 || return c
     # (flags the host cannot honor: an error, not ignored)
-    flags & ~JL_O_KNOWN == 0 || return Int32(-22)
+    flags & ~JL_O_KNOWN == 0 || return Int32(Base.UV_EINVAL)
     acc = flags & 0x3
     c = open_check(path, flags & JL_O_CREAT != 0, acc != 0)
     c == 0 || return c
@@ -762,8 +786,8 @@ function open_path(path::String, flags::Int32, mode::Int32)
         # EEXIST for O_CREAT|O_EXCL, else a link is ELOOP)
         ft = filetype(path, false)
         if !(ft isa Int32)
-            flags & (JL_O_CREAT | JL_O_EXCL) == JL_O_CREAT | JL_O_EXCL && return Int32(-17)
-            ft == FT_LINK && return Int32(-40)
+            flags & (JL_O_CREAT | JL_O_EXCL) == JL_O_CREAT | JL_O_EXCL && return Int32(Base.UV_EEXIST)
+            ft == FT_LINK && return Int32(Base.UV_ELOOP)
         end
     end
     r = open_at(fd, rel, oflags, fdflags, open_rights(fd, acc != JL_O_WRONLY, acc != 0),
@@ -785,79 +809,53 @@ end
 
 jl_fs_close(fd::RawFD) = (r = fd_close(reinterpret(Int32, fd)); r == 0 ? Int32(0) : uv(r))
 
-# the current offset of `fd`, or a libuv error code
-function tell(fd::Int32)
-    r = fd_seek(fd, Int64(0), UInt32(1), Staging.SCRATCH_OUT)
-    return r == 0 ? reinterpret(Int64, Staging.load64(Staging.SCRATCH_OUT)) : Int64(uv(r))
-end
-
-"`jl_fs_write(fd, buf, n, offset)`: all of it, at `offset` (-1: at the current offset, which it
-advances; else positional, the current offset unchanged, as pwrite)."
+# Raw descriptor calls return a count or a negative libuv error, and allow short IO.
+# Bound each request to one staging chunk (also safely representable by Int32).
+# A negative offset selects sequential writes, as in libuv.
 function jl_fs_write(fd::RawFD, buf::Ptr{UInt8}, n::Csize_t, offset::Int64)
-    f = reinterpret(Int32, fd)
-    offset < 0 && (write_ptr(f, buf, Int(n)); return Int32(0))
-    cur = tell(f)
-    cur < 0 && return Int32(cur)
-    r = fd_seek(f, offset, UInt32(0), Staging.SCRATCH_OUT)
-    r == 0 || return uv(r)
-    try
-        write_ptr(f, buf, Int(n))
-    finally
-        fd_seek(f, cur, UInt32(0), Staging.SCRATCH_OUT)
+    k = Int(min(n, Csize_t(Staging.CHUNK)))
+    return Staging.with_scope() do
+        off = Staging.alloc_data(k)
+        Staging.copy_ptr_to_linear!(off, buf, k)
+        write_once(reinterpret(Int32, fd), off, UInt32(k), offset)
     end
-    return Int32(0)
 end
 
-"`jl_fs_read(fd, buf, n)`: the bytes read (all `n` but at the end of the file), or an error code."
 function jl_fs_read(fd::RawFD, buf::Ptr{Cvoid}, n::Csize_t)
-    f = reinterpret(Int32, fd)
-    total = 0
-    tmp = Vector{UInt8}(undef, min(Int(n), Int(Staging.CHUNK)))
-    while total < Int(n)
-        got = os_read!(tmp, 1, f, min(Int(n) - total, length(tmp)))
-        for k in 1:got
-            unsafe_store!(Ptr{UInt8}(buf), tmp[k], total + k)
+    k = Int(min(n, Csize_t(Staging.CHUNK)))
+    return Staging.with_scope() do
+        off = Staging.alloc_data(k)
+        got = read_once(reinterpret(Int32, fd), off, UInt32(k))
+        got < 0 && return got
+        for j in 1:Int(got)
+            unsafe_store!(Ptr{UInt8}(buf), Staging.load8(off + UInt32(j - 1)), j)
         end
-        total += got
-        got == 0 && break
+        got
     end
-    return Int32(total)
 end
 
-"`jl_fs_sendfile(src, dst, offset, n)`: the bytes copied from `offset` of `src` (at most a
-chunk; the offset of `src` unchanged, as sendfile(2) with an offset), or an error code."
+# The source position is never changed, including on short writes and errors. Reusing the
+# linear chunk avoids a linear-to-GC-to-linear round trip for each copy operation.
 function jl_fs_sendfile(src::RawFD, dst::RawFD, offset::Int64, n::Csize_t)
-    s, d = reinterpret(Int32, src), reinterpret(Int32, dst)
-    cur = tell(s)
-    cur < 0 && return Int32(cur)
-    r = fd_seek(s, offset, UInt32(0), Staging.SCRATCH_OUT)
-    r == 0 || return uv(r)
-    local got
-    try
-        tmp = Vector{UInt8}(undef, min(Int(n), Int(Staging.CHUNK)))
-        got = os_read!(tmp, 1, s, length(tmp))
-        send_chunk(d, tmp, got)
-    finally
-        fd_seek(s, cur, UInt32(0), Staging.SCRATCH_OUT)
+    offset < 0 && return Int32(Base.UV_EINVAL)
+    k = UInt32(min(n, Csize_t(Staging.CHUNK)))
+    return Staging.with_scope() do
+        off = Staging.alloc_data(k)
+        got = read_once(reinterpret(Int32, src), off, k, offset)
+        got <= 0 && return got
+        write_once(reinterpret(Int32, dst), off, UInt32(got))
     end
-    return Int32(got)
 end
 
 "`jl_lseek(fd, offset, whence)`: the new offset, or -1 (errno set)."
 function jl_lseek(fd::RawFD, offset::Int64, whence::Cint)
     r = fd_seek(reinterpret(Int32, fd), offset, UInt32(whence), Staging.SCRATCH_OUT)
-    r == 0 || (set_errno(-uv(r)); return Int64(-1))
+    r == 0 || (set_errno(libc_errno(r)); return Int64(-1))
     return reinterpret(Int64, Staging.load64(Staging.SCRATCH_OUT))
 end
-send_chunk(d::Int32, tmp::Vector{UInt8}, got::Int) = Staging.with_scope() do
-    off = Staging.alloc_data(got)
-    Staging.copy_to_linear!(off, tmp, 1, got)
-    write_all(d, off, UInt32(got))
-end
-
 "`uv_fs_ftruncate(loop, req, fd, n, cb)`."
 function uv_fs_ftruncate(loop::Ptr{Cvoid}, req::Ptr{Cvoid}, fd::RawFD, n::Int64, cb::Ptr{Cvoid})
-    n < 0 && return Int32(-22)
+    n < 0 && return Int32(Base.UV_EINVAL)
     r = fd_filestat_set_size(reinterpret(Int32, fd), UInt64(n))
     return r == 0 ? Int32(0) : uv(r)
 end
@@ -872,7 +870,7 @@ function futimes(fd::Cint, tv::Ptr{Cvoid})
     tv == C_NULL || (ccall(:jl_set_errno, Cvoid, (Cint,), Cint(22)); return Cint(-1))
     r = fd_filestat_set_times(Int32(fd), UInt64(0), UInt64(0), UInt32(2 | 8))
     r == 0 && return Cint(0)
-    ccall(:jl_set_errno, Cvoid, (Cint,), Cint(-uv(r)))
+    ccall(:jl_set_errno, Cvoid, (Cint,), Cint(libc_errno(r)))
     return Cint(-1)
 end
 
@@ -941,16 +939,16 @@ function ios_file(s::Ptr{UInt8}, fname::Cstring, rd::Cint, wr::Cint, create::Cin
     (rd != 0 || wr != 0) || return fail(22)
     name = unsafe_string(fname)
     c = check_path(name)
-    c == 0 || return fail(-c)
+    c == 0 || return fail(libc_from_uv(c))
     c = open_check(name, create != 0, wr != 0)
-    c == 0 || return fail(-c)
+    c == 0 || return fail(libc_from_uv(c))
     fd, rel = resolve(name)
     oflags = (create != 0 ? O_CREAT : UInt32(0)) | (trunc != 0 ? O_TRUNC : UInt32(0))
     r = Staging.with_scope() do
         o, ol = Staging.raw_path(rel)
         path_open(fd, SYMLINK_FOLLOW, o, ol, oflags, open_rights(fd, rd != 0, wr != 0), inheriting_rights(fd), UInt32(0), Staging.SCRATCH_OUT)
     end
-    r == 0 || return fail(-uv(r))
+    r == 0 || return fail(libc_errno(r))
     nfd = reinterpret(Int32, Staging.load32(Staging.SCRATCH_OUT))
     return new_ios!(Ptr{Cvoid}(s), IOS(nfd, true, rd != 0, wr != 0, true, false, UInt8[], 0, 0))
 end
@@ -964,9 +962,12 @@ end
 # give the unread bytes of the read buffer back to the fd (before a write or a seek)
 function unread!(st::IOS)
     n = st.size - st.bpos
-    n > 0 && fd_seek(st.fd, -Int64(n), UInt32(1), Staging.SCRATCH_OUT)
+    if n > 0
+        r = fd_seek(st.fd, -Int64(n), UInt32(1), Staging.SCRATCH_OUT)
+        r == 0 || return uv(r)
+    end
     st.bpos = st.size = 0
-    return nothing
+    return Int32(0)
 end
 
 # read up to `n` bytes of the fd into `dst` at `i` (1-based): the bytes read, 0 at EOF; an
@@ -1101,7 +1102,8 @@ end
 function ios_write(s::Ptr{Cvoid}, p::Ptr{Cvoid}, n::Csize_t)
     st = ios_state(s)
     st.open || return Csize_t(0)
-    unread!(st)
+    r = unread!(st)
+    r == 0 || throw(Base.IOError("write: " * Errno.uv_message(r), r))
     write_ptr(st.fd, Ptr{UInt8}(p), Int(n))
     return n
 end
@@ -1123,7 +1125,8 @@ end
 function ios_putc(c::Cint, s::Ptr{Cvoid})
     st = ios_state(s)
     st.open || return Cint(-1)
-    unread!(st)
+    r = unread!(st)
+    r == 0 || throw(Base.IOError("write: " * Errno.uv_message(r), r))
     Staging.with_scope() do
         off = Staging.alloc_data(1)
         Staging.store8(off, c % UInt8)
@@ -1132,17 +1135,39 @@ function ios_putc(c::Cint, s::Ptr{Cvoid})
     return Cint(1)
 end
 
+# Synchronous hosts can retry EINTR, but cannot wait for readiness on EAGAIN.
+# Report EAGAIN promptly; callers must not retry an entire partially completed write.
+function write_once(fd::Int32, off::UInt32, n::UInt32, offset::Int64=Int64(-1))
+    Staging.store32(Staging.SCRATCH_IOVEC, off)
+    Staging.store32(Staging.SCRATCH_IOVEC + UInt32(4), n)
+    while true
+        r = offset < 0 ? fd_write(fd, Staging.SCRATCH_IOVEC, UInt32(1), Staging.SCRATCH_OUT) :
+            fd_pwrite(fd, Staging.SCRATCH_IOVEC, UInt32(1), UInt64(offset), Staging.SCRATCH_OUT)
+        r == 27 && continue # EINTR, at the same remaining offset
+        r == 0 || return uv(r)
+        return reinterpret(Int32, Staging.load32(Staging.SCRATCH_OUT))
+    end
+end
+
+function read_once(fd::Int32, off::UInt32, n::UInt32, offset::Int64=Int64(-1))
+    Staging.store32(Staging.SCRATCH_IOVEC, off)
+    Staging.store32(Staging.SCRATCH_IOVEC + UInt32(4), n)
+    while true
+        r = offset == -1 ? fd_read(fd, Staging.SCRATCH_IOVEC, UInt32(1), Staging.SCRATCH_OUT) :
+            fd_pread(fd, Staging.SCRATCH_IOVEC, UInt32(1), UInt64(offset), Staging.SCRATCH_OUT)
+        r == 27 && continue
+        r == 0 || return uv(r)
+        return reinterpret(Int32, Staging.load32(Staging.SCRATCH_OUT))
+    end
+end
+
 function write_all(fd::Int32, off::UInt32, n::UInt32)
     while n > 0
-        Staging.store32(Staging.SCRATCH_IOVEC, off)
-        Staging.store32(Staging.SCRATCH_IOVEC + UInt32(4), n)
-        r = ccall((:fd_write, "wasi_snapshot_preview1"), Int32, (Int32, UInt32, UInt32, UInt32),
-                  fd, Staging.SCRATCH_IOVEC, UInt32(1), Staging.SCRATCH_OUT)
-        r == 0 || throw(Base.IOError("write: " * Errno.uv_message(uv(r)), uv(r)))
-        k = Staging.load32(Staging.SCRATCH_OUT)
-        k == 0 && throw(Base.IOError("write: no progress", Int32(-5)))
-        off += k
-        n -= k
+        k = write_once(fd, off, n)
+        k < 0 && throw(Base.IOError("write: " * Errno.uv_message(k), k))
+        k == 0 && throw(Base.IOError("write: no progress", Int32(Base.UV_EIO)))
+        off += UInt32(k)
+        n -= UInt32(k)
     end
 end
 
@@ -1164,14 +1189,14 @@ function ios_close(s::Ptr{Cvoid})
     st.own || return Cint(0)
     r = fd_close(st.fd)
     r == 0 && return Cint(0)
-    set_errno(-uv(r))
+    set_errno(libc_errno(r))
     return Cint(-1)
 end
 
 # positions: the fd's, less what is buffered. A failure sets errno (Base's `systemerror`).
 function seek_fd(fd::Int32, off::Int64, whence::UInt32)
     r = fd_seek(fd, off, whence, Staging.SCRATCH_OUT)
-    r == 0 || (set_errno(-uv(r)); return Int64(-1))
+    r == 0 || (set_errno(libc_errno(r)); return Int64(-1))
     return reinterpret(Int64, Staging.load64(Staging.SCRATCH_OUT))
 end
 function ios_pos(s::Ptr{Cvoid})
@@ -1202,15 +1227,16 @@ ios_skip(s::Ptr{Cvoid}, n::Int64) = seek_to!(ios_state(s), n, UInt32(1))
 function ios_filesize(s::Ptr{Cvoid})
     st = ios_state(s)
     r = fd_filestat_get(st.fd, Staging.SCRATCH_OUT)
-    r == 0 || (set_errno(-uv(r)); return Int64(-1))
+    r == 0 || (set_errno(libc_errno(r)); return Int64(-1))
     return reinterpret(Int64, Staging.load64(Staging.SCRATCH_OUT + UInt32(32)))
 end
 function ios_trunc(s::Ptr{Cvoid}, n::Csize_t)
     st = ios_state(s)
-    unread!(st)
+    r = unread!(st)
+    r == 0 || (set_errno(libc_from_uv(r)); return Cint(1))
     r = fd_filestat_set_size(st.fd, UInt64(n))
     r == 0 && return Cint(0)
-    set_errno(-uv(r))
+    set_errno(libc_errno(r))
     return Cint(1)
 end
 
@@ -1289,7 +1315,7 @@ function realpath_wasm(path::String)
     hops = 0
     while true
         fd, rel = FS.resolve(p)
-        fd < 0 && err(Int32(-2))
+        fd < 0 && err(Int32(Base.UV_ENOENT))
         root = "/"
         for (f, dir) in FS.preopens()
             f == fd && (root = dir)
@@ -1302,13 +1328,13 @@ function realpath_wasm(path::String)
             t = FS.readlink_path(q)
             if t isa String
                 hops += 1
-                hops > 40 && err(Int32(-40))
+                hops > 40 && err(Int32(Base.UV_ELOOP))
                 rest = join(parts[k+1:end], "/")
                 base = startswith(t, '/') ? t : (done == "/" ? "/" * t : done * "/" * t)
                 p = FS.normalize(isempty(rest) ? base : base * "/" * rest)
                 changed = true
                 break
-            elseif t != -Int32(22)   # EINVAL: not a link
+            elseif t != Int32(Base.UV_EINVAL)   # EINVAL: not a link
                 err(t)
             end
             done = q
@@ -1316,7 +1342,7 @@ function realpath_wasm(path::String)
         changed && continue
         # (it must exist)
         FS.with_path((fd, off, len) -> FS.path_filestat_get(fd, FS.SYMLINK_FOLLOW, off, len, FS.Staging.SCRATCH_OUT), p) == 0 ||
-            err(Int32(-2))
+            err(Int32(Base.UV_ENOENT))
         return p
     end
 end
@@ -1341,7 +1367,7 @@ function cd_wasm(dir::String)
     r = FS.with_path((fd, off, len) -> FS.path_filestat_get(fd, FS.SYMLINK_FOLLOW, off, len, FS.Staging.SCRATCH_OUT), p)
     r == 0 || throw_uv(string("cd(", repr(dir), ")"), r < 0 ? r : FS.uv(r))
     FS.Staging.load8(FS.Staging.SCRATCH_OUT + UInt32(16)) == FS.FT_DIR ||
-        throw_uv(string("cd(", repr(dir), ")"), Int32(-20))
+        throw_uv(string("cd(", repr(dir), ")"), Int32(Base.UV_ENOTDIR))
     # (the physical directory, as chdir(2): its symbolic links resolved)
     FS.CWD[] = realpath_wasm(p)
     return nothing
@@ -1388,7 +1414,7 @@ end
 without it, an error)."
 function homedir_wasm()
     v = FS.host_env("HOME")
-    v === nothing && throw_uv("homedir()", Int32(-2))
+    v === nothing && throw_uv("homedir()", Int32(Base.UV_ENOENT))
     return v
 end
 
@@ -1408,9 +1434,9 @@ function mkdtemp_wasm(parent::String, prefix::String)
         p = tpath * rand_name(6)
         r = FS.mkdir_path(p, 0o700)
         r == 0 && return p
-        r == -Int32(17) || throw_uv(string("mktempdir(", repr(parent), ")"), r)
+        r == Int32(Base.UV_EEXIST) || throw_uv(string("mktempdir(", repr(parent), ")"), r)
     end
-    throw_uv(string("mktempdir(", repr(parent), ")"), Int32(-17))
+    throw_uv(string("mktempdir(", repr(parent), ")"), Int32(Base.UV_EEXIST))
 end
 
 "`mkstemp`: a new file `parent/jl_XXXXXX` (random), open for reading and writing."
@@ -1420,8 +1446,8 @@ function mkstemp_wasm(parent::String)
         p = joinpath(parent, Base.Filesystem.temp_prefix * rand_name(6))
         # (created exclusively, readable and writable by the owner only, as mkstemp does)
         fd = FS.open_path(p, Int32(FS.JL_O_RDWR | FS.JL_O_CREAT | FS.JL_O_EXCL | FS.JL_O_NOFOLLOW), Int32(0o600))
-        fd == -Int32(17) && continue
-        fd < 0 && throw(SystemError("mktemp", Int(-fd)))
+        fd == Int32(Base.UV_EEXIST) && continue
+        fd < 0 && throw(SystemError("mktemp", Int(FS.libc_from_uv(fd))))
         return (p, Base.fdio(Int(fd), true))
     end
     throw(SystemError("mktemp", 17))

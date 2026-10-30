@@ -155,6 +155,190 @@ function seam_ops(k::Int)
     return Int32(m == 0o640) + Int32(e == Base.UV_EACCES) * 2 + Int32(t == Base.UV_EACCES) * 4
 end
 
+# The raw descriptor ABI: counts, short reads, errors, and positional isolation.
+function raw_io(k::Int)
+    path = joinpath(ROOT, string("raw", k))
+    dst = path * "-copy"
+    write(path, "abcdefgh")
+    f = Base.Filesystem.open(path, Base.Filesystem.JL_O_RDWR)
+    d = Base.Filesystem.open(dst, Base.Filesystem.JL_O_CREAT | Base.Filesystem.JL_O_RDWR, 0o644)
+    b = UInt8[0x58, 0x59, 0x5a]
+    seek(f, 5)
+    w = GC.@preserve b ccall(:jl_fs_write, Int32,
+        (RawFD, Ptr{UInt8}, Csize_t, Int64), f.handle, b, 3, 1)
+    ok = w == 3 && position(f) == 5
+    seekstart(f)
+    got = GC.@preserve b ccall(:jl_fs_read, Int32,
+        (RawFD, Ptr{Cvoid}, Csize_t), f.handle, b, 3)
+    ok &= got == 3 && b == UInt8[0x61, 0x58, 0x59]
+    seek(f, 6)
+    got = GC.@preserve b ccall(:jl_fs_read, Int32,
+        (RawFD, Ptr{Cvoid}, Csize_t), f.handle, b, 3)
+    ok &= got == 2 && b[1:2] == UInt8[0x67, 0x68]
+    seek(f, 4)
+    sent = ccall(:jl_fs_sendfile, Int32, (RawFD, RawFD, Int64, Csize_t), f.handle, d.handle, 1, 3)
+    ok &= sent == 3 && position(f) == 4
+    # Errors return a negative code rather than throwing through the raw ABI.
+    bad = GC.@preserve b ccall(:jl_fs_read, Int32,
+        (RawFD, Ptr{Cvoid}, Csize_t), RawFD(-1), b, 3)
+    ok &= bad == Base.UV_EBADF
+    close(d)
+    bad = ccall(:jl_fs_sendfile, Int32, (RawFD, RawFD, Int64, Csize_t), f.handle, RawFD(-1), 1, 3)
+    ok &= bad == Base.UV_EBADF && position(f) == 4
+    close(f)
+    ro = Base.Filesystem.open(path, Base.Filesystem.JL_O_RDONLY)
+    seek(ro, 2)
+    bad = GC.@preserve b ccall(:jl_fs_write, Int32,
+        (RawFD, Ptr{UInt8}, Csize_t, Int64), ro.handle, b, 3, 1)
+    # WASI represents the missing write right as ENOTCAPABLE -> EACCES; native
+    # access-mode rejection is EBADF. Both must remain errors and preserve position.
+    ok &= (bad == Base.UV_EBADF || bad == Base.UV_EACCES) && position(ro) == 2
+    close(ro)
+    ok &= read(dst, String) == "XYZ"
+    rm(path); rm(dst)
+    return Int32(ok)
+end
+
+# Fault tests supplement the native comparison with deterministic host failures.
+function reconcile_fault(k::Int)
+    p = joinpath(ROOT, string("rewind", k))
+    write(p, "abcdef")
+    io = open(p, "r+")
+    read(io, UInt8)
+    code = try
+        k == 3 ? truncate(io, 2) : k == 2 ? write(io, UInt8('X')) : k == 5 ? write(io, "X") : write(io, "XX")
+        0
+    catch e
+        e isa SystemError ? -Int32(e.errnum) : e isa Base.IOError ? e.code : Int32(1)
+    end
+    # The next byte must still come from the preserved buffer after the failed rewind.
+    kept = read(io, UInt8) == UInt8('b')
+    close(io)
+    unchanged = read(p, String) == "abcdef"
+    rm(p)
+    return Int32(code == (k == 4 ? Base.UV_EACCES : Base.UV_EIO) && kept && unchanged)
+end
+
+function retry_write(k::Int)
+    p = joinpath(ROOT, string("retry", k))
+    io = open(p, "w")
+    code = try
+        write(io, "abcdef")
+        Int32(0)
+    catch e
+        e isa Base.IOError ? e.code : Int32(1)
+    end
+    close(io)
+    b = read(p, String)
+    rm(p)
+    # No whole-write retries: a committed prefix occurs exactly once.
+    expected = k == 1 ? "abcdef" : "ab"
+    error = k == 1 ? Int32(0) : k == 2 ? Base.UV_EIO : k == 3 ? Base.UV_ENOSPC : Base.UV_EAGAIN
+    return Int32(code == error && b == expected)
+end
+
+function positional_fault(k::Int)
+    p = joinpath(ROOT, string("positional", k))
+    write(p, "abcdefgh")
+    f = Base.Filesystem.open(p, Base.Filesystem.JL_O_RDWR)
+    seek(f, 5)
+    b = UInt8[0x58, 0x59, 0x5a]
+    got = GC.@preserve b ccall(:jl_fs_write, Int32,
+        (RawFD, Ptr{UInt8}, Csize_t, Int64), f.handle, b, 3, 1)
+    ok = position(f) == 5 && got == (k == 1 ? 2 : Base.UV_EIO)
+    close(f)
+    ok &= read(p, String) == (k == 1 ? "aXYdefgh" : "abcdefgh")
+    rm(p)
+    return Int32(ok)
+end
+
+function short_read(k::Int)
+    p = joinpath(ROOT, string("short", k))
+    write(p, "abcdef")
+    f = Base.Filesystem.open(p, Base.Filesystem.JL_O_RDONLY)
+    b = fill(UInt8(0xa5), 6)
+    got = GC.@preserve b ccall(:jl_fs_read, Int32,
+        (RawFD, Ptr{Cvoid}, Csize_t), f.handle, b, 6)
+    close(f); rm(p)
+    return Int32(got == 2 && b == UInt8[0x61, 0x62, 0xa5, 0xa5, 0xa5, 0xa5])
+end
+
+function file_wrappers(k::Int)
+    p = joinpath(ROOT, string("file-wrappers", k))
+    b = UInt8[i % 251 for i in 0:1_048_592]
+    f = Base.Filesystem.open(p, Base.Filesystem.JL_O_CREAT | Base.Filesystem.JL_O_RDWR, 0o644)
+    seek(f, 7)
+    n = GC.@preserve b unsafe_write(f, pointer(b), UInt(length(b)), Int64(3))
+    ok = n == length(b) && position(f) == 7
+    seek(f, 3)
+    out = similar(b)
+    read!(f, out)
+    ok &= out == b
+    truncate(f, 0); seekstart(f)
+    n = GC.@preserve b unsafe_write(f, pointer(b), UInt(length(b)), Int64(-2))
+    ok &= n == length(b) && position(f) == length(b)
+    seekstart(f); read!(f, out)
+    ok &= out == b
+    close(f); rm(p)
+    return Int32(ok)
+end
+
+function sendfile_fault(k::Int)
+    p = joinpath(ROOT, string("sendfile", k))
+    q = p * "-copy"
+    write(p, "abcdefgh")
+    s = Base.Filesystem.open(p, Base.Filesystem.JL_O_RDONLY)
+    d = Base.Filesystem.open(q, Base.Filesystem.JL_O_CREAT | Base.Filesystem.JL_O_RDWR, 0o644)
+    seek(s, 5)
+    got = ccall(:jl_fs_sendfile, Int32, (RawFD, RawFD, Int64, Csize_t), s.handle, d.handle, 1, 3)
+    expected = k == 1 ? 2 : k == 2 ? 1 : k == 3 ? Base.UV_EIO : Base.UV_ENOSPC
+    ok = got == expected && position(s) == 5
+    close(s); close(d)
+    ok &= read(q, String) == (k == 1 ? "bc" : k == 2 ? "b" : "")
+    rm(p); rm(q)
+    return Int32(ok)
+end
+
+# Check both WASI -> libc (even without a libuv equivalent) and UV -> libc paths.
+function errno_maps(k::Int)
+    F = WasmCodegen.Runtime.FS
+    return Int32(F.libc_errno(62) == 130 && F.libc_errno(76) == 13 &&
+        F.libc_errno(999) == 5 && F.libc_from_uv(Base.UV_EACCES) == 13 &&
+        F.libc_from_uv(Base.UV_ENOTDIR) == 20 && F.libc_from_uv(-9999) == 5)
+end
+function errno_fault(k::Int)
+    p = joinpath(ROOT, string("errno", k))
+    write(p, "abcdef")
+    code = Int32(0)
+    if k == 2 || k == 5
+        try
+            io = open(k == 5 ? p * "/" : p)
+            close(io)
+        catch e
+            code = e isa SystemError ? Int32(e.errnum) : Int32(-1)
+        end
+    elseif k == 4
+        f = Base.Filesystem.open(p, Base.Filesystem.JL_O_RDONLY)
+        try
+            seek(f, 2)
+        catch e
+            code = e isa SystemError ? Int32(e.errnum) : Int32(-1)
+        end
+        close(f)
+    else
+        io = open(p, "r+")
+        k == 7 && read(io, UInt8)
+        try
+            k == 3 || k == 7 ? truncate(io, 2) : position(io)
+        catch e
+            code = e isa SystemError ? Int32(e.errnum) : Int32(-1)
+        end
+        close(io)
+    end
+    rm(p)
+    return code
+end
+
 @testset "filesystem over WASI" begin
     expected = fs_ops(1)
     @test run_fs(fs_print, 2) == 0
@@ -182,6 +366,52 @@ end
         foreach(Base.delete_method, setdiff(methods_of(WasmCodegen.Runtime.WASM_METHODS), before))
     end
     @test methods_of(WasmCodegen.Runtime.WASM_METHODS) == before
+    @test file_wrappers(1) == 1
+    @test run_fs(file_wrappers, 2) == 1
+    @test retry_write(1) == 1
+    @test raw_io(1) == 1
+    @test run_fs(raw_io, 2) == 1
+    fault_compilations = IdDict{Any,Any}()
+    fault_run(f, k, faults) = wasm_run(get!(fault_compilations, f) do
+        WasmCodegen.compile(f, (Int,); config=cfg)
+    end, string(nameof(f)), k;
+        rettype=Int32, preopens=Dict(ROOT => ROOT), wasi_faults=faults)
+    for k in 1:5
+        errno = k == 4 ? 76 : 29 # denied seek rights and injected EIO
+        @test fault_run(reconcile_fault, k, [Dict("call" => "fd_seek", "negativeSeek" => true,
+            "at" => 1, "errno" => errno)]) == 1
+    end
+    for k in 1:4
+        faults = [Dict("call" => "fd_write", "at" => 1, "maxBytes" => 2),
+                  Dict("call" => "fd_write", "at" => 2, "errno" => (k == 1 ? 27 : k == 2 ? 0 : k == 3 ? 51 : 6))]
+        # Zero progress is a successful write returning zero bytes.
+        k == 2 && (faults[2] = Dict("call" => "fd_write", "at" => 2, "maxBytes" => 0))
+        @test fault_run(retry_write, k, faults) == 1
+    end
+    for k in 1:2
+        rule = k == 1 ? Dict("call" => "fd_pwrite", "at" => 1, "maxBytes" => 2) :
+                        Dict("call" => "fd_pwrite", "at" => 1, "errno" => 29)
+        @test fault_run(positional_fault, k, [rule]) == 1
+    end
+    @test fault_run(short_read, 1, [Dict("call" => "fd_read", "at" => 1, "maxBytes" => 2)]) == 1
+    @test fault_run(file_wrappers, 3, [Dict("call" => "fd_pwrite", "at" => 1, "maxBytes" => 2),
+        Dict("call" => "fd_pwrite", "at" => 2, "errno" => 27)]) == 1
+    for (k, rule) in enumerate([
+        Dict("call" => "fd_pread", "at" => 1, "maxBytes" => 2),
+        Dict("call" => "fd_write", "at" => 2, "maxBytes" => 1),
+        Dict("call" => "fd_pread", "at" => 1, "errno" => 29),
+        Dict("call" => "fd_write", "at" => 2, "errno" => 51)])
+        @test fault_run(sendfile_fault, k, [rule]) == 1
+    end
+    @test errno_maps(1) == 1
+    @test run_fs(errno_maps, 2) == 1
+    @test errno_fault(5) == 20
+    @test run_fs(errno_fault, 5) == 20
+    for (k, call, at, errno, expected) in ((1, "fd_seek", 1, 62, 130),
+            (2, "path_open", 2, 62, 130), (3, "fd_filestat_set_size", 1, 62, 130),
+            (4, "fd_seek", 1, 62, 130), (7, "fd_seek", 1, 76, 13))
+        @test fault_run(errno_fault, k, [Dict("call" => call, "at" => at, "errno" => errno)]) == expected
+    end
     # (for JavaScript, unsupported)
     @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(fs_print, (Int,))
 end
