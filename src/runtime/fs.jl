@@ -693,14 +693,24 @@ function readlink_path(path::String)
         return ft isa Int32 ? ft : Int32(Base.UV_EINVAL)
     end
     fd, rel = resolve(path)
-    return Staging.with_scope() do
-        o, ol = Staging.raw_path(rel)
-        cap = UInt32(4096)
-        buf = Staging.alloc_record(cap; align=1)
-        r = path_readlink(fd, o, ol, buf, cap, Staging.SCRATCH_OUT)
-        r == 0 || return uv(r)
-        get_raw(buf, Staging.load32(Staging.SCRATCH_OUT))
+    cap = UInt32(4096)
+    while true
+        result = readlink_result(fd, rel, cap)
+        result === nothing || return result
+        # A full buffer is ambiguous even for an exactly-capacity target.
+        cap == Staging.CHUNK && return uv(Int32(37)) # ENAMETOOLONG
+        cap *= UInt32(2)
     end
+end
+
+# A separate call keeps each attempt's capacity concrete while the caller grows it.
+readlink_result(fd::Int32, rel::String, cap::UInt32) = Staging.with_scope() do
+    o, ol = Staging.raw_path(rel)
+    buf = Staging.alloc_data(cap; align=1)
+    r = path_readlink(fd, o, ol, buf, cap, Staging.SCRATCH_OUT)
+    r == 0 || return uv(r)
+    n = Staging.load32(Staging.SCRATCH_OUT)
+    n < cap ? get_raw(buf, n) : nothing
 end
 
 """
@@ -740,7 +750,7 @@ function read_dirents!(entries::Vector{Tuple{String,UInt8}}, dfd::Int32)
         r == 0 || return Int32(r)
         used = Staging.load32(Staging.SCRATCH_OUT)
         p = buf
-        last = false
+        previous = cookie
         while p + UInt32(24) <= buf + used
             next = Staging.load64(p)
             n = Staging.load32(p + UInt32(16))
@@ -752,6 +762,12 @@ function read_dirents!(entries::Vector{Tuple{String,UInt8}}, dfd::Int32)
             p += UInt32(24) + n
         end
         used < cap && return Int32(0)
+        if cookie == previous
+            # No complete entry fit. Grow up to the staging chunk limit, then fail.
+            cap == Staging.CHUNK && return Int32(37) # ENAMETOOLONG
+            cap *= UInt32(2)
+            buf = Staging.alloc_data(cap)
+        end
     end
 end
 

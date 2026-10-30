@@ -364,6 +364,34 @@ function realpath_root(k::Int)
     end
 end
 
+function large_dirent(k::Int)
+    es = readdir(ROOT; sort=false)
+    return Int32(length(es) == 1 && ncodeunits(es[1]) == k)
+end
+function dirent_error(k::Int)
+    try
+        readdir(ROOT)
+        Int32(0)
+    catch e
+        e isa Base.IOError ? e.code : Int32(1)
+    end
+end
+function large_link(k::Int)
+    target = readlink(joinpath(ROOT, "synthetic-link"))
+    return Int32(ncodeunits(target) == k && all(==('a'), target))
+end
+function link_error(k::Int)
+    try
+        readlink(joinpath(ROOT, "synthetic-link"))
+        Int32(0)
+    catch e
+        e isa Base.IOError ? e.code : Int32(1)
+    end
+end
+function directory_batch(k::Int)
+    es = readdir(ROOT; sort=false)
+    return Int32(length(es) == 2 && ncodeunits(es[1]) == k && ncodeunits(es[2]) == 20)
+end
 preopen_empty(k::Int) = Int32(isempty(WasmCodegen.Runtime.FS.preopens()))
 function preopen_relative(k::Int)
     try
@@ -523,6 +551,32 @@ strerror_sum(k::Int) = Int32(sum(codeunits(Base.Libc.strerror(k))))
     finally
         foreach(Base.delete_method, setdiff(methods_of(WasmCodegen.Runtime.WASM_METHODS), before_query))
     end
+    # An entry larger than the initial buffer must grow rather than repeat forever.
+    entry = [Dict("length" => 70_000, "next" => 917)]
+    @test fault_run(large_dirent, 70_000, [Dict("call" => "fd_readdir", "at" => 1,
+        "repeat" => true, "cookie" => 0, "dirents" => entry)]) == 1
+    # An exactly full result needs another host call at the supplied (non-arithmetic) cookie.
+    @test fault_run(large_dirent, 65_512, [
+        Dict("call" => "fd_readdir", "at" => 1, "cookie" => 0,
+            "dirents" => [Dict("length" => 65_512, "next" => 991)]),
+        Dict("call" => "fd_readdir", "at" => 2, "cookie" => 991, "dirents" => [])]) == 1
+    for first in (65_502, 65_482) # truncated header, truncated name
+        @test fault_run(directory_batch, first, [
+            Dict("call" => "fd_readdir", "at" => 1, "cookie" => 0,
+                "dirents" => [Dict("length" => first, "next" => 53), Dict("length" => 20, "next" => 919)]),
+            Dict("call" => "fd_readdir", "at" => 2, "cookie" => 53,
+                "dirents" => [Dict("length" => 20, "next" => 919)])]) == 1
+    end
+    @test fault_run(dirent_error, 1, [Dict("call" => "fd_readdir", "at" => 1,
+        "repeat" => true, "cookie" => 0,
+        "dirents" => [Dict("length" => 1_048_576, "next" => 23)])]) == Base.UV_ENAMETOOLONG
+    symlink("irrelevant", joinpath(ROOT, "synthetic-link"))
+    for length in (4096, 4097)
+        @test fault_run(large_link, length, [Dict("call" => "path_readlink", "at" => 1,
+            "repeat" => true, "linkLength" => length)]) == 1
+    end
+    @test fault_run(link_error, 1, [Dict("call" => "path_readlink", "at" => 1,
+        "repeat" => true, "linkLength" => 1_048_576)]) == Base.UV_ENAMETOOLONG
     @test errno_maps(1) == 1
     @test run_fs(errno_maps, 2) == 1
     @test errno_fault(5) == 20
