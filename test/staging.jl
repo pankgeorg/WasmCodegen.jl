@@ -97,6 +97,19 @@ function st_errno(e::Int32)
         return (Int32(err.code), h)
     end
 end
+st_guest_errno(e::Int32) = R.Errno.guest_errno(e)
+st_uv_guest(code::Int32) = R.Errno.uv_to_guest_errno(code)
+st_synthetic_uv(code::Int32) = R.Errno._uv_to_guest_errno(code, Int32[-7001, -7002], Int32[13, 36])
+function st_guest_error(e::Int32)
+    try
+        throw(SystemError("probe", Int(R.Errno.guest_errno(e))))
+    catch err
+        err isa SystemError || return (Int32(-1), UInt64(0))
+        msg = R.Errno.strerror(err.errnum)
+        h = foldl((h, b) -> h * 31 + b, codeunits(msg); init=UInt64(0))
+        return (Int32(err.errnum), h)
+    end
+end
 plain(x::Int) = x + 1
 # a WASI call whose pointer is in the runtime's part, without a load or store of it
 scratch_only() = R.WASI.clock_time_get(R.WASI.CLOCK_REALTIME, UInt64(1000), S.SCRATCH_OUT)
@@ -150,7 +163,56 @@ scratch_only() = R.WASI.clock_time_get(R.WASI.CLOCK_REALTIME, UInt64(1000), S.SC
     end
     @test E.uv_message(Base.UV_EOF) == "end of file"
     @test E.uv_name(Base.UV_EOF) == "EOF"
-    @test E.strerror(13) == Base.Libc.strerror(Base.Libc.EACCES)
+    # Guest errno and strerror always use the same fixed Linux ABI, even when
+    # the build libc or libuv uses different numbering. EBADMSG and EOWNERDEAD
+    # also demonstrate why a direct WASI conversion must precede any UV fallback.
+    c = wcomp(st_guest_error, (Int32,))
+    for (wasi, guest, message) in ((2, 13, "Permission denied"), (9, 74, "Bad message"),
+        (37, 36, "File name too long"), (55, 39, "Directory not empty"),
+        (58, 95, "Operation not supported"), (61, 75, "Value too large for defined data type"),
+        (62, 130, "Owner died"), (76, 13, "Permission denied"),
+        (-1, 5, "Input/output error"), (77, 5, "Input/output error"))
+        @test E.guest_errno(wasi) == guest
+        @test E.strerror(guest) == message
+        expected = (Int32(guest), foldl((h, b) -> h * 31 + b, codeunits(message); init=UInt64(0)))
+        @test st_guest_error(Int32(wasi)) == expected
+        @test wasm_run(c, "st_guest_error", Int32(wasi); rettype=Tuple{Int32,UInt64}) == expected
+    end
+    @test E.guest_errno(0) == 0
+    @test E.uv_to_guest_errno(0) == 0
+    @test E.uv_to_guest_errno(E.uv_code(9)) == 5
+    @test E.uv_to_guest_errno(E.uv_code(62)) == 5
+    @test E.strerror(108) == "Cannot send after transport endpoint shutdown"
+    @test E.strerror(-1) == "Unknown error -1"
+    @test E.strerror(134) == "Unknown error 134"
+    if Sys.islinux()
+        # Independent native libc oracle on the validated Linux build profile.
+        for e in 0:133
+            @test E.strerror(e) == R.original(Base.Libc.strerror, Int32(e))
+        end
+        c = wcomp(st_guest_errno, (Int32,))
+        for (i, name) in enumerate(E.WASI_NAMES)
+            native_name = name === :ENOTCAPABLE ? :EACCES : name
+            isdefined(Base.Libc, native_name) || continue
+            expected = Int32(getglobal(Base.Libc, native_name))
+            @test st_guest_errno(Int32(i-1)) == expected
+            @test wasm_run(c, "st_guest_errno", Int32(i-1); rettype=Int32) == expected
+        end
+    end
+    c = wcomp(st_uv_guest, (Int32,))
+    for (code, expected) in ((Base.UV_EACCES, 13), (Base.UV_ENAMETOOLONG, 36),
+        (Base.UV_ENOTEMPTY, 39), (Base.UV_EOVERFLOW, 75), (Base.UV_ESPIPE, 29),
+        (Base.UV_ESHUTDOWN, 108), (Base.UV_ENODATA, 61), (Base.UV_EOF, 5),
+        (Base.UV_UNKNOWN, 5), (0, 0), (-123456, 5))
+        @test st_uv_guest(Int32(code)) == expected
+        @test wasm_run(c, "st_uv_guest", Int32(code); rettype=Int32) == expected
+    end
+    c = wcomp(st_synthetic_uv, (Int32,))
+    for (code, expected) in ((-7001, 13), (-7002, 36), (0, 0), (-7003, 5))
+        @test st_synthetic_uv(Int32(code)) == expected
+        @test wasm_run(c, "st_synthetic_uv", Int32(code); rettype=Int32) == expected
+    end
+
 end
 
 end

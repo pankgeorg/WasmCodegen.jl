@@ -252,8 +252,11 @@ end # WASI
 
 WASI errnos (preview 1 numbering) mapped by name to the build platform's `Base.UV_E*`
 codes. ENOTCAPABLE becomes EACCES; errors without a libuv equivalent and unknown WASI
-codes become EIO. Guest libc errno numbers are a separate, fixed Linux ABI, independent
-of the build host. Messages are captured natively when the package loads.
+codes become EIO. Guest libc errno numbers and English messages are a separate, fixed
+Linux ABI, independent of the build host. Use `guest_errno` for WASI results going to
+libc/SystemError, `uv_to_guest_errno` for existing libuv results, and `uv_code` for
+IOError/libuv interfaces. Negation does not convert between these ABIs. Only libuv's
+messages are captured from the build host when the package loads.
 """
 module Errno
 
@@ -287,6 +290,43 @@ const UV_CODES = Int32[v for (_, v) in Base.uv_err_vals]
 const UV_STRERROR = String[Base.struverror(c) for c in UV_CODES]
 const UV_NAME = String[Base.uverrorname(c) for c in UV_CODES]
 
+# Resolve UV codes to guest libc numbers by name. Do not reverse the WASI UV
+# table: multiple unrepresentable WASI errors collapse to UV_EIO there.
+const UV_GUEST_ERRNO = let guest = Dict(zip(WASI_NAMES, LINUX))
+    for (name, value) in (:ENONET => 64, :ESHUTDOWN => 108, :EHOSTDOWN => 112,
+                          :EREMOTEIO => 121, :ESOCKTNOSUPPORT => 94,
+                          :ENODATA => 61, :EUNATCH => 49)
+        guest[name] = Int32(value)
+    end
+    Int32[get(guest, Symbol(String(name)[4:end]), 5) for (name, _) in Base.uv_err_vals]
+end
+
+"""
+    guest_errno(wasi_errno)
+
+The positive errno in the fixed Linux guest libc ABI, for `jl_set_errno` and
+`SystemError.errnum`. Success is 0; ENOTCAPABLE becomes EACCES (13); unknown WASI
+values become EIO (5). This preserves errors which `uv_code` cannot represent.
+"""
+guest_errno(e::Integer) = 0 <= e < length(LINUX) ? LINUX[e+1] : Int32(5)
+
+# The same lookup is exercised with synthetic UV numbering in tests.
+function _uv_to_guest_errno(code::Integer, codes::Vector{Int32}, guest::Vector{Int32})
+    code == 0 && return Int32(0)
+    i = findfirst(==(code), codes)
+    return i === nothing ? Int32(5) : guest[i]
+end
+
+"""
+    uv_to_guest_errno(uv_code)
+
+Convert a platform `Base.UV_*` result by name to the fixed Linux guest libc ABI.
+Success is 0; unknown codes or codes without a Linux errno (including EOF and DNS
+errors) become EIO (5). Handle EOF as EOF in the caller. Prefer `guest_errno` when
+the original WASI result is available; libuv may have discarded its identity.
+"""
+uv_to_guest_errno(code::Integer) = _uv_to_guest_errno(code, UV_CODES, UV_GUEST_ERRNO)
+
 "The libuv code of WASI errno `e` (`UV_EIO` for unknown or unrepresentable errors)."
 uv_code(e::Integer) = 0 <= e < length(UV) ? UV[e+1] : Int32(Base.UV_EIO)
 
@@ -301,18 +341,145 @@ function uv_name(code::Integer)
     return i === nothing ? string("Unknown system error ", code) : UV_NAME[i]
 end
 
-# Guest libc numbers stay fixed even when the build libc uses different numbers.
+# Fixed English messages for the Linux guest errno ABI, including errno values
+# outside WASI's set. Never index the build host's libc strerror by a guest number.
 const NERR = 134
-const STRERROR = let messages = String[string("Unknown error ", e) for e in 0:NERR-1]
-    messages[1] = Base.Libc.strerror(Int32(0))
-    for (i, name) in enumerate(WASI_NAMES)
-        name === :SUCCESS && continue
-        native_name = name === :ENOTCAPABLE ? :EACCES : name
-        messages[LINUX[i]+1] = isdefined(Base.Libc, native_name) ?
-            Base.Libc.strerror(Int32(getglobal(Base.Libc, native_name))) : uv_message(UV[i])
-    end
-    messages
-end
+const STRERROR = String[
+    "Success",
+    "Operation not permitted",
+    "No such file or directory",
+    "No such process",
+    "Interrupted system call",
+    "Input/output error",
+    "No such device or address",
+    "Argument list too long",
+    "Exec format error",
+    "Bad file descriptor",
+    "No child processes",
+    "Resource temporarily unavailable",
+    "Cannot allocate memory",
+    "Permission denied",
+    "Bad address",
+    "Block device required",
+    "Device or resource busy",
+    "File exists",
+    "Invalid cross-device link",
+    "No such device",
+    "Not a directory",
+    "Is a directory",
+    "Invalid argument",
+    "Too many open files in system",
+    "Too many open files",
+    "Inappropriate ioctl for device",
+    "Text file busy",
+    "File too large",
+    "No space left on device",
+    "Illegal seek",
+    "Read-only file system",
+    "Too many links",
+    "Broken pipe",
+    "Numerical argument out of domain",
+    "Numerical result out of range",
+    "Resource deadlock avoided",
+    "File name too long",
+    "No locks available",
+    "Function not implemented",
+    "Directory not empty",
+    "Too many levels of symbolic links",
+    "Unknown error 41",
+    "No message of desired type",
+    "Identifier removed",
+    "Channel number out of range",
+    "Level 2 not synchronized",
+    "Level 3 halted",
+    "Level 3 reset",
+    "Link number out of range",
+    "Protocol driver not attached",
+    "No CSI structure available",
+    "Level 2 halted",
+    "Invalid exchange",
+    "Invalid request descriptor",
+    "Exchange full",
+    "No anode",
+    "Invalid request code",
+    "Invalid slot",
+    "Unknown error 58",
+    "Bad font file format",
+    "Device not a stream",
+    "No data available",
+    "Timer expired",
+    "Out of streams resources",
+    "Machine is not on the network",
+    "Package not installed",
+    "Object is remote",
+    "Link has been severed",
+    "Advertise error",
+    "Srmount error",
+    "Communication error on send",
+    "Protocol error",
+    "Multihop attempted",
+    "RFS specific error",
+    "Bad message",
+    "Value too large for defined data type",
+    "Name not unique on network",
+    "File descriptor in bad state",
+    "Remote address changed",
+    "Can not access a needed shared library",
+    "Accessing a corrupted shared library",
+    ".lib section in a.out corrupted",
+    "Attempting to link in too many shared libraries",
+    "Cannot exec a shared library directly",
+    "Invalid or incomplete multibyte or wide character",
+    "Interrupted system call should be restarted",
+    "Streams pipe error",
+    "Too many users",
+    "Socket operation on non-socket",
+    "Destination address required",
+    "Message too long",
+    "Protocol wrong type for socket",
+    "Protocol not available",
+    "Protocol not supported",
+    "Socket type not supported",
+    "Operation not supported",
+    "Protocol family not supported",
+    "Address family not supported by protocol",
+    "Address already in use",
+    "Cannot assign requested address",
+    "Network is down",
+    "Network is unreachable",
+    "Network dropped connection on reset",
+    "Software caused connection abort",
+    "Connection reset by peer",
+    "No buffer space available",
+    "Transport endpoint is already connected",
+    "Transport endpoint is not connected",
+    "Cannot send after transport endpoint shutdown",
+    "Too many references: cannot splice",
+    "Connection timed out",
+    "Connection refused",
+    "Host is down",
+    "No route to host",
+    "Operation already in progress",
+    "Operation now in progress",
+    "Stale file handle",
+    "Structure needs cleaning",
+    "Not a XENIX named type file",
+    "No XENIX semaphores available",
+    "Is a named type file",
+    "Remote I/O error",
+    "Disk quota exceeded",
+    "No medium found",
+    "Wrong medium type",
+    "Operation canceled",
+    "Required key not available",
+    "Key has expired",
+    "Key has been revoked",
+    "Key was rejected by service",
+    "Owner died",
+    "State not recoverable",
+    "Operation not possible due to RF-kill",
+    "Memory page has hardware error",
+]
 
 "`strerror(errno)` for the guest's fixed Linux libc errno ABI."
 strerror(e::Integer) = 0 <= e < NERR ? STRERROR[e+1] : string("Unknown error ", e)
