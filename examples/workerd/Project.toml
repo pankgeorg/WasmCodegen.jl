@@ -1,0 +1,10 @@
+[deps]
+IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+WasmBuilder = "c3e9a8f2-6b1d-4f7a-8e25-1a9d3b7c4e60"
+WasmCodegen = "5b0f1d7e-3c2a-4e8b-9a61-7d2f4c8e1a93"
+
+[sources]
+IRStructurizer = {url = "https://github.com/gbaraldi/IRStructurizer.jl", rev = "eh-tryop"}
+WasmBuilder = {url = "https://github.com/gbaraldi/WasmBuilder.jl", rev = "main"}
+WasmCodegen = {path = "../.."}
