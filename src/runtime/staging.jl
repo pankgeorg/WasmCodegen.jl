@@ -244,6 +244,8 @@ fd_write(fd::Int32, iovs::UInt32, iovs_len::UInt32, nwritten::UInt32) =
 clock_time_get(id::UInt32, precision::UInt64, time::UInt32) =
     ccall((:clock_time_get, "wasi_snapshot_preview1"), Int32, (UInt32, UInt64, UInt32),
           id, precision, time)
+random_get(buf::UInt32, len::UInt32) =
+    ccall((:random_get, "wasi_snapshot_preview1"), Int32, (UInt32, UInt32), buf, len)
 
 end # WASI
 
@@ -493,3 +495,9 @@ end # Errno
 end
 @noinline throw_uv_error(what::String, code::Int32) =
     throw(Base.IOError(string(what, ": ", Errno.uv_message(code), " (", Errno.uv_name(code), ")"), code))
+
+"64 random bits from the host (WASI `random_get`): for names of temporary files."
+function entropy()
+    wasi_check(WASI.random_get(Staging.SCRATCH_OUT, UInt32(8)), "random_get")
+    return Staging.load64(Staging.SCRATCH_OUT)
+end

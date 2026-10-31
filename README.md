@@ -71,6 +71,31 @@ wasi.initialize(instance);
 instance.exports.f(100n);
 ```
 
+WASI file paths use absolute preopen names and a virtual working directory (`PWD`, or the
+first preopen). Preopens must occupy contiguous descriptors starting at 3; the first EBADF
+ends discovery. Resolution uses the longest component-prefix match. `link/..` is resolved
+lexically, and `cd(f, dir)` restores the old directory by path, so renaming that directory
+can prevent restoration. Permission bits, uid/gid and block counts are synthesized unless
+a mode provider is installed. Default modes do not enforce access or guarantee 0600/0700
+privacy for temporary files/directories. Access checks approximate owner bits, not ACLs or
+effective credentials. Preview 1 metadata timestamps cannot represent times before 1970.
+
+File IOStreams write synchronously to the host; `flush` has no pending file output to drain
+and does not promise durability. After read-ahead, writing or truncating requires a successful
+rewind; nonseekable duplex descriptors fail this transition and retain their read buffer.
+Writes retry EINTR from the unwritten suffix; EAGAIN is reported without waiting for host
+readiness. An error after a partial write can leave a prefix written. Raw `jl_fs_read`,
+`jl_fs_write` and `jl_fs_sendfile` return counts or negative errors, permit short IO, and cap
+each request at 1 MiB. Julia's complete-read/write wrappers loop above that interface.
+Positional IO uses `fd_pread`/`fd_pwrite` and never moves the source/current file offset.
+
+Creation followed by mode adjustment is not atomic. If a mode query or adjustment fails,
+the created object remains at the host's mode and a newly opened descriptor is closed.
+Path-based mode adjustment has replacement races. Atomic create-with-mode and
+identity-checked chmod require a stronger host interface and are outside this contract.
+Directory records up to 1 MiB and symbolic-link targets shorter than 1 MiB are supported;
+ambiguous full buffers grow to that bound and then report ENAMETOOLONG.
+
 `compile` throws `UnsupportedConstructs` with the statements it cannot compile and the
 method instances they are in, as juliac's verifier reports what it cannot trim. The module
 it returns is optimized by `wasm-opt -O3` (Binaryen_jll); `Config(optimize=nothing)` gives
