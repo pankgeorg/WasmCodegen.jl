@@ -42,6 +42,7 @@ WasmCodegen.with_trim_patches() do _, _
     include("env.jl")
     include("fs.jl")
     include("event.jl")
+    include("diagnostics.jl")
     include("juliac/runtests.jl")
 end
 
