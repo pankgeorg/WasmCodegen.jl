@@ -2,7 +2,8 @@
 // js/julia_io.mjs's events and js/julia_task.mjs, with Node's WASI, each Julia task on its own
 // JSPI stack. argv[3]: JSON list of calls [{fn, args, i64, fresh, jsTimer, expectTrap}]. A call
 // runs on a new instance unless `fresh` is false (then on the previous call's: tasks it left
-// parked may run). `jsTimer`: a setTimeout(0) is armed before the call; the result says
+// parked may run). `jsHost`: the new instance runs on js/julia.mjs's WASI (as on hosts without
+// one: no preopened directory) in place of Node's, its output on this process's. `jsTimer`: a setTimeout(0) is armed before the call; the result says
 // whether it fired before the call returned. `shutdownAfter`: the host is shut down that many
 // ms into the call (which then fails). The argument "$PORT" is the port of a local HTTP
 // server: /small ("hello"), /delayed (a head, then 3 bytes after 30 ms), /blob/<i> (65536 + i
@@ -16,6 +17,7 @@ import path from 'node:path';
 import http from 'node:http';
 import { makeJuliaIOEvents, makeJuliaIOPaths } from '../js/julia_io.mjs';
 import { makeJuliaTask } from '../js/julia_task.mjs';
+import { createHost } from '../js/julia.mjs';
 
 const [, , wasmPath, callsJson] = process.argv;
 const calls = JSON.parse(callsJson);
@@ -34,17 +36,20 @@ const server = http.createServer((req, res) => {
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const port = server.address().port;
 
-async function instantiate() {
-  const wasi = new WASI({ version: 'preview1', args: ['tasks'], env: { HOME: dir, PWD: dir, TMPDIR: dir },
-                          preopens: { [dir]: dir }, returnOnExit: true });
-  const events = makeJuliaIOEvents({ preopens: [dir], network: true });
-  const paths = makeJuliaIOPaths({ preopens: [dir] });
+async function instantiate(jsHost) {
+  const preopens = jsHost ? [] : [dir];
+  const host = jsHost ? createHost({ args: ['tasks'], env: { HOME: dir, TMPDIR: dir },
+                                     write: (fd, b) => (fd === 2 ? process.stderr : process.stdout).write(b) }) : null;
+  const wasi = jsHost ? null : new WASI({ version: 'preview1', args: ['tasks'], env: { HOME: dir, PWD: dir, TMPDIR: dir },
+                                          preopens: { [dir]: dir }, returnOnExit: true });
+  const events = makeJuliaIOEvents({ preopens, network: true });
+  const paths = makeJuliaIOPaths({ preopens });
   const jt = makeJuliaTask({ busy: () => events.stats().open > 0 });
-  const instance = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: wasi.wasiImport,
+  const instance = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: jsHost ? host.imports.wasi_snapshot_preview1 : wasi.wasiImport,
                                                         julia_io: { ...paths.imports, ...events.imports }, ...jt.imports });
   events.bindMemory(instance.exports.memory);
   paths.bindMemory(instance.exports.memory);
-  wasi.initialize(instance);
+  if (jsHost) host.attach(instance); else wasi.initialize(instance);
   jt.bind(instance);
   return { instance, events, jt };
 }
@@ -55,7 +60,7 @@ let cur = null;
 for (const c of calls) {
   if (!cur || c.fresh !== false) {
     if (cur) out({ shutdown: cur.jt.shutdown() });
-    cur = await instantiate();
+    cur = await instantiate(!!c.jsHost);
   }
   const { instance, events, jt } = cur;
   const args = (c.args || []).map((a) => (a === '$PORT' ? port : a)).map((a) => (c.i64 ? BigInt(a) : a));

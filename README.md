@@ -61,7 +61,7 @@ two interfaces, `Config(host = ...)`:
   compiling to Wasm do (Go's `wasip1`, Kotlin's `wasmWasi`). The module exports its
   `memory` (a page, for the data of WASI calls) and runs its initialization from
   `_initialize`, as a WASI reactor; `js/julia.mjs` runs these too, where JavaScript has
-  no WASI (browsers). In Node, with `node:wasi`:
+  no WASI (browsers, Cloudflare Workers), without a filesystem. In Node, with `node:wasi`:
 
 ```js
 import { WASI } from 'node:wasi';
@@ -107,7 +107,7 @@ parameters, `examples/mtk` simulates a ModelingToolkit model with sliders, and
 
 ## Host runtimes
 
-The supported hosts are Node.js, wasmtime and, partly, Cloudflare workerd. The sections
+The supported hosts are Node.js, wasmtime and Cloudflare workerd. The sections
 below say what each needs and what doesn't work yet.
 
 Modules use WasmGC and typed function references. A program that catches exceptions also
@@ -174,25 +174,34 @@ Tested with wasmtime 50.0.1.
 
 ### Cloudflare workerd and Workers
 
-Partly supported. Tested locally with workerd 1.20261031.1 (V8 15.7) and not deployed.
+Supported on `js/julia.mjs`, for `host = :js` and `host = :wasi` modules, with
+`js/julia_task.mjs` for Tasks on JSPI and `js/julia_io.mjs` for timers. Tested locally with
+workerd 1.20261031.1 (V8 15.7) and not deployed. [`examples/workerd`](examples/workerd)
+serves a Worker that runs a Lorenz solve, the tests' Tasks program (#37: tasks, timers,
+channels) and a WASI program that reads its environment and the clock, and compares their
+output with Node's and native Julia's.
 
-- **Runs:** a Lorenz solve and a Dict/String loop gave the same results as Node, with the
-  imports from `js/julia.mjs`'s `createHost`. JSPI works in workerd.
-- **Doesn't run:** Node's WASI driver. workerd's `node:wasi` throws
-  `ERR_METHOD_NOT_IMPLEMENTED` from its constructor, so `host = :wasi` modules need another
-  implementation of their WASI imports. `js/julia.mjs` has one; in workerd only its
-  `random_get` has been exercised. The host's events of #36 (`js/julia_io.mjs`) fail too:
-  they detect the platform from Node's diagnostic report, which workerd doesn't fill in.
-- **Compiling at request time is disallowed** ("Wasm code generation disallowed by
-  embedder"). Configure modules as Wasm modules of the Worker and instantiate the
-  `WebAssembly.Module` they import. `instantiate(bytes)` of `js/julia.mjs` compiles bytes,
-  so it can't be used inside a request.
-- **`wasm:js-string`** builtins need the compatibility flag
-  `wasm_esm_integration_builtins`.
+- **WASI from `js/julia.mjs`.** workerd's `node:wasi` throws `ERR_METHOD_NOT_IMPLEMENTED`
+  from its constructor. `createHost({ env, args })` provides WASI preview 1 instead: the
+  arguments, the environment, the clocks, randomness and the standard streams. It exposes
+  no filesystem: no directory is preopened (workerd's own `/tmp` and `/bundle` included),
+  so file operations fail as for a path out of the preopens. `julia_io`'s HTTP is untested
+  in workerd.
+- **Modules compiled ahead of time.** Compiling at request time is disallowed ("Wasm code
+  generation disallowed by embedder"). Configure each module as a Wasm module of the
+  Worker (`(name = "m.wasm", wasm = embed "m.wasm")` in workerd's configuration;
+  `import m from './m.wasm'` with Wrangler) and pass the `WebAssembly.Module` it imports to
+  `instantiate` or `WebAssembly.instantiate`.
+- **Compatibility flags.** `nodejs_compat`, for `julia_io.mjs` and `julia_task.mjs`, is on by
+  default from the compatibility date 2026-08-04. JSPI needs no flag. JS string builtins
+  (`wasm:js-string`) and string constants need `wasm_esm_integration_builtins`
+  (`compatibilityFlags = ["wasm_esm_integration_builtins"]`, or `compatibility_flags` in
+  `wrangler.toml`); WasmCodegen's modules use neither.
 - **Production limits** ([limits](https://developers.cloudflare.com/workers/platform/limits/)),
   which local workerd doesn't enforce: 128 MB of memory per isolate, including Wasm; CPU
   time per HTTP request, 10 ms on the Free plan and 30 s by default (up to 5 minutes) on
-  the Paid plan; 64 MiB of uncompressed bundle; 1 s of startup.
+  the Paid plan; 64 MiB of uncompressed bundle; 1 s of startup. A Worker's clocks advance
+  only between I/O operations.
 
 ### Not supported or untested
 

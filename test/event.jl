@@ -319,6 +319,44 @@ using .EventTests: EventTests as EV
     native = string("arch=", Base.BinaryPlatforms.arch(p), ";os=", Base.BinaryPlatforms.os(p), ";",
                     Sys.islinux() ? string("libc=", Base.BinaryPlatforms.libc(p), ";") : "")
     @test LAST_OUTPUT[] == native
+    # a runtime whose diagnostic report has no header (Cloudflare's workerd), on js/julia.mjs's
+    # WASI: the arch and the os, and no libc
+    dir2 = mktempdir()
+    write(joinpath(dir2, "m.wasm"), wc(EV.platform_print, ()).bytes)
+    write(joinpath(dir2, "run.mjs"), """
+    import fs from 'node:fs';
+    import { createHost } from '$(WasmCodegen.JS_HOST)';
+    import { makeJuliaIOEvents } from '$(joinpath(dirname(WasmCodegen.JS_HOST), "julia_io.mjs"))';
+    process.report.getReport = () => ({});
+    const out = [];
+    const host = createHost({ write: (fd, b) => out.push(...b) });
+    const events = makeJuliaIOEvents({ network: false });
+    const mod = await WebAssembly.compile(fs.readFileSync('$(joinpath(dir2, "m.wasm"))'));
+    const instance = await WebAssembly.instantiate(mod, { ...host.imports, julia_io: events.imports });
+    events.bindMemory(instance.exports.memory);
+    host.attach(instance);
+    await WebAssembly.promising(instance.exports.platform_print)();
+    process.stdout.write(new TextDecoder().decode(new Uint8Array(out)));
+    """)
+    @test read(`$(node_cmd()) $(jspi_flags()) $(joinpath(dir2, "run.mjs"))`, String) ==
+          string("arch=", Base.BinaryPlatforms.arch(p), ";os=", Base.BinaryPlatforms.os(p), ";")
+    # the libc for each shape of the report: Node's, without the glibc version (musl), and
+    # unknown without a header, without a report, or when making one fails
+    write(joinpath(dir2, "shapes.mjs"), """
+    import { detectPlatform } from '$(joinpath(dirname(WasmCodegen.JS_HOST), "julia_io.mjs"))';
+    const libc = () => detectPlatform().find(([k]) => k === 'libc')?.[1] ?? null;
+    const r = [libc()];
+    for (const f of [() => ({ header: {} }), () => ({}), () => undefined, () => { throw new Error('no report'); }]) {
+      process.report.getReport = f;
+      r.push(libc());
+    }
+    Object.defineProperty(process, 'report', { value: undefined, configurable: true });
+    r.push(libc());
+    process.stdout.write(JSON.stringify(r));
+    """)
+    native_libc = Sys.islinux() ? string(Base.BinaryPlatforms.libc(p)) : nothing
+    @test JSON.parse(read(`$(node_cmd()) $(joinpath(dir2, "shapes.mjs"))`, String)) ==
+          Any[native_libc, Sys.islinux() ? "musl" : nothing, nothing, nothing, nothing, nothing]
 
     # HTTP, downloads and decompression: on the driver, against its server
     entries = unique(first.(EV.CALLS))

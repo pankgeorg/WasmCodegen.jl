@@ -54,7 +54,7 @@
 // | `cancel` | `(h) -> i32` | Aborts the operation of the handle (it becomes cancelled: `-ECANCELED`, 11). Idempotent. `0`, or `-EBADF` for an unknown handle. |
 // | `close` | `(h) -> i32` | Releases the handle, aborting what it does: `0`. A closed or unknown handle is `-EBADF` (closing twice too). |
 // | `decompress` | `(src_off, src_len, dst_off, dst_len) -> i32 status` | Synchronous. Decompresses the file `src` into `dst` (absolute paths): gzip (`1f 8b`) or zstd (`28 b5 2f fd`) by the magic bytes, anything else is `EILSEQ` (25); truncated input `EIO` (the destination left as it was). Writes `dst + ".partial"` and renames it to `dst`; on failure, removes it. The message: `errmsg(-1)`. |
-// | `host_platform` | `(out_off, cap) -> i32` | Synchronous. Writes the record `u32 n, (str key, str value)*n` of the host machine's tags, with the names of `Base.BinaryPlatforms`: `arch` (`x86_64`, `aarch64`, `i686`, `armv7l`, `powerpc64le`, `riscv64`), `os` (`linux`, `macos`, `windows`, `freebsd`), `libc` (`glibc` or `musl`, on Linux), and any other the host is configured with (`libgfortran_version`, `cxxstring_abi`, ...: Node cannot detect them). The detected tags first; the configuration overrides them key by key. Never `julia_version` (the module adds its own). `cap` too small: `-ENOBUFS` with the length needed at `out_off`. An `arch` or `os` the host cannot tell: `-ENOTSUP`. |
+// | `host_platform` | `(out_off, cap) -> i32` | Synchronous. Writes the record `u32 n, (str key, str value)*n` of the host machine's tags, with the names of `Base.BinaryPlatforms`: `arch` (`x86_64`, `aarch64`, `i686`, `armv7l`, `powerpc64le`, `riscv64`), `os` (`linux`, `macos`, `windows`, `freebsd`), `libc` (`glibc` or `musl`, on Linux, when the runtime can tell: Node can, from its diagnostic report), and any other the host is configured with (`libgfortran_version`, `cxxstring_abi`, ...: Node cannot detect them). The detected tags first; the configuration overrides them key by key. Never `julia_version` (the module adds its own). `cap` too small: `-ENOBUFS` with the length needed at `out_off`. An `arch` or `os` the host cannot tell: `-ENOTSUP`. |
 // | `path_mode` | `(path_off, path_len, follow i32) -> i32` | The POSIX `st_mode` (type and permission bits) of the absolute path (of the link itself unless `follow`), or `-errno`. (WASI preview 1 has no permission bits.) |
 // | `path_chmod` | `(path_off, path_len, mode i32) -> i32 status` | `chmod(2)` of the absolute path (following links). |
 // | `path_symlink` | `(target_off, target_len, link_off, link_len) -> i32 status` | `symlink(2)`: a symbolic link at the absolute path `link` to `target`, which is any string (absolute, or out of the preopens), never resolved nor validated, as natively. (WASI's `path_symlink` refuses such targets.) |
@@ -283,18 +283,31 @@ export function makeCheckPath(preopens) {
 const ARCH = { x64: 'x86_64', arm64: 'aarch64', ia32: 'i686', arm: 'armv7l', riscv64: 'riscv64' };
 const OS = { linux: 'linux', darwin: 'macos', win32: 'windows', freebsd: 'freebsd' };
 
-// The detected tags of the host: arch, os and (Linux) libc; a value Node cannot map is absent.
-// (`opts` stand in for the process, in tests; an explicit `glibc: undefined` is a musl host)
+// The glibc version of the process from Node's diagnostic report (none: musl), or null when
+// the runtime has no such report (it cannot tell the libc)
+function reportedGlibc() {
+  try {
+    const header = globalThis.process?.report?.getReport?.()?.header;
+    return header && typeof header === 'object' ? (header.glibcVersionRuntime ?? undefined) : null;
+  } catch {
+    return null;
+  }
+}
+
+// The detected tags of the host: arch, os and (Linux) libc; a value the runtime cannot tell
+// is absent. (`opts` stand in for the process, in tests; an explicit `glibc: undefined` is a
+// musl host, `glibc: null` a runtime that cannot tell)
 export function detectPlatform(opts = {}) {
-  const arch = opts.arch ?? process.arch, platform = opts.platform ?? process.platform;
-  const endianness = opts.endianness ?? os.endianness();
-  const glibc = 'glibc' in opts ? opts.glibc : process.report.getReport().header.glibcVersionRuntime;
+  const proc = globalThis.process;
+  const arch = opts.arch ?? proc?.arch, platform = opts.platform ?? proc?.platform;
+  const endianness = opts.endianness ?? os.endianness?.();
+  const glibc = 'glibc' in opts ? opts.glibc : reportedGlibc();
   const tags = [];
   const a = arch === 'ppc64' ? (endianness === 'LE' ? 'powerpc64le' : undefined) : ARCH[arch];
   if (a) tags.push(['arch', a]);
   const o = OS[platform];
   if (o) tags.push(['os', o]);
-  if (o === 'linux') tags.push(['libc', glibc ? 'glibc' : 'musl']);
+  if (o === 'linux' && glibc !== null) tags.push(['libc', glibc ? 'glibc' : 'musl']);
   return tags;
 }
 
@@ -865,7 +878,7 @@ export function makeJuliaIOEvents(opts = {}) {
     if (cap < 4) throw new GuestError(E.INVAL, `host_platform: cap ${cap} < 4`);
     checkRange(out_off, 4, 4);
     for (const k of ['arch', 'os'])
-      if (!platform.some(([q]) => q === k)) throw new GuestError(E.NOTSUP, `host_platform: this host's ${k} is not one Julia knows (${k === 'arch' ? process.arch : process.platform}); configure it`);
+      if (!platform.some(([q]) => q === k)) throw new GuestError(E.NOTSUP, `host_platform: this host's ${k} is not one Julia knows (${k === 'arch' ? globalThis.process?.arch : globalThis.process?.platform}); configure it`);
     const rec = encodeRecord([['u32', platform.length], ...platform.flatMap(([k, v]) => [['str', k], ['str', v]])]);
     if (rec.length > cap) { view().setUint32(out_off, rec.length, true); lastError = `host_platform: record needs ${rec.length} bytes, capacity ${cap}`; return -E.NOBUFS; }
     checkRange(out_off, rec.length);

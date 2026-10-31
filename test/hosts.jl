@@ -10,6 +10,12 @@ host_print_fail(n::Int) = (println(Core.stdout, "before ", n); n > 0 && error("b
 host_order() = (print(Core.stderr, "first"); println(Core.stdout, "second"); print(Core.stdout, "third"); 0)
 host_inc(x::Int) = x + 1
 host_clock() = time()
+# the environment and the clock of a WASI host, and a filesystem without preopened directories
+env_clock_text(now::Float64) =
+    string("greeting ", get(ENV, "WCG_GREETING", "-"), "; keys ",
+           join(sort([k for (k, _) in ENV if startswith(k, "WCG_")]), ","), "; unset ", haskey(ENV, "WCG_UNSET"),
+           "; clock ", abs(time() - now) < 60, "; file ", isfile("/wcg/no/such/file"), "\n")
+host_env_clock(now::Float64) = (print(Core.stdout, env_clock_text(now)); Int32(0))
 # an image object completed by initialization (a cycle), which calls no host function
 mutable struct HostNode; next::Any; v::Int; end
 const HOST_CYCLE = (n = HostNode(nothing, 7); n.next = n; n)
@@ -19,15 +25,17 @@ imported_modules(c) = unique(f.imported[1] for f in c.cgm.mod.funcs if f.importe
 imported_names(c) = [f.imported[2] for f in c.cgm.mod.funcs if f.imported !== nothing]
 exported_names(c) = [name for (name, _) in c.cgm.mod.exports]
 
-# run `fn(args...)` of the module with js/julia.mjs's `instantiate`: (result as a string, output)
-function run_julia_mjs(c, fn, args...)
+# run `fn(args...)` of the module with js/julia.mjs's `instantiate` (and WASI's environment
+# `env`), given the compiled module: (result as a string, output)
+function run_julia_mjs(c, fn, args...; env=Dict{String,String}())
     dir = mktempdir()
     write(joinpath(dir, "m.wasm"), c.bytes)
     write(joinpath(dir, "run.mjs"), """
     import { instantiate } from '$(WasmCodegen.JS_HOST)';
     import fs from 'node:fs';
     const out = [];
-    const { instance } = await instantiate(fs.readFileSync('$(joinpath(dir, "m.wasm"))'), { write: (fd, b) => out.push(...b) });
+    const mod = await WebAssembly.compile(fs.readFileSync('$(joinpath(dir, "m.wasm"))'));
+    const { instance } = await instantiate(mod, { write: (fd, b) => out.push(...b), env: $(JSON.json(env)) });
     const r = instance.exports.$fn($(join((a isa Int64 ? "$(a)n" : string(a) for a in args), ", ")));
     process.stdout.write(JSON.stringify({ r: String(r), out: new TextDecoder().decode(new Uint8Array(out)) }));
     """)
@@ -125,6 +133,15 @@ end
         order = WasmCodegen.compile(host_order, (); config=cfg)
         @test julia_mjs_console(order, "host_order") == [("err", "first"), ("out", "second"), ("out", "third")]
     end
+    # js/julia.mjs's WASI: the environment, the clock, and errnos for the filesystem
+    envc = WasmCodegen.compile(host_env_clock, (Float64,); config=WasmCodegen.Config(host=:wasi))
+    wenv = Dict("WCG_GREETING" => "hello", "WCG_TARGET" => "js")
+    native = withenv(() -> env_clock_text(time()),
+                     [k => nothing for k in keys(ENV) if startswith(k, "WCG_")]..., wenv...)
+    @test native == "greeting hello; keys WCG_GREETING,WCG_TARGET; unset false; clock true; file false\n"
+    @test run_julia_mjs(envc, "host_env_clock", time(); env=wenv) == ("0", native)
+    # its WASI functions called directly: records, errnos and strings (prints the failed checks)
+    @test read(`$(node_cmd()) $(joinpath(@__DIR__, "wasi_host.mjs"))`, String) == ""
     # WASI's fd_write writing part of the bytes (written until all are), or failing (lost)
     big = WasmCodegen.compile(host_big_print, (Int,); config=WasmCodegen.Config(host=:wasi))
     @test run_partial_writes(big, "host_big_print", 3, 10) == ("10", repeat("ab", 10))

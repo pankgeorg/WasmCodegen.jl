@@ -49,7 +49,8 @@ const P = TasksProgram
              Dict("fn" => "downloads", "args" => ["\$PORT", 8, 4]),
              Dict("fn" => "lone_yield", "args" => ["\$PORT"]),
              Dict("fn" => "discarded", "args" => [70000]),
-             Dict("fn" => "pingpong_busy", "args" => [10_000_000], "shutdownAfter" => 20, "expectTrap" => true)]
+             Dict("fn" => "pingpong_busy", "args" => [10_000_000], "shutdownAfter" => 20, "expectTrap" => true),
+             Dict("fn" => "main_safe", "jsHost" => true)]
     out = IOBuffer(); err = IOBuffer()
     cmd = `$(node_cmd()) --disable-warning=ExperimentalWarning $(jspi_flags()) $(joinpath(@__DIR__, "tasks.mjs")) $wasm $(JSON.json(calls))`
     proc = run(pipeline(ignorestatus(cmd); stdout=out, stderr=err))
@@ -99,6 +100,9 @@ const P = TasksProgram
     @test num(21) == 7 << 32
     # the host shut down during a root call: the call fails
     @test occursin("shut down", rs[22]["trap"]) && rs[22]["terminal"]
+    # `main` on js/julia.mjs's WASI (hosts without one): the same stdout as natively
+    @test res(23) == 0 && rs[23]["open"] == 0
+    @test endswith(stdout_wasm, native)
 end
 
 @testset "Config(tasks)" begin
