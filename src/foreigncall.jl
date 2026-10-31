@@ -37,7 +37,7 @@ function foreigncall_library(@nospecialize(x))
 end
 
 "The libraries whose functions are the host's: a `ccall` of one is a call of a Wasm import."
-const IMPORT_LIBRARIES = ("wasi_snapshot_preview1",)
+const IMPORT_LIBRARIES = ("wasi_snapshot_preview1", "julia_regex")
 
 # the types of the arguments and results of host imports
 const IMPORT_SCALARS = (Int32, UInt32, Int64, UInt64)
@@ -51,6 +51,10 @@ functions are imported only by modules for WASI (`Config(host = :wasi)`), which 
 linear memory their pointers address.
 """
 function emit_import_ccall!(fc::FnCtx, lib::String, name::Symbol, ex::Expr, args::Vector{Any})
+    # (an extension of the host: only for a module that asks for it)
+    lib == "julia_regex" && !(fc.cgm.config.host === :wasi && :julia_regex in fc.cgm.config.host_extensions) &&
+        unsupported("Regex (PCRE2): it runs on the host's regex engine, the `julia_regex` imports ",
+                    "(`js/julia_regex.mjs`), for `Config(host = :wasi, host_extensions = [:julia_regex])`")
     lib == "wasi_snapshot_preview1" && fc.cgm.config.host !== :wasi &&
         unsupported("the WASI function ", name, " in a module for JavaScript (file IO, the environment and ",
                     "the like need `Config(host = :wasi)`)")
@@ -61,7 +65,7 @@ function emit_import_ccall!(fc::FnCtx, lib::String, name::Symbol, ex::Expr, args
         error("WasmCodegen: the host import $lib.$name has a type other than Int32, UInt32, Int64, " *
               "UInt64 (or Cvoid as its result): $RT ($(join(ATs, ", ")))")
     # (its pointers are offsets of the runtime's part of the memory: `Runtime.Staging`)
-    lib == "wasi_snapshot_preview1" && staging_memory!(fc.cgm)
+    lib in IMPORT_LIBRARIES && staging_memory!(fc.cgm)
     wt(T) = sizeof(T) == 8 ? I64 : I32
     params = ValType[wt(T) for T in ATs]
     results = RT === Cvoid ? ValType[] : ValType[wt(RT)]
@@ -623,6 +627,20 @@ const RUNTIME_CCALLS = Dict{Symbol,RuntimeCcall}(
     :ios_filesize => RuntimeCcall(Runtime.FS.ios_filesize, [:val]),
     :ios_trunc => RuntimeCcall(Runtime.FS.ios_trunc, [:val, :val]),
     :jl_readuntil => RuntimeCcall(Runtime.FS.jl_readuntil, [:val, :val, :val, :val]),
+    # PCRE2 (Base's `Regex`): the host's regex engine (`julia_regex` imports, `runtime/regex.jl`)
+    :pcre2_compile_8 => RuntimeCcall(Runtime.HostRegex.compile, [:val, :val, :val, :val, :val, :val]),
+    :pcre2_jit_compile_8 => RuntimeCcall(Runtime.HostRegex.jit_compile, [:val, :val]),
+    :pcre2_code_free_8 => RuntimeCcall(Runtime.HostRegex.code_free, [:val]),
+    :pcre2_pattern_info_8 => RuntimeCcall(Runtime.HostRegex.pattern_info, [:val, :val, :val]),
+    :pcre2_substring_number_from_name_8 => RuntimeCcall(Runtime.HostRegex.substring_number_from_name, [:val, :val]),
+    :pcre2_match_data_create_from_pattern_8 => RuntimeCcall(Runtime.HostRegex.match_data_create, [:val, :val]),
+    :pcre2_match_data_free_8 => RuntimeCcall(Runtime.HostRegex.match_data_free, [:val]),
+    :pcre2_get_ovector_pointer_8 => RuntimeCcall(Runtime.HostRegex.ovector_pointer, [:val]),
+    :pcre2_get_ovector_count_8 => RuntimeCcall(Runtime.HostRegex.ovector_count, [:val]),
+    :pcre2_match_8 => RuntimeCcall(Runtime.HostRegex.match, [:val, :val, :val, :val, :val, :val, :val]),
+    :pcre2_substring_length_bynumber_8 => RuntimeCcall(Runtime.HostRegex.substring_length_bynumber, [:val, :val, :val]),
+    :pcre2_substring_copy_bynumber_8 => RuntimeCcall(Runtime.HostRegex.substring_copy_bynumber, [:val, :val, :val, :val]),
+    :pcre2_get_error_message_8 => RuntimeCcall(Runtime.HostRegex.get_error_message, [:val, :val, :val]),
     # the environment, for WASI (`runtime/env.jl`)
     :getenv => RuntimeCcall(Runtime.Env.getenv, [:val]),
     :setenv => RuntimeCcall(Runtime.Env.setenv, [:val, :val, :val]),

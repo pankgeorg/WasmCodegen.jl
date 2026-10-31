@@ -39,6 +39,7 @@ WasmCodegen.with_trim_patches() do _, _
     include("staging.jl")
     include("env.jl")
     include("fs.jl")
+    include("regex.jl")
     include("juliac/runtests.jl")
 end
 

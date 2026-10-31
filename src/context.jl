@@ -19,6 +19,8 @@ The configuration of the code generator:
   of the import module `julia`, which `js/julia.mjs` provides; `:wasi`, WASI preview 1
   (`wasi_snapshot_preview1`), for WASI runtimes (wasmtime, Node's `node:wasi`) and for
   JavaScript through `js/julia.mjs`;
+- `host_extensions`: interfaces beyond WASI the host provides, for `host = :wasi`:
+  `:julia_regex`, the host's regex engine for `Regex` (`js/julia_regex.mjs`);
 - `image_pointer_fields`: the `(type, field name)`s whose pointers of the build process
   (addresses without an owner) the image may hold as they are; any other non-null one is an
   unsupported construct;
@@ -55,6 +57,7 @@ Base.@kwdef struct Config
     patch_bindings::Vector{Pair{Symbol,Any}} = Pair{Symbol,Any}[]
     abi_version::Union{Nothing,Pair{String,Int32}} = nothing
     pre_image_hooks::Vector{Any} = Any[]
+    host_extensions::Vector{Symbol} = Symbol[]
 end
 
 """

@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHost } from '../js/julia.mjs';
+import { makeJuliaRegex } from '../js/julia_regex.mjs';
 const modules = new Map();
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 let output = '';
@@ -20,12 +21,16 @@ const wasiOutFd = fs.openSync(wasiOut, 'a+');
 async function instantiate(mod, opts = {}) {
   const imports = WebAssembly.Module.imports(mod);
   if (WebAssembly.Module.exports(mod).some((e) => e.name === 'memory' && e.kind === 'memory')) {
+    // (and the host's regex engine, for `host_extensions = [:julia_regex]`)
+    const regex = makeJuliaRegex();
     for (const imp of imports) {
+      if (imp.module === 'julia_regex' && imp.name in regex.imports) continue;
       if (imp.module !== 'wasi_snapshot_preview1') throw new Error('not a WASI import: ' + imp.module + '.' + imp.name);
     }
     const wasi = new WASI({ version: 'preview1', stdout: wasiOutFd, stderr: wasiOutFd, returnOnExit: true,
                             env: opts.env ?? {}, args: opts.args ?? [], preopens: opts.preopens ?? {} });
     const host = wasi.getImportObject();
+    host.julia_regex = regex.imports;
     let inst;
     // Faults are opt-in and scoped to this instance. Normal tests use the host directly.
     for (const name of new Set((opts.faults ?? []).map((r) => r.call))) {
@@ -76,6 +81,7 @@ async function instantiate(mod, opts = {}) {
       };
     }
     inst = await WebAssembly.instantiate(mod, host);
+    regex.bindMemory(inst.exports.memory);
     wasi.initialize(inst);
     return inst;
   }

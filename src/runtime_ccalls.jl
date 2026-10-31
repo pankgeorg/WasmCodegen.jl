@@ -128,7 +128,7 @@ const FOREIGNCALL_HINTS = Pair{Regex,String}[
     r"^dsfmt_" => "MersenneTwister (dSFMT) is not in Wasm; Xoshiro (Random.default_rng) is",
     r"^(cholmod_|umfpack_|SuiteSparse|amd_|camd_|colamd_|ccolamd_|spqr_)" =>
         "SparseArrays factorizations (SuiteSparse) are not in Wasm",
-    r"^pcre2_" => "Regex (PCRE2) is not in Wasm",
+    r"^pcre2_" => "Regex (PCRE2) runs on the host's engine with Config(host = :wasi, host_extensions = [:julia_regex])",
 ]
 
 "The Julia API that reaches the C function `name` and why it cannot run, or \"\"."
