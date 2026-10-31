@@ -864,6 +864,13 @@ function funcwrapper_cfunction(FW::Module, @nospecialize(Ret), @nospecialize(Arg
     return callee, FW.map_rettype(Ret), argts
 end
 
+function is_funcwrapper(@nospecialize(x))
+    FW = funcwrappers_module()
+    FW === nothing && return false
+    T = typeof(x)
+    return T isa DataType && T.name === Base.invokelatest(getglobal, FW, :FunctionWrapper).body.body.name
+end
+
 """
     funcwrapper_ptr_fields!(img, x, l, back) -> Union{Nothing, Tuple{Vector{Inst}, Vector{Inst}}}
 
@@ -915,10 +922,14 @@ function mutable_global!(img::Image, @nospecialize(x), l::Layout)
     push!(init, Inst(:struct_new, l.wtype))
     g = add_global!(img.cgm.mod, global_name(img, x), RefType(l.wtype, false), false, init)
     img.globals[x] = g
+    # a FunctionWrapper's two pointer fields: one deferred patch, prepared by `funcwrapper_ptr_fields!`
+    fw = img.cgm.config.funcref_wrappers && is_funcwrapper(x)
+    fw && push!(img.patches, (g, :fwptrs, l.wtype, 0, x, l, img.owner))
     for i in 1:fieldcount(T)
         image_field_defined(x, i) || continue
         FT = fieldtype(T, i)
         isempty(field_leaves(ts, FT)) && continue
+        fw && i <= 2 && continue
         v = image_field(x, i)
         if (T, fieldname(T, i)) in img.cgm.config.image_pointer_fields
             push!(img.patches, (g, :struct_insts, l.wtype, first(l.fields[i]) - 1,
@@ -957,6 +968,28 @@ function prepare_image_patches!(cgm::CGModule)
         i += 1
         p = img.patches[i]
         g, kind, wtype, idx, v, FT = p
+        if kind === :fwptrs
+            x, l = v, FT
+            owner = length(p) >= 7 ? p[7] : nothing
+            back = Any[]
+            ptrs = try
+                with_image_owner(() -> funcwrapper_ptr_fields!(img, x, l, back), img, owner)
+            catch err
+                err isa Unsupported || rethrow()
+                deferred_value_failed!(cgm, err, owner, typeof(x))
+                nothing
+            end
+            isempty(back) || error("a FunctionWrapper's object in progress while deferred values are prepared")
+            T = typeof(x)
+            if ptrs === nothing
+                img.patches[i] = (g, :failed, wtype, idx, nothing, T)
+            else
+                img.patches[i] = (g, :struct_insts, wtype, first(l.fields[1]) - 1, ptrs[1], fieldtype(T, 1))
+                push!(img.patches, (g, :struct_insts, wtype, first(l.fields[2]) - 1, ptrs[2], fieldtype(T, 2)))
+            end
+            prepared = true
+            continue
+        end
         (kind === :struct || kind === :array) || continue
         owner = length(p) >= 7 ? p[7] : nothing
         leaves = try
