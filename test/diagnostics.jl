@@ -6,6 +6,17 @@ nest(T, k) = k == 0 ? T : (S = nest(T, k - 1); W{S,S})
 big() = nest(Int, 18)   # printed in full: 2.6 MB (no const binding: not printed as an alias)
 const SINK = Ref{Any}(1)
 apply_dynamic(x) = W{typeof(x), SINK[]}
+id(x) = x
+wherearg(x::T) where T = x
+loop(n::Int) = (s = 0; for k in 1:n; s += k; end; s)
+import WasmCodegen
+# the allocations of `f(args...)` in the world the code generator runs in (juliac's patches,
+# which print a type by rendering it whole, are after it)
+function allocated(f, args...)
+    run() = Base.invoke_in_world(WasmCodegen.COMPILER_WORLD[], f, args...)
+    run()
+    return @allocated run()
+end
 end
 
 @testset "bounded diagnostics" begin
@@ -43,4 +54,48 @@ end
     @test occursin("apply_type of types not known", report) &&
           occursin(r"in MethodInstance for \S*apply_dynamic\(::", report)
     @test sizeof(report) < 10maxlen
+
+    # method and code instances in a statement: printed as `show` prints them, rendering no more
+    # of their signatures than is printed
+    B.id(1)
+    small = instance(B.id, Int)
+    m = only(methods(B.wherearg))
+    unspecialized = Base.specialize_method(m, m.sig, Core.svec())
+    @test WasmCodegen.diagnostic_string(unspecialized) == sprint(show, unspecialized) ==
+          "MethodInstance for $(B).wherearg(::T) where T"
+    for x in (small, small.cache, unspecialized)
+        stmt = Expr(:invoke, x, Core.Argument(2))
+        @test WasmCodegen.diagnostic_statement(stmt, Int) == sprint(show, stmt) * "::Int64"
+    end
+    # the work of rendering, as allocations: `show` of the statement renders the whole 2.6 MB
+    # signature in a buffer first; its diagnostic, no more than it prints
+    stmt = Expr(:invoke, instance(B.id, B.big()), Core.Argument(2))
+    @test B.allocated(WasmCodegen.limited_sprint, show, stmt) > 2_000_000
+    @test B.allocated(WasmCodegen.diagnostic_statement, stmt, Int) < 200_000
+    @test B.allocated(WasmCodegen.diagnostic_string, instance(B.id, B.big())) < 200_000
+
+    # an error of the structurizer
+    ir = Base.code_ircode(B.loop, (Int,))[1][1]
+    k = findfirst(x -> x isa Core.GotoNode, ir.stmts.stmt)
+    ir.stmts.stmt[k] = Core.GotoNode(999)
+    err = try WasmCodegen.structurize_or_unsupported(ir) catch e; e end
+    @test err isa WasmCodegen.Unsupported
+    @test startswith(sprint(showerror, err), "WasmCodegen: unsupported: structurizing the IR: BoundsError")
+
+    # the result of a statement that cannot be converted to its type, in a statement with an
+    # instance of a huge signature
+    c = WasmCodegen.compile(B.loop, (Int,); config = test_config(optimize = nothing))
+    info = c.cgm.funcs[instance(B.loop, Int)]
+    fc = WasmCodegen.FnCtx(c.cgm, info, nothing, WasmBuilder.Builder(c.cgm.mod, info.func))
+    stmt = Expr(:invoke, instance(B.id, B.big()), Core.Argument(2))
+    err = try
+        WasmCodegen.convert_result(fc, WasmCodegen.ghost(Tuple{Nothing}, (nothing,)), stmt, Tuple{Union{Nothing,Int}})
+    catch e
+        e
+    end
+    @test err isa WasmCodegen.Unsupported
+    msg = sprint(showerror, err)
+    @test occursin("a conversion from Tuple{Nothing} to Tuple{Union{Nothing, Int64}}", msg)
+    @test occursin("in the result of :(\$(Expr(:invoke, MethodInstance for ", msg) && occursin("id(::", msg)
+    @test sizeof(msg) < 3maxlen
 end

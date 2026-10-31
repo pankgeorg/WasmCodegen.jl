@@ -47,16 +47,49 @@ diagnostic_string(xs...) = limited_sprint(print_diagnostic, xs...)
 
 function print_diagnostic(io::IO, xs...)
     for x in xs
-        x isa Core.MethodInstance ? print_method_instance(io, x) : print(io, x)
+        x isa Union{Core.MethodInstance,Core.CodeInstance} ? print_instance(io, x) : print(io, x)
     end
 end
 
-# as `show` prints a method instance, but writing the signature as it goes: `show` renders it
-# whole before writing any of it
-function print_method_instance(io::IO, mi::Core.MethodInstance)
+"""
+    diagnostic_statement(stmt, typ) -> String
+
+The statement `stmt` of type `typ` as `show` prints them, bounded as
+[`limited_sprint`](@ref) bounds it, the method and code instances it refers to included.
+"""
+diagnostic_statement(@nospecialize(stmt), @nospecialize(typ)) =
+    string(limited_sprint(show, streamed_instances(stmt)), "::", limited_sprint(show, typ))
+
+# `show` prints a method or code instance by rendering its signature whole before writing any of
+# it: in a statement, each is replaced by a value printing it as it goes
+struct StreamedInstance
+    x::Union{Core.MethodInstance,Core.CodeInstance}
+end
+Base.show(io::IO, s::StreamedInstance) = print_instance(io, s.x)
+
+function streamed_instances(@nospecialize(x))
+    x isa Union{Core.MethodInstance,Core.CodeInstance} && return StreamedInstance(x)
+    x isa Expr || return x
+    return Expr(x.head, Any[streamed_instances(a) for a in x.args]...)
+end
+
+# as `show` prints a method or code instance, writing the signature as it goes
+function print_instance(io::IO, ci::Core.CodeInstance)
+    ci.def isa Core.MethodInstance || return show(io, ci)
+    print(io, "CodeInstance for ")
+    print_instance(io, ci.def)
+end
+
+function print_instance(io::IO, mi::Core.MethodInstance)
     m = mi.def
-    sig = Base.unwrap_unionall(mi.specTypes)
-    (m isa Method && sig isa DataType && !isempty(sig.parameters)) || return show(io, mi)
+    sig, tvars, outer = mi.specTypes, Any[], io
+    while sig isa UnionAll
+        push!(tvars, sig.var)
+        io = IOContext(io, :unionall_env => sig.var)
+        sig = sig.body
+    end
+    (m isa Method && !(isdefined(m, :generator) && mi === m.generator) &&
+     sig isa DataType && !isempty(sig.parameters)) || return show(io, mi)
     print(io, "MethodInstance for ")
     Base.show_signature_function(io, sig.parameters[1], false, "", false, true)
     print(io, "(")
@@ -64,6 +97,7 @@ function print_method_instance(io::IO, mi::Core.MethodInstance)
         print(io, i > 1 ? ", ::" : "::", T)
     end
     print(io, ")")
+    Base.show_method_params(outer, tvars)
 end
 
 struct LimitReached <: Exception end
@@ -90,7 +124,9 @@ unsupported(parts...) = throw(Unsupported(parts...))
     UnsupportedConstructs
 
 The program uses constructs the code generator cannot compile (with `trim = :safe`): every
-one, with the function it is in, as juliac's verifier reports dynamic dispatch.
+one, with the function it is in, as juliac's verifier reports dynamic dispatch. The report
+counts constructs as distinct by their printed (bounded) messages: two whose messages differ
+only past `DIAGNOSTIC_MAXLEN` bytes of a part are one.
 """
 struct UnsupportedConstructs <: Exception
     errors::Vector{Pair{Core.MethodInstance,Unsupported}}
