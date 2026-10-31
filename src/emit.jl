@@ -830,8 +830,8 @@ function emit_expr!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return emit_builtin!(fc, Core.modifyfield!, args, typ)
     elseif head === :new
         T = operand(fc, ex.args[1])
-        isconstant(T) || unsupported("`new` of a type that is not known at compile time")
         args = CGVal[operand(fc, a) for a in ex.args[2:end]]
+        isconstant(T) || return split_new!(fc, T, args, typ)
         return emit_new!(fc, constant_value(T), args)
     elseif head === :splatnew
         T = operand(fc, ex.args[1])
