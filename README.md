@@ -105,6 +105,106 @@ Each example builds a page: `examples/lorenz` solves the Lorenz system with adju
 parameters, `examples/mtk` simulates a ModelingToolkit model with sliders, and
 `examples/juliasyntax` parses Julia source in the browser.
 
+## Host runtimes
+
+The supported hosts are Node.js, wasmtime and, partly, Cloudflare workerd. The sections
+below say what each needs and what doesn't work yet.
+
+Modules use WasmGC and typed function references. A program that catches exceptions also
+uses exception handling with `exnref`; one that catches none traps on a throw instead.
+
+### Node.js
+
+Node 24 is the reference host: the tests run there. Node 24.21 enables `exnref` and JSPI
+(JavaScript Promise Integration) by default, so the tests pass no Wasm flags. JSPI is
+needed by the host's events of
+[#36](https://github.com/gbaraldi/WasmCodegen.jl/pull/36) and by Tasks on JSPI of
+[#37](https://github.com/gbaraldi/WasmCodegen.jl/pull/37) (both not merged). On a Node
+without JSPI by default, these need `--experimental-wasm-jspi`.
+
+For speed, keep the defaults: `wasm-opt -O3` and Node's own tiering. Node's
+`--liftoff-only`, `--no-liftoff` and `--no-wasm-dynamic-tiering` were each slower in
+[#43](https://github.com/gbaraldi/WasmCodegen.jl/issues/43).
+
+### Browsers
+
+Only V8 has been checked, through Node and workerd. No minimum browser version has been
+verified. The example pages' error message gives the versions that added WebAssembly GC
+(Chrome 119, Firefox 120, Safari 18.2), which is not all a module may use. Browser support
+for `exnref` and JSPI hasn't been tested here.
+
+### wasmtime
+
+Tested with wasmtime 50.0.1.
+
+- **Support.** GC, typed function references and exceptions (`exnref`) are Tier 1 and
+  enabled by default with Cranelift
+  ([status](https://github.com/bytecodealliance/wasmtime/blob/v50.0.1/docs/stability-wasm-proposals.md)).
+  A module that imports nothing, such as a Tsit5 solve, runs with the default flags and
+  gives Node's results. A `host = :js` module that imports `julia` functions doesn't run as
+  is: `js/julia.mjs` implements them in JavaScript, and an embedder would have to provide
+  its own.
+- **WASI imports.** wasmtime rejects `host = :wasi` modules built with the current
+  WasmBuilder at instantiation, with `types incompatible`: WasmBuilder puts every type in
+  one recursion group. Modules built with
+  [gbaraldi/WasmBuilder.jl#2](https://github.com/gbaraldi/WasmBuilder.jl/pull/2) (import
+  types in recursion groups of their own, not merged) run, and give `node:wasi`'s output.
+- **GC heap size.** The default collector is the copying collector. On a Dict/String loop
+  that keeps a Dict alive, its heap stayed small and it collected constantly; a 64 MiB
+  initial heap made the loop about 5.6× faster (4.76 s to 0.85 s), for about 64 MiB more
+  memory. For allocation-heavy code, try a bigger initial heap:
+
+  ```
+  wasmtime run -O gc-heap-initial-size=67108864 --invoke f module.wasm 100
+  ```
+
+  An embedder sets
+  [`Config::gc_heap_initial_size`](https://github.com/bytecodealliance/wasmtime/blob/v50.0.1/crates/wasmtime/src/config.rs#L1521).
+  Keep the copying collector: with `-C collector=drc` the same loop took about 4× as long
+  as with the default, and DRC doesn't collect cycles.
+- **Tasks.** Tasks on JSPI (#37) import JSPI functions from JavaScript, so they don't run
+  on wasmtime. Wasm stack switching could replace them, but wasmtime has it at Tier 3,
+  off by default, and only on x86_64 Linux.
+- **Threads.** Shared memory and atomics (Tier 2) share linear memory only, not WasmGC
+  objects, which every Julia object is here. Sharing those needs shared-everything
+  threads, which wasmtime hasn't implemented
+  ([#9466](https://github.com/bytecodealliance/wasmtime/issues/9466)). wasi-threads, a
+  thread-spawning ABI, is [legacy](https://github.com/WebAssembly/wasi-threads) and Tier 3
+  in wasmtime. Independent instances on separate threads need none of these.
+
+### Cloudflare workerd and Workers
+
+Partly supported. Tested locally with workerd 1.20261031.1 (V8 15.7) and not deployed.
+
+- **Runs:** a Lorenz solve and a Dict/String loop gave the same results as Node, with the
+  imports from `js/julia.mjs`'s `createHost`. JSPI works in workerd.
+- **Doesn't run:** Node's WASI driver. workerd's `node:wasi` throws
+  `ERR_METHOD_NOT_IMPLEMENTED` from its constructor, so `host = :wasi` modules need another
+  implementation of their WASI imports. `js/julia.mjs` has one; in workerd only its
+  `random_get` has been exercised. The host's events of #36 (`js/julia_io.mjs`) fail too:
+  they detect the platform from Node's diagnostic report, which workerd doesn't fill in.
+- **Compiling at request time is disallowed** ("Wasm code generation disallowed by
+  embedder"). Configure modules as Wasm modules of the Worker and instantiate the
+  `WebAssembly.Module` they import. `instantiate(bytes)` of `js/julia.mjs` compiles bytes,
+  so it can't be used inside a request.
+- **`wasm:js-string`** builtins need the compatibility flag
+  `wasm_esm_integration_builtins`.
+- **Production limits** ([limits](https://developers.cloudflare.com/workers/platform/limits/)),
+  which local workerd doesn't enforce: 128 MB of memory per isolate, including Wasm; CPU
+  time per HTTP request, 10 ms on the Free plan and 30 s by default (up to 5 minutes) on
+  the Paid plan; 64 MiB of uncompressed bundle; 1 s of startup.
+
+### Not supported or untested
+
+- **WasmEdge** 0.18.1 is not a supported host, and WasmCodegen's output hasn't been tried
+  there. Its [0.18.0 release](https://github.com/WasmEdge/WasmEdge/releases/tag/0.18.0)
+  turned on the Wasm 3.0 proposals, including exception handling, function references and
+  tail calls, by default. Its [proposal tracker](https://github.com/WasmEdge/WasmEdge/issues/4825)
+  still lists GC as unfinished (a real runtime collector,
+  [#4156](https://github.com/WasmEdge/WasmEdge/pull/4156)), as well as stack switching and the
+  component model.
+- Other engines and runtimes haven't been tried: Wasmer, wazero, Deno and Bun.
+
 ## How it works
 
 - **The program's world.** The program is inferred in a world with juliac's trim patches
