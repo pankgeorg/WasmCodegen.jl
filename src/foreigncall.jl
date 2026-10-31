@@ -532,7 +532,7 @@ end
 A C function implemented by the runtime function `f`. `args` says how each argument of the
 C call becomes an argument of `f`: `:val` (as it is), `:ref` (a pointer to a scalar, as
 Fortran passes them: the scalar), `:array` (a pointer into an array: a `MemoryRef`),
-`:skip` (dropped, e.g. the hidden lengths of Fortran strings).
+`:bytes` (a pointer of any type into an array of bytes: a `MemoryRef{UInt8}`), `:skip` (dropped, e.g. the hidden lengths of Fortran strings).
 """
 struct RuntimeCcall
     f::Any
@@ -601,8 +601,8 @@ const RUNTIME_CCALLS = Dict{Symbol,RuntimeCcall}(
     :jl_ios_get_nbyte_int => RuntimeCcall(Runtime.FS.jl_ios_get_nbyte_int, [:val, :val]),
     # the IO streams of files (`IOStream`)
     :ios_file => RuntimeCcall(Runtime.FS.ios_file, [:val, :val, :val, :val, :val, :val]),
-    :ios_readall => RuntimeCcall(Runtime.FS.ios_readall, [:val, :val, :val]),
-    :ios_read => RuntimeCcall(Runtime.FS.ios_read, [:val, :val, :val]),
+    :ios_readall => RuntimeCcall(Runtime.FS.ios_readall, [:val, :bytes, :val]),
+    :ios_read => RuntimeCcall(Runtime.FS.ios_read, [:val, :bytes, :val]),
     :ios_fillbuf => RuntimeCcall(Runtime.FS.ios_fillbuf, [:val]),
     :jl_nb_available => RuntimeCcall(Runtime.FS.jl_nb_available, [:val]),
     :ios_getc => RuntimeCcall(Runtime.FS.ios_getc, [:val]),
@@ -717,6 +717,12 @@ function emit_runtime_ccall!(fc::FnCtx, r::RuntimeCcall, args::Vector{Any}, @nos
             o = array_origin(a)
             push!(vals, o !== nothing && is_ptr_type(a.typ) && o.eltype === eltype(a.typ) ?
                         element_ref!(fc, o, const_value(fc, 1), o.eltype) : a)
+        elseif kind === :bytes
+            # (as `:array`, whatever the pointer's type, for a memory of bytes; not the bytes
+            # of a String or Symbol)
+            o = array_origin(a)
+            push!(vals, o !== nothing && !o.terminated && is_ptr_type(a.typ) && o.eltype === UInt8 ?
+                        element_ref!(fc, o, const_value(fc, 1), UInt8) : a)
         end
     end
     res = call_runtime!(fc, r.f, vals)
