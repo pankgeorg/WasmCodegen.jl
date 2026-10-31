@@ -557,6 +557,10 @@ const RUNTIME_CCALLS = Dict{Symbol,RuntimeCcall}(
     :jl_strtof_c => RuntimeCcall(Runtime.Floats.strtof, [:val, :val]),
     :jl_try_substrtod => RuntimeCcall(Runtime.Floats.try_substrtod, [:val, :val, :val]),
     :jl_try_substrtof => RuntimeCcall(Runtime.Floats.try_substrtof, [:val, :val, :val]),
+    # the environment, for WASI (`runtime/env.jl`)
+    :getenv => RuntimeCcall(Runtime.Env.getenv, [:val]),
+    :setenv => RuntimeCcall(Runtime.Env.setenv, [:val, :val, :val]),
+    :unsetenv => RuntimeCcall(Runtime.Env.unsetenv, [:val]),
     :jl_set_errno => RuntimeCcall(Runtime.Floats.set_errno, [:val]),
     :jl_errno => RuntimeCcall(Runtime.Floats.get_errno, Symbol[]),
     # C strings: the bytes before a NUL (a string's or symbol's end)

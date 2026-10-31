@@ -37,6 +37,7 @@ WasmCodegen.with_trim_patches() do _, _
     include("vararg_tuples.jl")
     include("versions.jl")
     include("staging.jl")
+    include("env.jl")
     include("juliac/runtests.jl")
 end
 
