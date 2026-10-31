@@ -55,6 +55,21 @@ function finish_host!(cgm::CGModule)
     return nothing
 end
 
+"""
+    staging_memory!(cgm)
+
+The linear memory, of the pages the runtime's part needs too (`Runtime.Staging`, from the
+second page), when the module uses it: a module that does not keeps one page.
+"""
+function staging_memory!(cgm::CGModule)
+    get!(cgm.helpers, :staging_memory) do
+        mem = wasi_memory!(cgm)
+        mem.min = max(mem.min, Int(Runtime.Staging.PAGES))
+        mem.max === nothing || (mem.max = max(mem.max, mem.min))
+        mem
+    end
+end
+
 ## WASI
 
 const WASI = "wasi_snapshot_preview1"
