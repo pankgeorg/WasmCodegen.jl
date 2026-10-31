@@ -387,6 +387,34 @@ function load_bits!(fc::FnCtx, p::CGVal, byte, off::Int, n::Int)
         end
         return acc
     end
+    view = byte_view!(fc, ptr_owner(p))
+    if view !== nothing
+        # within the bytes of the owner's view: read from its array
+        arr, base, len = view
+        boff = new_local!(fc, I64)
+        emit!(fc.b, :local_get, b)
+        off != 0 && (emit!(fc.b, :i64_const, off); emit!(fc.b, :i64_add))
+        emit!(fc.b, :local_get, base); emit!(fc.b, :i64_sub)
+        emit!(fc.b, :local_tee, boff)
+        emit!(fc.b, :local_get, len); emit!(fc.b, :i64_lt_u)
+        if n > 1
+            emit!(fc.b, :local_get, len); emit!(fc.b, :local_get, boff); emit!(fc.b, :i64_sub)
+            emit!(fc.b, :i64_const, n); emit!(fc.b, :i64_ge_u)
+            emit!(fc.b, :i32_and)
+        end
+        if!(fc.b)
+        at = array_type!(fc.cgm.types, I8)
+        for j in 0:n-1
+            emit!(fc.b, :local_get, arr)
+            emit!(fc.b, :local_get, boff); emit!(fc.b, :i32_wrap_i64)
+            j > 0 && (emit!(fc.b, :i32_const, j); emit!(fc.b, :i32_add))
+            emit!(fc.b, :array_get_u, at)
+            emit!(fc.b, :i64_extend_i32_u)
+            j > 0 && (emit!(fc.b, :i64_const, 8j); emit!(fc.b, :i64_shl); emit!(fc.b, :i64_or))
+        end
+        emit!(fc.b, :local_set, acc)
+        else!(fc.b)
+    end
     # through the owner, at run time, byte by byte
     emit!(fc.b, :i64_const, 0); emit!(fc.b, :local_set, acc)
     loadb = ptr_byte_helper!(fc.cgm, :load)
@@ -400,7 +428,37 @@ function load_bits!(fc::FnCtx, p::CGVal, byte, off::Int, n::Int)
         end
         emit!(fc.b, :local_get, acc); emit!(fc.b, :i64_or); emit!(fc.b, :local_set, acc)
     end
+    view === nothing || end!(fc.b)
     return acc
+end
+
+"""
+    byte_view!(fc, owner) -> Union{Nothing,NTuple{3,Int}}
+
+The locals `(array, base, len)` of the byte view of the owner leaf `owner` of a pointer
+without a static origin: the byte array holding the owner's bytes, the base address of the
+owner and the number of bytes in the array, for owners whose bytes are the shared byte array
+(Strings, Symbols, and memories whose elements are stored as bytes in it); else a null array
+and length 0. They are kept
+per owner local and refreshed (`jl_ptr_byte_view`) only when the owner differs from the one
+they were made for. `nothing` for a constant owner.
+"""
+function byte_view!(fc::FnCtx, owner::LeafVal)
+    owner isa Int || return nothing
+    ts = fc.cgm.types
+    cown, arr, base, len = get!(fc.byteviews, owner) do
+        (new_local!(fc, jlvalue_ref(ts)), new_local!(fc, RefType(array_type!(ts, I8), true)),
+         new_local!(fc, I64), new_local!(fc, I64))
+    end
+    emit!(fc.b, :local_get, owner); emit!(fc.b, :local_get, cown); emit!(fc.b, :ref_eq)
+    emit!(fc.b, :i32_eqz)
+    if!(fc.b)
+    emit!(fc.b, :local_get, owner)
+    call!(fc.b, ptr_byte_helper!(fc.cgm, :view))
+    emit!(fc.b, :local_set, len); emit!(fc.b, :local_set, base); emit!(fc.b, :local_set, arr)
+    emit!(fc.b, :local_get, owner); emit!(fc.b, :local_set, cown)
+    end!(fc.b)
+    return (arr, base, len)
 end
 
 # push whether the byte offset `b + off` is not a multiple of `s` (an i32)
@@ -575,15 +633,17 @@ end
 
 `jl_ptr_load_byte(address, owner) -> i32` or `jl_ptr_store_byte(address, owner, byte)`:
 a byte of the memory a pointer without a static origin points into, found from its
-owner's kind at run time. Their bodies are generated with the module's types
+owner's kind at run time; or `jl_ptr_byte_view(owner) -> (array, base, len)`, the byte view
+of an owner (`byte_view!`). Their bodies are generated with the module's types
 (`finish_pointers!`).
 """
 function ptr_byte_helper!(cgm::CGModule, kind::Symbol)
     get!(cgm.helpers, (:ptr, kind)) do
         jl = jlvalue_ref(cgm.types)
-        kind === :load ?
-            add_func!(cgm.mod, "jl_ptr_load_byte", ValType[I64, jl], ValType[I32]) :
-            add_func!(cgm.mod, "jl_ptr_store_byte", ValType[I64, jl, I32], ValType[])
+        kind === :load ? add_func!(cgm.mod, "jl_ptr_load_byte", ValType[I64, jl], ValType[I32]) :
+        kind === :store ? add_func!(cgm.mod, "jl_ptr_store_byte", ValType[I64, jl, I32], ValType[]) :
+        add_func!(cgm.mod, "jl_ptr_byte_view", ValType[jl],
+                  ValType[RefType(array_type!(cgm.types, I8), true), I64, I64])
     end
 end
 
@@ -832,8 +892,41 @@ function get_elem_bits!(b::Builder, at::TypeRef, st::StorageType)
     storage_to_bits!(b, st)
 end
 
+# the body of `jl_ptr_byte_view`: of the owners whose bytes are an array of bytes, the array,
+# the base address and the array's length; of others, a null array and length 0
+function finish_byte_view!(cgm::CGModule, f::Func, owners)
+    ts = cgm.types
+    at = array_type!(ts, I8)
+    b = Builder(cgm.mod, f)
+    tid = add_local!(f, I32)
+    arr = add_local!(f, RefType(at, true))
+    emit!(b, :local_get, 0); emit!(b, :ref_is_null)
+    if!(b); emit!(b, :ref_null, at); emit!(b, :i64_const, 0); emit!(b, :i64_const, 0); return!(b); end!(b)
+    emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :local_set, tid)
+    for ((st, a, stg), ids) in owners
+        (a == at && stg === I8) || continue
+        for (k, id) in enumerate(ids)
+            emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+            k > 1 && emit!(b, :i32_or)
+        end
+        if!(b)
+        emit!(b, :local_get, 0); emit!(b, :ref_cast, st)
+        emit!(b, :struct_get, st, DATA_FIELD)
+        emit!(b, :local_tee, arr)
+        emit!(b, :local_get, 0); call!(b, object_hash_func!(cgm))
+        emit!(b, :i64_extend_i32_u); emit!(b, :i64_const, 32); emit!(b, :i64_shl)
+        emit!(b, :local_get, arr); emit!(b, :array_len); emit!(b, :i64_extend_i32_u)
+        return!(b)
+        end!(b)
+    end
+    emit!(b, :ref_null, at); emit!(b, :i64_const, 0); emit!(b, :i64_const, 0)
+    finish!(b)
+end
+
 function finish_pointers!(cgm::CGModule)
     owners = objects = leafmems = nothing
+    view = get(cgm.helpers, (:ptr, :view), nothing)
+    view === nothing || finish_byte_view!(cgm, view, byte_owners(cgm))
     for kind in (:load, :store)
         f = get(cgm.helpers, (:ptr, kind), nothing)
         f === nothing && continue
