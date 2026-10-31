@@ -20,7 +20,10 @@ The configuration of the code generator:
   (`wasi_snapshot_preview1`), for WASI runtimes (wasmtime, Node's `node:wasi`) and for
   JavaScript through `js/julia.mjs`;
 - `host_extensions`: interfaces beyond WASI the host provides, for `host = :wasi`:
-  `:julia_regex`, the host's regex engine for `Regex` (`js/julia_regex.mjs`);
+  `:julia_regex`, the host's regex engine for `Regex` (`js/julia_regex.mjs`); `:julia_io`,
+  the host's events (`sleep` on its timers, HTTP requests, decompression, its platform:
+  `Runtime.Host`) and its file modes and symbolic links of any target for the filesystem
+  (`js/julia_io.mjs`; waiting needs JavaScript Promise Integration);
 - `image_pointer_fields`: the `(type, field name)`s whose pointers of the build process
   (addresses without an owner) the image may hold as they are; any other non-null one is an
   unsupported construct;

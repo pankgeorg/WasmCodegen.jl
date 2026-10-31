@@ -56,9 +56,10 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
         return ghost(Nothing, nothing)
     end
     F = mi.specTypes.parameters[1]
-    impl = Base.issingletontype(F) ? Runtime.wasm_impl(F.instance) : nothing
+    impl = Base.issingletontype(F) ? Runtime.wasm_impl(F.instance, fc.cgm.config.host_extensions) : nothing
     if impl !== nothing
-        # a runtime function with a native twin: its Wasm implementation
+        # a runtime function with a native twin, or one an extension of the host implements:
+        # its Wasm implementation (for the module's host)
         args = CGVal[operand(fc, a) for a in ex.args[3:end]]
         argtypes = Tuple(mi.specTypes.parameters[2:end])
         args = CGVal[convert_repr(fc, a, T) for (a, T) in zip(args, argtypes)]

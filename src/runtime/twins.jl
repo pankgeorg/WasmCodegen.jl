@@ -7,8 +7,29 @@
 "The Wasm implementations of runtime functions with a native twin (see above)."
 const WASM_IMPLS = IdDict{Any,Any}()
 
-"The function compiled in place of the runtime function `f`, or `nothing`."
-wasm_impl(@nospecialize(f)) = get(WASM_IMPLS, f, nothing)
+"""
+The Wasm implementations of runtime functions for an extension of the host (see
+`Config(host_extensions = ...)`): `EXTENSION_IMPLS[ext][f]` is compiled in place of `f` only
+in modules whose host provides `ext`, before `WASM_IMPLS`. (A function whose default
+implementation is right for hosts without the extension, `FS.path_mode` and the like.)
+"""
+const EXTENSION_IMPLS = Dict{Symbol,IdDict{Any,Any}}()
+
+"""
+    wasm_impl(f, extensions=()) -> Union{Nothing,Function}
+
+The function compiled in place of the runtime function `f`, in a module whose host provides
+the extensions `extensions`, or `nothing`.
+"""
+function wasm_impl(@nospecialize(f), extensions=())
+    for ext in extensions
+        impls = get(EXTENSION_IMPLS, ext, nothing)
+        impls === nothing && continue
+        impl = get(impls, f, nothing)
+        impl === nothing || return impl
+    end
+    return get(WASM_IMPLS, f, nothing)
+end
 
 """
     Twins

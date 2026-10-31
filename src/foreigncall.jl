@@ -37,7 +37,7 @@ function foreigncall_library(@nospecialize(x))
 end
 
 "The libraries whose functions are the host's: a `ccall` of one is a call of a Wasm import."
-const IMPORT_LIBRARIES = ("wasi_snapshot_preview1", "julia_regex")
+const IMPORT_LIBRARIES = ("wasi_snapshot_preview1", "julia_regex", "julia_io")
 
 # the types of the arguments and results of host imports
 const IMPORT_SCALARS = (Int32, UInt32, Int64, UInt64)
@@ -55,6 +55,9 @@ function emit_import_ccall!(fc::FnCtx, lib::String, name::Symbol, ex::Expr, args
     lib == "julia_regex" && !(fc.cgm.config.host === :wasi && :julia_regex in fc.cgm.config.host_extensions) &&
         unsupported("Regex (PCRE2): it runs on the host's regex engine, the `julia_regex` imports ",
                     "(`js/julia_regex.mjs`), for `Config(host = :wasi, host_extensions = [:julia_regex])`")
+    lib == "julia_io" && !(fc.cgm.config.host === :wasi && :julia_io in fc.cgm.config.host_extensions) &&
+        unsupported("the host's events (`sleep`, HTTP, decompression: the `julia_io` import ", name,
+                    ", `js/julia_io.mjs`), for `Config(host = :wasi, host_extensions = [:julia_io])`")
     lib == "wasi_snapshot_preview1" && fc.cgm.config.host !== :wasi &&
         unsupported("the WASI function ", name, " in a module for JavaScript (file IO, the environment and ",
                     "the like need `Config(host = :wasi)`)")
