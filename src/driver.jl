@@ -68,7 +68,7 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
     # (the bindings that name functions and enums, as of this compilation)
     empty!(Runtime.FUNCTION_SHOWS); empty!(Runtime.ENUM_SHOWS)
     mis = Core.MethodInstance[entry_instance(e.f, e.argtypes; world) for e in entries]
-    w = collect_world(mis; world, verify=config.verify)
+    w = collect_world(mis; world, verify=config.verify, inline_cap=config.inline_cap)
     restores = Any[]
     # (the source roots before the hooks run, for this compilation only: see `SOURCE_ROOTS`)
     result = Base.ScopedValues.with(SOURCE_ROOTS => source_roots(config)) do
