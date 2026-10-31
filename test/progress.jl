@@ -22,6 +22,9 @@ end
     @test occursin("optimize: $(length(c.bytes)) bytes after wasm-opt -O3", out)
     @test wasm_run(c, "progress_prog", 0.5; rettype = Float64) ≈ progress_prog(0.5)
 
-    quiet = stderr_of(() -> WasmCodegen.compile(progress_prog, (Float64,); config = test_config(optimize = nothing)))
+    @test c.cgm.structurize_ns > 0
+    local q
+    quiet = stderr_of(() -> (q = WasmCodegen.compile(progress_prog, (Float64,); config = test_config(optimize = nothing))))
     @test !occursin("WasmCodegen: ", quiet)
+    @test q.cgm.structurize_ns == 0   # not timed
 end

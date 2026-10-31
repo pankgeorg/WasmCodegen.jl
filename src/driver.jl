@@ -70,9 +70,10 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
         end
         process_worklist!(cgm)
         compile_runtime_cases!(cgm)
-        progress(config, "emit", t, length(cgm.funcs), " functions (exceptions: ", mode, "), ",
-                 length(cgm.diagnostics), " unsupported constructs";
-                 note=string(" (structurizing ", seconds(cgm.structurize_ns), " s)"))
+        config.progress &&
+            progress(config, "emit", t, length(cgm.funcs), " functions (exceptions: ", mode, "), ",
+                     length(cgm.diagnostics), " unsupported constructs";
+                     note=string(" (structurizing ", seconds(cgm.structurize_ns), " s)"))
         # the runtime functions the code needed (added to the world as it was emitted) may
         # use exceptions more than the program did: then again, as they need
         m = exception_mode(w)
@@ -96,7 +97,8 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
     if config.optimize !== nothing
         t = time_ns()
         bytes = wasm_opt(bytes, config.optimize)
-        progress(config, "optimize", t, length(bytes), " bytes after wasm-opt ", join(config.optimize.exec, ' '))
+        config.progress && progress(config, "optimize", t, length(bytes), " bytes after wasm-opt ",
+                                    join(config.optimize.exec, ' '))
     end
     return Compilation(bytes, w, cgm)
 end
