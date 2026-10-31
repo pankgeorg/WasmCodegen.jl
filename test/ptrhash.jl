@@ -104,11 +104,20 @@ function alternate_owners(n::Int)
     end
 end
 
-# whether the function compiled for Base's `hash_bytes(::Ptr{UInt8}, ...)` reads the bytes
-# through a byte view guarded by the owner's identity
-function hash_bytes_uses_view(c)
+@noinline function sum_bytes(p::Ptr{UInt8}, n::Int)
+    s = UInt64(0)
+    for i in 1:n
+        s = 31s + unsafe_load(p, i)
+    end
+    return s
+end
+sum_string_bytes(k::Int) = (s = repeat("abc", k); GC.@preserve s sum_bytes(pointer(s), ncodeunits(s)))
+
+# whether the functions compiled for the method `name` with a pointer as first argument read
+# bytes through a byte view guarded by the owner's identity
+function reads_through_view(c, name::Symbol)
     infos = [info for (mi, info) in c.cgm.funcs
-             if mi.def isa Method && mi.def.name === :hash_bytes && mi.specTypes.parameters[2] <: Ptr]
+             if mi.def isa Method && mi.def.name === name && mi.specTypes.parameters[2] <: Ptr]
     isempty(infos) && return false
     return all(infos) do info
         body = info.func.body
@@ -122,7 +131,7 @@ end
              (hash_substrings, (1,)), (hash_substrings, (3,)), (compare_hashed_strings, (2,)),
              (compare_hashed_strings, (100,)), (string_nul, (3,)), (string_nul, (7,)), (string_nul, (0,)),
              (memory_bytes, (9,)), (ref_word, (72623859790382856,)), (symbol_bytes, (4242,)),
-             (reload_after_store, (5,)), (alternate_owners, (4,))]
+             (reload_after_store, (5,)), (alternate_owners, (4,)), (sum_string_bytes, (7,))]
     # each runs natively without throwing, so the comparisons below compare values
     for (f, args) in calls
         @test (f(args...); true)
@@ -143,10 +152,13 @@ end
     @wtest symbol_bytes(4242)
     @wtest reload_after_store(5)
     @wtest alternate_owners(4)
+    @wtest sum_string_bytes(7)
     for (f, k, T) in ((string_past_nul, 2, UInt8), (string_wide_past_nul, 3, UInt64), (string_before, 3, UInt8),
                       (memory_past_end, 4, UInt8))
         r = wasm_run(wcompile(f, (Int,)), string(nameof(f)), k; rettype=T)
         @test r isa Tuple && r[1] === :trap
     end
-    @test hash_bytes_uses_view(wcompile(hash_strings, (Int,)))
+    @test reads_through_view(wcompile(sum_string_bytes, (Int,)), :sum_bytes)
+    # Base hashes strings with `hash_bytes(::Ptr{UInt8}, ...)` from Julia 1.13
+    isdefined(Base, :hash_bytes) && @test reads_through_view(wcompile(hash_strings, (Int,)), :hash_bytes)
 end
