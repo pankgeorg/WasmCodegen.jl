@@ -59,17 +59,19 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
     mis = Core.MethodInstance[entry_instance(e.f, e.argtypes; world) for e in entries]
     w = collect_world(mis; world, verify=config.verify)
     restores = Any[]
-    local result
-    try
-        for hook in config.pre_image_hooks
-            r = Base.invokelatest(hook)
-            r isa Function && push!(restores, r)
+    # (the source roots before the hooks run, for this compilation only: see `SOURCE_ROOTS`)
+    result = Base.ScopedValues.with(SOURCE_ROOTS => source_roots(config)) do
+        try
+            for hook in config.pre_image_hooks
+                r = Base.invokelatest(hook)
+                r isa Function && push!(restores, r)
+            end
+            emit_module(w, mis, entries, config, validate)
+        catch
+            # (the compilation's error is the one thrown; a failing restore is reported)
+            run_restores(restores)
+            rethrow()
         end
-        result = emit_module(w, mis, entries, config, validate)
-    catch
-        # (the compilation's error is the one thrown; a failing restore is reported)
-        run_restores(restores)
-        rethrow()
     end
     failure = run_restores(restores)
     failure === nothing || throw(failure)

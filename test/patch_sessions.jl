@@ -93,3 +93,70 @@ end
         delete!(WasmCodegen.Runtime.WASM_IMPLS, T.twin)
     end
 end
+
+# a log call's file names its package's root instead of the build host's directory; other
+# strings and Symbols, `@__FILE__` too, are as natively
+module RelocTests
+@noinline rl_id(s) = s
+function rl_print()
+    # (the file of a log call, as the logging macros pass it)
+    println(Core.stdout, Base.fixup_stdlib_path(@__FILE__))
+    return Int32(0)
+end
+# (left as they are: data, compared and looked up as natively)
+const FILE = @__FILE__
+const SYM = Symbol(FILE)
+const SYMTAB = Dict(SYM => Int32(73))
+const STRTAB = Dict(FILE => Int32(91))
+const FILES = [FILE]
+const DATA = joinpath(dirname(@__FILE__), "data.toml")
+const OTHER = string("/elsewhere", @__FILE__)
+# (not below the root once normalized; text that only looks like a log id)
+const ESCAPING = string(dirname(@__FILE__), "/../outside.jl")
+const LOGLIKE = string("Mod:", @__FILE__, ":7\n")
+function rl_print_kept()
+    for s in (FILE, DATA, OTHER, ESCAPING, LOGLIKE)
+        println(Core.stdout, rl_id(s))
+    end
+    return Int32(0)
+end
+lookup_sym() = get(SYMTAB, SYM, Int32(-1))
+lookup_str() = get(STRTAB, FILE, Int32(-1))
+compare_file(i::Int) = FILES[i] == FILE && Symbol(FILES[i]) === SYM
+end
+@testset "image: relocatable source paths" begin
+    R = RelocTests
+    root = rstrip(pkgdir(WasmCodegen), '/')
+    file = R.FILE
+    @test startswith(file, string(root, '/'))
+    relocated = replace(file, string(root, '/') => "@WasmCodegen/")
+    c = WasmCodegen.compile(R.rl_print, (); config=WasmCodegen.Config(optimize=nothing))
+    @test wasm_run(c, "rl_print"; rettype=Int32) == 0
+    @test LAST_OUTPUT[] == string(relocated, "\n")
+    @test isempty(WasmCodegen.SOURCE_ROOTS[])
+    # other strings and Symbols keep their values: printed, compared and looked up as natively
+    c = WasmCodegen.compile(R.rl_print_kept, (); config=WasmCodegen.Config(optimize=nothing))
+    @test wasm_run(c, "rl_print_kept"; rettype=Int32) == 0
+    @test LAST_OUTPUT[] == join(string.((R.FILE, R.DATA, R.OTHER, R.ESCAPING, R.LOGLIKE), "\n"))
+    c = WasmCodegen.compile([WasmCodegen.Entry(R.lookup_sym, ()), WasmCodegen.Entry(R.lookup_str, ()),
+                             WasmCodegen.Entry(R.compare_file, (Int,))]; config=WasmCodegen.Config(optimize=nothing))
+    @test wasm_run(c, "lookup_sym"; rettype=Int32) == R.lookup_sym() == 73
+    @test wasm_run(c, "lookup_str"; rettype=Int32) == R.lookup_str() == 91
+    @test wasm_run(c, "compare_file", 1; rettype=Bool) == R.compare_file(1) == true
+    # each compilation its own roots, restored after a compilation within it (from a hook),
+    # also when that one fails
+    seen = Any[]
+    function hook()
+        before = copy(WasmCodegen.SOURCE_ROOTS[])
+        WasmCodegen.compile(R.rl_print, ())
+        try
+            WasmCodegen.compile(PatchTarget.untrimmable, (Int,))
+        catch
+        end
+        push!(seen, (!isempty(before), WasmCodegen.SOURCE_ROOTS[] == before))
+        return nothing
+    end
+    WasmCodegen.compile(R.rl_print, (); config=WasmCodegen.Config(pre_image_hooks=Any[hook]))
+    @test seen == [(true, true)]
+    @test isempty(WasmCodegen.SOURCE_ROOTS[])
+end
