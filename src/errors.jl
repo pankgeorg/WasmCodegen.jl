@@ -55,9 +55,12 @@ end
 # whole before writing any of it
 function print_method_instance(io::IO, mi::Core.MethodInstance)
     m = mi.def
-    m isa Method || return show(io, mi)
-    print(io, "MethodInstance for ", m.name, "(")
-    for (i, T) in enumerate(Base.unwrap_unionall(mi.specTypes).parameters[2:end])
+    sig = Base.unwrap_unionall(mi.specTypes)
+    (m isa Method && sig isa DataType && !isempty(sig.parameters)) || return show(io, mi)
+    print(io, "MethodInstance for ")
+    Base.show_signature_function(io, sig.parameters[1], false, "", false, true)
+    print(io, "(")
+    for (i, T) in enumerate(sig.parameters[2:end])
         print(io, i > 1 ? ", ::" : "::", T)
     end
     print(io, ")")
