@@ -23,7 +23,9 @@ const TRIM_PATCHES = [joinpath(@__DIR__, "trim", "juliac-trim-base.jl"),
                       joinpath(@__DIR__, "trim", "wasm-time.jl"),
                       joinpath(@__DIR__, "trim", "wasm-fs.jl"),
                       joinpath(@__DIR__, "trim", "wasm-regex.jl"),
-                      joinpath(@__DIR__, "trim", "wasm-event.jl")]
+                      joinpath(@__DIR__, "trim", "wasm-event.jl"),
+                      joinpath(@__DIR__, "trim", "wasm-specialize.jl"),
+                      joinpath(@__DIR__, "trim", "wasm-invokelatest.jl")]
 
 # the C runtime's scheduler on one thread, for `Config(tasks=:jspi)` (after the others)
 const TASK_PATCHES = [joinpath(@__DIR__, "trim", "wasm-tasks.jl")]
