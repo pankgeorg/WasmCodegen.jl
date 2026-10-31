@@ -50,6 +50,7 @@ WasmCodegen.with_trim_patches() do _, _
     include("function_wrappers.jl")
     include("fw_shell_first.jl")
     include("inline_cap.jl")
+    include("diagnostics.jl")
     include("juliac/runtests.jl")
 end
 

@@ -1233,7 +1233,7 @@ function emit_apply_iterate!(fc::FnCtx, args::Vector{Any}, @nospecialize(typ))
     # a tuple of unknown length, from one vector
     l = layout(fc, typ)
     (length(xs) == 1 && l.kind === Boxed && l.elements !== nothing) ||
-        unsupported("splatting ", join([x.typ for x in xs], ", "), " into a tuple")
+        unsupported("splatting ", join([diagnostic_string(x.typ) for x in xs], ", "), " into a tuple")
     v = xs[1]
     V = v.typ
     (V isa DataType && V <: Array && ndims(V) == 1 && eltype(V) <: l.elements.elem.T &&
