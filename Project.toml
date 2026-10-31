@@ -11,8 +11,8 @@ PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 WasmBuilder = "c3e9a8f2-6b1d-4f7a-8e25-1a9d3b7c4e60"
 
 [sources]
-IRStructurizer = {rev = "eh-tryop", url = "https://github.com/gbaraldi/IRStructurizer.jl"}
-WasmBuilder = {rev = "main", url = "https://github.com/gbaraldi/WasmBuilder.jl"}
+IRStructurizer = {rev = "combined-2026-11-01-v3.5", url = "https://github.com/pankgeorg/IRStructurizer.jl"}
+WasmBuilder = {rev = "combined-2026-11-01-v3.5", url = "https://github.com/pankgeorg/WasmBuilder.jl"}
 
 [compat]
 Binaryen_jll = "0.130.0"
