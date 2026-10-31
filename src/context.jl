@@ -126,7 +126,7 @@ mutable struct CGModule
     start::Vector{Inst}
     "How the program uses exceptions (`:none`, `:control`, `:values`: see `exceptions.jl`)."
     exceptions::Symbol
-    "Time spent structurizing the IR of the functions emitted (ns)."
+    "Time spent structurizing the IR of the functions emitted (ns), with `config.progress`."
     structurize_ns::UInt64
 end
 

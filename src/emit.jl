@@ -161,6 +161,7 @@ function structurize_or_unsupported(ir::CC.IRCode)
 end
 
 function structurize_timed(cgm::CGModule, mi::Core.MethodInstance)
+    cgm.config.progress || return structurize_prepared(cgm, mi)
     t = time_ns()
     try
         return structurize_prepared(cgm, mi)
