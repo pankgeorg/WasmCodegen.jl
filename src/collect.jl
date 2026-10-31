@@ -101,7 +101,7 @@ function trim_check(entries::Vector{Core.MethodInstance}; world::UInt=Base.get_w
     io = IOBuffer()
     try
         redirect_stdout(devnull) do
-            CC.verify_typeinf_trim(io, codeinfos, onlywarn)
+            verify_trim(io, codeinfos, entries, onlywarn)
         end
     catch err
         err isa Core.TrimFailure || rethrow()
@@ -164,6 +164,111 @@ function link_invoke_targets!(codeinfos::Vector{Any})
         codeinfos[i + 1] = src
     end
     return codeinfos
+end
+
+# whether `mi` is a method of a runtime twin (`Runtime.WASM_IMPLS`), whose calls the code
+# generator replaces by calls of its Wasm implementation (`overlays.jl`)
+function twin_instance(mi::Core.MethodInstance)
+    F = mi.specTypes isa DataType ? mi.specTypes.parameters[1] : nothing
+    return F isa DataType && Base.issingletontype(F) && haskey(Runtime.WASM_IMPLS, F.instance)
+end
+
+# whether `mi` is a twin's native body or `Twins.original` (or its keyword body), which only
+# those call
+function twin_body(mi::Core.MethodInstance)
+    m = mi.def
+    m isa Method && m.module === Runtime.Twins &&
+        (m.name === :original || startswith(String(m.name), "#original#")) && return true
+    return twin_instance(mi)
+end
+
+"""
+    compiled_instances(codeinfos, entries) -> (compiled, native_only)
+
+The method instances of `codeinfos` (native inference's) that the module compiles: those the
+entries reach through `:invoke`s, not entering the calls of runtime twins, which the code
+generator replaces; and those reached only through twins' native bodies (`native_only`).
+"""
+function compiled_instances(codeinfos::Vector{Any}, entries::Vector{Core.MethodInstance})
+    src = IdDict{Core.MethodInstance,Core.CodeInfo}()
+    for i in 1:length(codeinfos)
+        item = codeinfos[i]
+        item isa Core.CodeInstance && (src[CC.get_ci_mi(item)] = codeinfos[i + 1]::Core.CodeInfo)
+    end
+    # the instances reached from `roots`, not entering twins (whose callees are `twins`)
+    function reach(roots, twins)
+        reached = IdSet{Core.MethodInstance}()
+        work = Core.MethodInstance[roots...]
+        while !isempty(work)
+            mi = pop!(work)
+            mi in reached && continue
+            push!(reached, mi)
+            ci = get(src, mi, nothing)
+            ci === nothing && continue
+            for st in ci.code
+                Meta.isexpr(st, :invoke) || Meta.isexpr(st, :invoke_modify) || continue
+                t = st.args[1]
+                callee = t isa Core.CodeInstance ? CC.get_ci_mi(t) : t
+                callee isa Core.MethodInstance || continue
+                twin_instance(callee) ? push!(twins, callee) : push!(work, callee)
+            end
+        end
+        return reached
+    end
+    twins = Core.MethodInstance[]
+    compiled = reach(entries, twins)
+    # (from the twins' native bodies, which call more twins in turn)
+    native = reach(twins, Core.MethodInstance[])
+    return compiled, IdSet{Core.MethodInstance}(mi for mi in native if !(mi in compiled))
+end
+
+"""
+    verify_trim(io, codeinfos, entries, onlywarn)
+
+juliac's verifier (`Compiler.verify_typeinf_trim`), without the errors in the native bodies
+of the runtime's twins, and in the code only they reach, that the module does not compile: in Wasm, the code generator calls
+each twin's Wasm implementation instead (`overlays.jl`). (Natively, those bodies call the
+method before the patches with `invoke_in_world`, which the verifier rejects.) A twin body
+reached otherwise (an entry, a direct call of `Twins.original`) is still verified.
+"""
+function verify_trim(io::IO, codeinfos::Vector{Any}, entries::Vector{Core.MethodInstance}, onlywarn::Bool)
+    TV = CC.TrimVerifier
+    errors, parents = TV.get_verify_typeinf_trim(codeinfos)
+    compiled, native_only = compiled_instances(codeinfos, entries)
+    filter!(errors) do e
+        d = e.second
+        d isa TV.CallMissing || return true
+        mi = CC.get_ci_mi(d.codeinst)
+        return !(mi in native_only || (twin_body(mi) && !(mi in compiled)))
+    end
+    # (the rest as `verify_typeinf_trim`)
+    counts = [0, 0]
+    io = IOContext{IO}(io)
+    for (warn, desc) in errors
+        severity = warn ? 2 : 1
+        no = (counts[severity] += 1)
+        printstyled(io, "Error #", no, ": "; color=Base.error_color(), bold=true)
+        # (Julia 1.12's has no `warn`)
+        VERSION >= v"1.13-" ? TV.verify_print_error(io, desc, parents, warn) :
+                              TV.verify_print_error(io, desc, parents)
+    end
+    if counts[1] > 0 || counts[2] > 0
+        print(io, "Trim verify finished with ")
+        if counts[1] > 0
+            printstyled(io, counts[1], counts[1] == 1 ? " error" : " errors"; color=Base.error_color(), bold=true)
+        else
+            print(io, counts[1], counts[1] == 1 ? " error" : " errors")
+        end
+        print(io, ", ")
+        if counts[2] > 0
+            printstyled(io, counts[2], counts[2] == 1 ? " warning" : " warnings"; color=Base.warn_color(), bold=true)
+        else
+            print(io, counts[2], counts[2] == 1 ? " warning" : " warnings")
+        end
+        print(io, ".\n")
+        counts[1] > 0 && !onlywarn && throw(Core.TrimFailure())
+    end
+    return nothing
 end
 
 """

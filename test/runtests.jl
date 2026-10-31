@@ -34,3 +34,6 @@ WasmCodegen.with_trim_patches() do _, _
     include("versions.jl")
     include("juliac/runtests.jl")
 end
+
+# sessions with project patches, outside the session above
+include("patch_sessions.jl")

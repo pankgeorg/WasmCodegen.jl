@@ -35,6 +35,15 @@ itself (a host call), or `nothing` for other calls.
 function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nospecialize(typ))
     m = mi.def
     m isa Method || return nothing
+    F = mi.specTypes.parameters[1]
+    impl = Base.issingletontype(F) ? Runtime.wasm_impl(F.instance) : nothing
+    if impl !== nothing
+        # a runtime function with a native twin: its Wasm implementation
+        args = CGVal[operand(fc, a) for a in ex.args[3:end]]
+        argtypes = Tuple(mi.specTypes.parameters[2:end])
+        args = CGVal[convert_repr(fc, a, T) for (a, T) in zip(args, argtypes)]
+        return call_runtime!(fc, impl, args)
+    end
     if m.module === Runtime.IO && m.name === :write_byte
         fd, b = CGVal[operand(fc, a) for a in ex.args[3:end]]
         push_val!(fc, convert_repr(fc, fd, Int32))

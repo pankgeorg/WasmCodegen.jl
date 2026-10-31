@@ -18,10 +18,21 @@ The configuration of the code generator:
 - `host`: the interface to the host the module imports (`host.jl`): `:js`, the functions
   of the import module `julia`, which `js/julia.mjs` provides; `:wasi`, WASI preview 1
   (`wasi_snapshot_preview1`), for WASI runtimes (wasmtime, Node's `node:wasi`) and for
-  JavaScript through `js/julia.mjs`.
+  JavaScript through `js/julia.mjs`;
 - `image_pointer_fields`: the `(type, field name)`s whose pointers of the build process
   (addresses without an owner) the image may hold as they are; any other non-null one is an
-  unsupported construct.
+  unsupported construct;
+- `extra_patches`: files of patches applied after the default ones (`trim_patches`), in
+  the same session (see [`with_trim_patches`](@ref)): method definitions only;
+- `patch_bindings`: `name => value` bindings the patch files see (the modules they patch,
+  loaded before the session opens);
+- `abi_version`: `name => version`: an export `name` returning the `Int32` `version`, by
+  which hosts check the interface they implement (`nothing`: none);
+- `pre_image_hooks`: functions called (without arguments, in the latest world) after the
+  program is inferred and before its code and image are emitted, which is when the image
+  reads the values of globals: to reset state of the build process the module must not
+  hold. A hook may return a function, called (in reverse order) when the compilation ends,
+  to restore what it changed.
 """
 Base.@kwdef struct Config
     on_unsupported::Symbol = :error
@@ -40,6 +51,10 @@ Base.@kwdef struct Config
     as it is. See `ir_cache_stats`, `empty_ir_cache!`."
     ir_cache::Bool = false
     image_pointer_fields::Vector{Tuple{Any,Symbol}} = Tuple{Any,Symbol}[]
+    extra_patches::Vector{String} = String[]
+    patch_bindings::Vector{Pair{Symbol,Any}} = Pair{Symbol,Any}[]
+    abi_version::Union{Nothing,Pair{String,Int32}} = nothing
+    pre_image_hooks::Vector{Any} = Any[]
 end
 
 """

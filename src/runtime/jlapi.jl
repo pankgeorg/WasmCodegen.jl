@@ -324,3 +324,43 @@ const N_THREADS = Ref{Cint}(1)
 const N_THREADPOOLS = Ref{Cint}(2)
 "`jl_n_gcthreads`: no GC threads besides the one thread (`Threads.ngcthreads() == 1`)."
 const N_GCTHREADS = Ref{Cint}(0)
+
+## C structs Base reads through pointers (`cglobal`s of non-scalars), as functions with a
+## native twin (see `twins.jl`): natively, in the build process, they read the C runtime's;
+## compiled, they are the module's constants. The trim patch `wasm-runtime.jl` makes Base
+## call them.
+
+"""
+The options of the process that builds the module (`Base.JLOptions()`), without strings or
+arrays (null pointer fields: the build's paths are not the program's) and with one thread:
+set when the trim patches are applied, serialized into the module.
+"""
+const BUILD_JLOPTIONS = Ref{Base.JLOptions}()
+
+"`Base.JLOptions()`: natively the process's options."
+@noinline jl_options() = unsafe_load(cglobal(:jl_options, Base.JLOptions))
+@noinline jl_options_wasm() = BUILD_JLOPTIONS[]
+WASM_IMPLS[jl_options] = jl_options_wasm
+
+"The build process's options, sanitized as `BUILD_JLOPTIONS` holds them."
+function sanitized_jloptions()
+    opts = jl_options()
+    fields = Any[]
+    for (name, T) in zip(fieldnames(Base.JLOptions), fieldtypes(Base.JLOptions))
+        v = getfield(opts, name)
+        push!(fields, T <: Ptr ? T(0) : name === :nthreads ? T(1) : name === :nthreadpools ? T(2) : v)
+    end
+    return Base.JLOptions(fields...)
+end
+
+"""
+`Threads._nthreads_in_pool(tpid)` (`jl_n_threads_per_pool[tpid]`): natively the process's;
+compiled, as natively with `-t 1`: the interactive pool (0) empty, the default one (1) the one
+thread.
+"""
+@noinline function nthreads_in_pool(tpid::Int8)
+    p = unsafe_load(cglobal(:jl_n_threads_per_pool, Ptr{Cint}))
+    return Int(unsafe_load(p, tpid + 1))
+end
+@noinline nthreads_in_pool_wasm(tpid::Int8) = tpid == 1 ? 1 : 0
+WASM_IMPLS[nthreads_in_pool] = nthreads_in_pool_wasm

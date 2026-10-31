@@ -1,7 +1,7 @@
 # The C runtime's and the C library's functions the runtime answers (`runtime_ccalls.jl`),
 # through the Base APIs that reach them: CRC-32C, byte search from the end, Symbol
-# comparison, gensym, Libc.rand, the GC's controls and statistics, the floating-point
-# environment, fields set by index (deepcopy).
+# comparison, gensym, Libc.rand, the GC's controls and statistics, threads, the floating-point
+# environment, JLOptions, fields set by index (deepcopy).
 
 # CRC-32C (`jl_crc32c`): of strings, byte vectors, integers (by reference), IO; Pkg's slugs
 rt_crc_string(k::Int) = (s = ("hello, wasm", "a", "Pkg slug ✓")[k];
@@ -115,6 +115,10 @@ rt_gc_sync(x::Int64) = ccall(:jl_gc_sync_total_bytes, Int64, (Int64,), x) + x
 # the CPU and thread queries, as natively with `-t 1` on one CPU (not compared with native)
 rt_cpu() = (ccall(:jl_cpu_threads, Cint, ()), ccall(:jl_effective_threads, Cint, ()), Threads.threadpool() === :default)
 
+# threads, as natively with `-t 1` (not compared with the test process, which has more)
+rt_threads() = (Threads.nthreads(), Threads.maxthreadid(), Threads.nthreadpools(), Threads.threadid(),
+                Threads.threadpool() === :default, Threads.threadpoolsize(:interactive),
+                Threads.threadpoolsize(:default), Threads.ngcthreads(), Threads.nthreads(:default))
 rt_sys(x::Int) = (Sys.CPU_THREADS + x, Sys.WORD_SIZE, Sys.KERNEL === :Linux, Sys.ARCH === :aarch64, Sys.islinux(), Sys.iswindows())
 rt_lock(x::Int) = (l = ReentrantLock(); lock(l); y = x + islocked(l); unlock(l); (y, islocked(l)))
 
@@ -131,6 +135,11 @@ function rt_setround_up(x::Float64)
         return e isa ArgumentError ? 1 : 2
     end
 end
+
+# JLOptions: the options of the process that built the module (here, the test process)
+rt_jloptions() = (isinteractive(), Base.JLOptions().check_bounds, Base.JLOptions().depwarn,
+                  Base.JLOptions().color, Base.JLOptions().startupfile, Base.JLOptions().fast_math,
+                  Base.JLOptions().code_coverage, Base.JLOptions().opt_level)
 
 # deepcopy of mutable structs (`jl_set_nth_field`), as Pkg copies its Project and Manifest
 mutable struct RTProj
@@ -193,11 +202,13 @@ rt_typeintersect(x::Int) = (typeintersect(x > 0 ? Vector{Int} : Vector, Abstract
     @testset "rt_sys" begin @wtest rt_sys(1) end
     @testset "rt_lock" begin @wtest rt_lock(3) end
     @testset "rt_fenv" begin @wtest rt_fenv(1.0) end
+    @testset "rt_jloptions" begin @wtest rt_jloptions() end
     @testset "rt_setround" begin @wtest rt_setround(1.0) end
     @test wasm_run(wcompile(rt_setround_up, (Float64,)), "rt_setround_up", 1.0; rettype=Int) == 1
     @test wasm_run(wcompile(rt_gc_sync, (Int64,)), "rt_gc_sync", Int64(5); rettype=Int64) == 5
     # not compared with native (documented constants)
-    for (f, expected) in ((rt_gc_stats, (0, 0, 0, 0, (0, 0), 0)), (rt_cpu, (Cint(1), Cint(1), true)))
+    for (f, expected) in ((rt_gc_stats, (0, 0, 0, 0, (0, 0), 0)), (rt_cpu, (Cint(1), Cint(1), true)),
+                          (rt_threads, (1, 1, 2, 1, true, 0, 1, 1, 1)))
         got = wasm_run(wcompile(f, ()), string(nameof(f)); rettype=Base.return_types(f, ())[1])
         @test got == expected
         got == expected || @info "mismatch" f expected got
