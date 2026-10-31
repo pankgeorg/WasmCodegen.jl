@@ -598,6 +598,9 @@ that is the first argument. With one thread, the loads and stores they are. Othe
 unsupported.
 """
 function emit_llvmcall!(fc::FnCtx, args::Vector{CGVal}, @nospecialize(R))
+    # `llvm.assume` (FunctionWrappers' `assume`) is an optimizer hint: nothing to compile
+    fc.cgm.config.funcref_wrappers && isconstant(args[1]) && llvm_assume_only(constant_value(args[1])) &&
+        return ghost(Nothing, nothing)
     ir = isconstant(args[1]) ? constant_value(args[1]) : nothing
     ir isa Tuple && (ir = ir[1])
     vals = args[4:end]
@@ -639,4 +642,28 @@ function emit_llvmcall!(fc::FnCtx, args::Vector{CGVal}, @nospecialize(R))
     end
     ptr_store!(fc, p, new, one_)
     return old
+end
+
+# whether an llvmcall (a body, or a (module, entry) pair) does nothing but `call @llvm.assume` (with the
+# `trunc` of its argument and `ret void`): for a module, the body of the named entry, which must be the
+# module's only definition
+function llvm_assume_only(code)
+    if code isa Tuple && length(code) == 2
+        ir, entry = code
+        (ir isa AbstractString && entry isa AbstractString) || return false
+        occursin(r"^[A-Za-z0-9_]+$", entry) || return false
+        # comments and strings could hide a delimiter from the match below: not recognized
+        (occursin(';', ir) || occursin('"', ir)) && return false
+        count("define ", ir) == 1 || return false
+        m = match(Regex("define[^\\n]*@" * entry * "\\([^)]*\\)[^{]*\\{(.*?)\\}", "s"), ir)
+        m === nothing && return false
+        body = m[1]
+    else
+        code isa AbstractString || return false
+        body = code
+    end
+    occursin("@llvm.assume", body) || return false
+    exec = filter(l -> !isempty(l) && !startswith(l, "declare ") && !startswith(l, "attributes "), strip.(split(body, '\n')))
+    return !isempty(exec) && all(l -> l == "ret void" || occursin(r"^call void @llvm\.assume\(i1 %[A-Za-z0-9_.]+\)$", l) ||
+                                        occursin(r"^%[A-Za-z0-9_.]+ = trunc i8 %[A-Za-z0-9_.]+ to i1$", l), exec)
 end

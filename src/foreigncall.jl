@@ -93,6 +93,8 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         iname = llvm_intrinsic_name(ex.args[1])
         iname === nothing || return emit_llvm_intrinsic!(fc, iname, args, typ)
     end
+    name === nothing && !is_llvmcall(ex.args[5]) && fc.cgm.config.funcref_wrappers &&
+        return emit_indirect_ccall!(fc, ex, typ)
     if name === :jl_alloc_genericmemory
         M = args[1]::CGVal
         isconstant(M) || unsupported("allocating a Memory of a type not known at compile time")
@@ -753,4 +755,167 @@ function emit_runtime_ccall!(fc::FnCtx, r::RuntimeCcall, args::Vector{Any}, @nos
     end
     res = call_runtime!(fc, r.f, vals)
     return res.kind === Ghost ? ghost(Nothing, nothing) : res
+end
+
+## function pointers (`Config(funcref_wrappers = true)`, see `runtime/fwrappers.jl`)
+
+const FUNCWRAPPERS_PKG = Base.PkgId(Base.UUID("069b7b12-0de2-55c6-9aab-29f3d0a68a2e"), "FunctionWrappers")
+"The `FunctionWrappers` module when it is loaded, else `nothing`."
+funcwrappers_module() = Base.maybe_root_module(FUNCWRAPPERS_PKG)
+
+"""
+    cfunc_sig!(cgm, rt, argts) -> TypeRef
+
+The Wasm function type of a C signature: the leaves of each argument type (a `Ref` is a
+pointer) and of the return type (none for a singleton).
+"""
+function cfunc_sig!(cgm::CGModule, @nospecialize(rt), argts::Vector{Any})
+    params = ValType[]
+    for (i, T) in enumerate(argts)
+        P = i > 1 && singleton_ref(T) ? Any : T isa Type && T <: Ref ? Ptr{Cvoid} : T
+        append!(params, valtypes(cgm, P))
+    end
+    lr = layout(cgm, rt)
+    results = lr.kind === Ghost || lr.kind === Bottom ? ValType[] : valtypes(cgm, rt)
+    return WasmBuilder.functype!(cgm.mod, params, results)
+end
+
+"The parameter and result value types of the Wasm function type `t`, for diagnostics."
+function functype_string(cgm::CGModule, t)
+    ft = try cgm.mod.types[t.idx + 1] catch; nothing end
+    return ft === nothing ? string(t) : string(ft)
+end
+
+"""
+    singleton_ref(T) -> Bool
+
+Whether `T` is `Ref{S}` of a singleton type `S`, or of a concrete type `S` not stored inline (a
+mutable or boxed object, such as a `Vector`). FunctionWrappers declares such an argument as
+`Ref{S}` in the `cfunction` signature and passes it as `Any` in the `ccall` (its
+`map_cfunc_argtype`/`map_argtype`: everything not `allocatedinline`), so both sides carry it as a
+reference to the object.
+"""
+singleton_ref(@nospecialize(T)) =
+    T isa DataType && T <: Ref && length(T.parameters) == 1 && (S = T.parameters[1];
+        Base.issingletontype(S) || (S isa DataType && isconcretetype(S) && !Base.allocatedinline(S)))
+
+"""
+    cfunc_trampoline!(cgm, callee, rt, argts) -> FuncInfo
+
+`Runtime.fw_trampoline` compiled for the cfunction `(callee, rt, argts)` of FunctionWrappers'
+shape (`argts[1]` a `Ref` of the wrapped object's type, the others passed by value or a `Ref`
+of a singleton type), checked to have the C signature's Wasm type.
+"""
+function cfunc_trampoline!(cgm::CGModule, @nospecialize(callee), @nospecialize(rt), argts::Vector{Any})
+    (!isempty(argts) && argts[1] isa DataType && argts[1] <: Ref) ||
+        unsupported("a cfunction whose first argument is not a Ref: ", argts)
+    objT = argts[1].parameters[1]
+    rest = argts[2:end]
+    for T in rest
+        (T isa Type && T <: Ref && !singleton_ref(T)) &&
+            unsupported("a cfunction with an argument passed by reference: ", T)
+    end
+    lr = layout(cgm, rt)
+    (rt isa Type && rt <: Ref) && unsupported("a cfunction returning by reference: ", rt)
+    info = if any(singleton_ref, rest)
+        mask = Tuple(singleton_ref(T) for T in rest)
+        # only the singleton types are read; `Nothing` elsewhere keeps `S` concrete (an `Any` argument
+        # would make it abstract, and `Type{S}` a parameter)
+        S = Tuple{(singleton_ref(T) ? T.parameters[1] : Nothing for T in rest)...}
+        length(rest) <= 8 || unsupported("a cfunction with more than 8 arguments and a singleton one: ", argts)
+        runtime_function!(cgm, Runtime.fw_trampoline_singletons,
+                          (Type{objT}, Type{S}, Val{mask}, Core.Typeof(callee), Ptr{Cvoid},
+                           Any[singleton_ref(T) ? Any : T for T in rest]...))
+    else
+        runtime_function!(cgm, Runtime.fw_trampoline,
+                          (Type{objT}, Core.Typeof(callee), Ptr{Cvoid}, rest...))
+    end
+    sig = cfunc_sig!(cgm, rt, argts)
+    info.func.type == sig ||
+        unsupported("a cfunction whose trampoline type differs from its C signature: ", argts, " -> ", rt,
+                    " (trampoline ", functype_string(cgm, info.func.type), ", C ", functype_string(cgm, sig), ")")
+    return info
+end
+
+"The constant instructions of a box owning a reference to `func` (type `sig`)."
+function funcptr_box_init(ts::Types, func::Func, sig::TypeRef, hash::Int32)
+    box = funcptr_box_type!(ts, sig)
+    return Inst[Inst(:i32_const, typeid!(ts, Runtime.FuncPtrBox)), Inst(:i32_const, hash),
+                Inst(:ref_func, func), Inst(:struct_new, box)]
+end
+
+"""
+    funcptr_box!(cgm, info) -> (Global, Int64)
+
+The one box owning the reference to the trampoline `info`, and the address of pointers to it:
+its virtual address (its identity hash shifted by 32 bits, as for any pointer owner). Every
+pointer to one trampoline is the same pointer and pointers to different trampolines differ.
+(Natively, wrappers whose `@cfunction` comes from the same compiled code share a pointer, but a
+`@cfunction` compiled at another call site has a pointer of its own.)
+"""
+function funcptr_box!(cgm::CGModule, info::FuncInfo)
+    get!(cgm.helpers, (:funcptr_box, info.func)) do
+        ts = cgm.types
+        h = image_hash!(cgm.image, hash((:funcptr_box, objectid(info.mi))))
+        g = add_global!(cgm.mod, "jl_funcptr_$(length(cgm.helpers))", RefType(funcptr_box_type!(ts, info.func.type), false),
+                        false, funcptr_box_init(ts, info.func, info.func.type, h))
+        (g, owner_address(h))
+    end
+end
+
+"The virtual address of an object whose identity hash is `h` (see `push_memory_base!`)."
+owner_address(h::Int32) = reinterpret(Int64, UInt64(reinterpret(UInt32, h)) << 32)
+
+"`Expr(:cfunction, Ptr{Cvoid}, f, rt, argts, cc)`: a pointer owned by a box of the trampoline's reference."
+function emit_cfunction!(fc::FnCtx, ex::Expr, @nospecialize(typ))
+    fc.cgm.config.funcref_wrappers || unsupported("the expression head cfunction")
+    f = ex.args[2]
+    f isa QuoteNode && (f = f.value)
+    if f isa Core.SSAValue || f isa Core.Argument || f isa GlobalRef
+        c = operand(fc, f)
+        (c isa CGVal && isconstant(c)) || unsupported("a cfunction of a function value not known at compile time")
+        f = constant_value(c)
+    end
+    rt = ex.args[3]
+    argts = collect(Any, ex.args[4]::Core.SimpleVector)
+    info = cfunc_trampoline!(fc.cgm, f, rt, argts)
+    ts = fc.cgm.types
+    g, addr = funcptr_box!(fc.cgm, info)
+    emit!(fc.b, :global_get, g)
+    o = new_local!(fc, jlvalue_ref(ts))
+    emit!(fc.b, :local_set, o)
+    emit!(fc.b, :i64_const, addr)      # nonzero: never `C_NULL`
+    return new_ptr!(fc, typ === Ptr{Cvoid} ? typ : Ptr{Cvoid}, o, nothing)
+end
+
+"A `ccall` whose target is a pointer value: `call_ref` of the function its owner box holds."
+function emit_indirect_ccall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
+    target = operand(fc, ex.args[1])
+    (target isa CGVal && is_ptr_type(target.typ)) ||
+        unsupported("a foreign call through a value of type ", target isa CGVal ? target.typ : typeof(target))
+    rt = ex.args[2]
+    argts = collect(Any, ex.args[3]::Core.SimpleVector)
+    nargs = length(argts)
+    vals = CGVal[operand(fc, a) for a in ex.args[6:5+nargs]]
+    sig = cfunc_sig!(fc.cgm, rt, argts)
+    ts = fc.cgm.types
+    box = funcptr_box_type!(ts, sig)
+    fr = new_local!(fc, RefType(sig, true))
+    push_leaf!(fc, ptr_owner(target))
+    emit!(fc.b, :ref_cast, box)
+    emit!(fc.b, :struct_get, box, DATA_FIELD)
+    emit!(fc.b, :local_set, fr)
+    for (v, T) in zip(vals, argts)
+        if T isa Type && T <: Ref
+            is_ptr_type(v.typ) || unsupported("a by-reference foreign call argument of type ", v.typ)
+            push_val!(fc, v)
+        else
+            push_val!(fc, convert_repr(fc, v, T))
+        end
+    end
+    emit!(fc.b, :local_get, fr)
+    call_ref!(fc.b, sig)
+    lr = layout(fc, rt)
+    lr.kind === Ghost && return ghost(rt, rt.instance)
+    return pop_val!(fc, rt)
 end

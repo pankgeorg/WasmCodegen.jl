@@ -46,6 +46,7 @@ WasmCodegen.with_trim_patches() do _, _
     include("specialize.jl")
     include("invokelatest.jl")
     include("world_calls.jl")
+    include("function_wrappers.jl")
     include("juliac/runtests.jl")
 end
 

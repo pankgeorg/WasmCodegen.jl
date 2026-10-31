@@ -71,6 +71,9 @@ Base.@kwdef struct Config
     unsupported); a world known only at run time is assumed to be (nothing the call runs
     redefined after it)."
     direct_world_calls::Bool = false
+    "`cfunction` pointers and calls through them (`FunctionWrappers`) compile to typed Wasm
+    function references (`runtime/fwrappers.jl`)."
+    funcref_wrappers::Bool = false
 end
 
 """
