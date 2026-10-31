@@ -11,7 +11,8 @@ using ..Main: wcompile, wasm_run, @wtest, WasmCodegen
 # a String, compared by its length and bytes
 digest(s::String) = (sizeof(s), foldl((h, b) -> 31h + b, codeunits(s); init=UInt64(7)))
 kstr(i::Int) = digest(string("k", i % 1000))
-mixed_str(i::Int, x::Float64) = digest(string(i, "-", x, 'c', i % 3 == 0))
+# (at most four argument types: Julia 1.12 does not union-split `print` over more)
+mixed_str(i::Int, x::Float64) = digest(string(i, "-", x, i % 3 == 0 ? 'c' : 'é'))
 function mixed_sum(i::Int)
     t = (i, "abc", 2.5, nothing, Int32(i))
     s = 0.0
@@ -129,7 +130,12 @@ end
         @wtest escaping(4, k)
         @wtest escaping_narrowed(4, k)
     end
-    @test !emits_box(wcompile(kstr, (Int,)), (:kstr, :print_to_string), Int)
+    # (Julia 1.12's `print_to_string` carries the element through a φ, which is boxed)
+    if VERSION >= v"1.13-"
+        @test !emits_box(wcompile(kstr, (Int,)), (:kstr, :print_to_string), Int)
+    else
+        @test_broken !emits_box(wcompile(kstr, (Int,)), (:kstr, :print_to_string), Int)
+    end
     @test !emits_box(wcompile(mixed_sum, (Int,)), (:mixed_sum,), Int)
     @test !emits_box(wcompile(payloads, (Int, Int)), (:payloads,), Int)
     @test emits_box(wcompile(escaping, (Int, Int)), (:escaping,), Int)
