@@ -69,3 +69,20 @@ The results of a structured control flow operation (an `if` or a loop), read wit
 struct MultiVal
     vals::Vector{CGVal}
 end
+
+"""
+    SplitUnion
+
+A value of a union of concrete types `typ` held unboxed: one value per member type of the
+union it was made as (`vals`, in the order of `members`, a superset of the members of `typ`)
+and the local `tag`, the (1-based, i32) index of the member it is. Only `isa` with a type
+known at compile time and narrowing read it (`analyze_split_unions!`): to a member, its
+value; to a smaller union, the same `SplitUnion` of that type. Only `vals[tag]` holds the
+value; the others hold whatever was last assigned to them.
+"""
+struct SplitUnion
+    typ::Any
+    members::Vector{Any}
+    tag::Int
+    vals::Vector{CGVal}
+end
