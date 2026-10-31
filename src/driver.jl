@@ -36,6 +36,15 @@ module.
 function compile(entries::Vector; config::Config=Config(), validate::Bool=true,
                  world::Union{Nothing,UInt}=nothing)
     entries = Entry[e isa Entry ? e : Entry(e[1], e[2]) for e in entries]
+    config.tasks in (:none, :jspi) || throw(ArgumentError("Config(tasks = $(repr(config.tasks))): :none or :jspi"))
+    if config.tasks === :jspi
+        config.host === :wasi && :julia_io in config.host_extensions ||
+            throw(ArgumentError("Config(tasks = :jspi) needs the host's events: host = :wasi, host_extensions = [:julia_io]"))
+        # (the new stacks' entry point, and the scheduler's primitives)
+        push!(entries, Entry(Runtime.Tasks.task_entry, (Int32,); name="jl_task_entry"))
+        config = Config(; (k => (k === :extra_patches ? [config.extra_patches; TASK_PATCHES] : getfield(config, k))
+                           for k in fieldnames(Config))...)
+    end
     run(program_world) = Base.invoke_in_world(COMPILER_WORLD[], compile_in_world, entries,
                                               config, validate, program_world)
     if config.trim_patches && world === nothing

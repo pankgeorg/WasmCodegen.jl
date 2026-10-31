@@ -61,6 +61,10 @@ Base.@kwdef struct Config
     abi_version::Union{Nothing,Pair{String,Int32}} = nothing
     pre_image_hooks::Vector{Any} = Any[]
     host_extensions::Vector{Symbol} = Symbol[]
+    "`:none`: a program of one task (waits that need another task throw); `:jspi`: Julia
+    Tasks, each on its own stack (JavaScript Promise Integration), for `host = :wasi` with
+    the `:julia_io` extension: the host provides the `julia_task` imports (`js/julia_task.mjs`)."
+    tasks::Symbol = :none
 end
 
 """
