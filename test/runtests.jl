@@ -6,6 +6,9 @@ push!(LOAD_PATH, joinpath(@__DIR__, "PrecompiledPrograms"))
 using PrecompiledPrograms
 pop!(LOAD_PATH)
 
+# (the references of printing.jl, with Base's printing: before the patches)
+include("printing_fixtures.jl")
+
 # one session of juliac's trim patches for all the tests (as juliac builds in one process)
 WasmCodegen.with_trim_patches() do _, _
     include("basics.jl")
@@ -26,6 +29,7 @@ WasmCodegen.with_trim_patches() do _, _
     include("typeof_any.jl")
     include("invoke_cycle.jl")
     include("reflection_rt.jl")
+    include("printing.jl")
     include("runtime.jl")
     include("idset.jl")
     include("unset.jl")

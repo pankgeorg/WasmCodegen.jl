@@ -22,10 +22,45 @@ let Runtime = WasmCodegen.Runtime
         # specializes it on the type, so its reflection is done at compile time
         _typeinfo_implicit(@nospecialize(T)) = typeinfo_implicit(T)::Bool
         # printing a type: juliac's (which reflects on the type, see juliac-trim-base.jl),
-        # made a foldable function of the type, so that inference computes the name of a
-        # type known at compile time (as a Symbol: a String is not kept as a constant)
-        Base.@assume_effects :foldable _type_name(@nospecialize(T::Type)) = Symbol(sprint(_show_type, T))
+        # computed at compile time: a constant for a type known then, else from a table of
+        # the module's types (`Runtime.simple_type_name`, the same text as `_show_type`)
+        Base.@assume_effects :foldable _type_name(@nospecialize(T::Type)) =
+            $(Runtime.map_type_symbol)($(Runtime.simple_type_name), T)
         show(io::IO, T::Type) = print(io, _type_name(T))
+        # showing a function or an enum: the bindings that name it, and their visibility from
+        # `show`'s default module, at compile time (`Runtime.function_show`/`enum_show`);
+        # another module in the `IOContext`'s `:module` is not in Wasm
+        function show_function(io::IO, f::Function, compact::Bool, fallback::Function)
+            s = $(Runtime.map_type_value)($(Runtime.function_show), typeof(f))::$(Runtime.FunctionShow)
+            if s.fallback
+                fallback(io, f)
+            elseif compact
+                print(io, s.name)
+            elseif s.bound && s.value === f
+                mod = get(io, :module, UsesBaseOnly)
+                visible = mod === s.mod || (mod === UsesBaseOnly ? s.visible :
+                    error("show of a function with an IOContext :module other than Base.UsesBaseOnly is not in Wasm"))
+                visible || print(io, s.mod, ".")
+                show_sym(io, s.name)
+            else
+                fallback(io, f)
+            end
+        end
+        function show(io::IO, x::Enums.Enum)
+            sym = Enums._symbol(x)
+            if !(get(io, :compact, false)::Bool)
+                from = get(io, :module, Main)
+                s = $(Runtime.map_type_value)($(Runtime.enum_show), typeof(x))::$(Runtime.EnumShow)
+                # (a value not of an instance, `<invalid #n>`, is no binding: never visible)
+                visible = from === nothing ? false : from === s.def ? sym in s.names : from === Main ? sym in s.visible :
+                    error("show of an enum with an IOContext :module other than Main is not in Wasm")
+                if !visible
+                    show(io, s.def)
+                    print(io, ".")
+                end
+            end
+            print(io, sym)
+        end
         # (`typesplit` reflects on and makes types: a table of the module's types instead)
         nonnothing_nonmissing_typeinfo(io::IO) =
             $(Runtime.map_type)($(Runtime.nonnothing_nonmissing), get(io, :typeinfo, Any))

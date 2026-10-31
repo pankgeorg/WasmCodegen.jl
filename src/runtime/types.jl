@@ -2,6 +2,125 @@
 # the code generator compiles to a table of `f` over the types of the module.
 
 @noinline map_type(f::F, @nospecialize(T)) where {F} = f(T)::Type
+"`map_type_symbol(f, T)`: `f(T)`, a Symbol, from the same kind of table as `map_type`."
+@noinline map_type_symbol(f::F, @nospecialize(T)) where {F} = f(T)::Symbol
+"""
+`map_type_value(f, T)`: `f(T)`, any object, from the same kind of table as `map_type`. `f` runs
+only natively (on the module's types, when the code generator builds the table), so it is
+not inferred from here: juliac's verifier skips this body (`collect.jl`, `twin_body`).
+"""
+@noinline map_type_value(f::F, @nospecialize(T)) where {F} = Base.inferencebarrier(f)(T)
+
+# Showing functions and enums (`trim/wasm-base.jl`): which global names a value, and whether
+# it is visible from the default module of `show`, decided by the bindings of the module's
+# modules, known at compile time (the C runtime's bindings are not in the module).
+
+"How `show` names a function of a type (`Base.show_function`), for `map_type_value`."
+mutable struct FunctionShow   # (mutable: an object of the image; never mutated)
+    fallback::Bool      # an anonymous function's type (shown by the fallback)
+    name::Symbol        # the type's `singletonname`
+    bound::Bool         # `name` names a constant of its module of this type: `value`
+    value::Any
+    mod::Module
+    visible::Bool       # `isvisible(name, mod, Base.UsesBaseOnly)`
+end
+const NOT_A_FUNCTION = FunctionShow(true, :_, false, nothing, Base, false)
+# (both in the latest world, the program's: the compiler's is older than its definitions;
+# one object per type, as the tables of the module's types are built to a fixpoint)
+function_show(@nospecialize(T)) = get!(() -> Base.invokelatest(_function_show, T)::FunctionShow, FUNCTION_SHOWS, T)
+function _function_show(@nospecialize(T))
+    (T isa DataType && T <: Function) || return NOT_A_FUNCTION
+    tn = T.name
+    tn.name === tn.singletonname && return NOT_A_FUNCTION
+    sym = tn.singletonname
+    if isdefined(tn, :module) && isdefinedglobal(tn.module, sym) && isconst(tn.module, sym)
+        g = getglobal(tn.module, sym)
+        if typeof(g) === T
+            return FunctionShow(false, sym, true, g, tn.module, Base.isvisible(sym, tn.module, Base.UsesBaseOnly))
+        end
+    end
+    return FunctionShow(false, sym, false, nothing, Base, false)
+end
+
+"How `show` names an enum's instances (`Base.show(::IO, ::Enum)`), for `map_type_value`."
+mutable struct EnumShow       # (mutable: an object of the image; never mutated)
+    def::Module
+    names::Vector{Symbol}       # the instances' names (bindings of `def`)
+    visible::Vector{Symbol}     # those visible from `Main` (`isvisible`)
+end
+const NOT_AN_ENUM = EnumShow(Base, Symbol[], Symbol[])
+# (of the compilation: emptied when one starts, as bindings and their visibility change)
+const FUNCTION_SHOWS = IdDict{Any,FunctionShow}()
+const ENUM_SHOWS = IdDict{Any,EnumShow}()
+enum_show(@nospecialize(T)) = get!(() -> Base.invokelatest(_enum_show, T)::EnumShow, ENUM_SHOWS, T)
+function _enum_show(@nospecialize(T))
+    (T isa DataType && T <: Enum && isconcretetype(T)) || return NOT_AN_ENUM
+    def = parentmodule(T)
+    names = Symbol[Symbol(x) for x in instances(T)]
+    return EnumShow(def, names, Symbol[n for n in names if Base.isvisible(n, def, Main)])
+end
+
+"""
+`simple_type_name(T)`: the name a type is printed with in a module (`show(io, ::Type)`,
+`trim/wasm-base.jl`): its name and parameters, without modules (juliac's printing of types,
+without reflection at run time: a table over the module's types, `map_type_symbol`).
+"""
+function simple_type_name(@nospecialize(T))
+    io = IOBuffer()
+    show_simple_type(io, T)
+    return Symbol(String(take!(io)))
+end
+
+function show_simple_type_param(io::Base.IO, @nospecialize(p))
+    if p isa Int
+        show(io, p)
+    elseif p isa Type
+        show_simple_type(io, p)
+    elseif p isa Symbol
+        print(io, ":")
+        print(io, p)
+    elseif p isa TypeVar
+        print(io, p.name)
+    else
+        print(io, "?")
+    end
+end
+function show_simple_type(io::Base.IO, @nospecialize(T))
+    if T isa DataType
+        print(io, T.name.name)
+        if T !== T.name.wrapper && length(T.parameters) > 0
+            print(io, "{")
+            first = true
+            for p in T.parameters
+                first || print(io, ", ")
+                first = false
+                show_simple_type_param(io, p)
+            end
+            print(io, "}")
+        end
+    elseif T isa Union
+        print(io, "Union{")
+        show_simple_type_param(io, T.a)
+        print(io, ", ")
+        show_simple_type_param(io, T.b)
+        print(io, "}")
+    elseif T isa UnionAll
+        show_simple_type(io, T.body::Type)
+        print(io, " where ")
+        print(io, T.var.name)
+    end
+end
+
+"What `typeinfo_eltype` gives where Base's is `nothing` (a table of a function of types holds types)."
+struct NoEltype end
+"`Base.typeinfo_eltype(T)`, `NoEltype` for `nothing`: the element type a context of type `T` implies."
+typeinfo_eltype(@nospecialize(T)) = (e = Base.typeinfo_eltype(T); e === nothing ? NoEltype : e::Type)
+
+"The types of the fields of a `Pair` type `T` (`fieldtype(T, 1)`, `fieldtype(T, 2)`), for `show` of a pair in a context of `T`; `Any` for other types."
+# (total: `map_type` computes them for every type of the module, `Union{}` among them, which is
+# `<: Pair` but has no fields; a context of `Union{}` holds no pair)
+pair_first_type(@nospecialize(T)) = T isa Type && T !== Union{} && T <: Pair ? fieldtype(T, 1) : Any
+pair_second_type(@nospecialize(T)) = T isa Type && T !== Union{} && T <: Pair ? fieldtype(T, 2) : Any
 
 "The type a value shown in a context of `typeinfo` `T` is printed as (`nonnothing_nonmissing_typeinfo`)."
 nonnothing_nonmissing(@nospecialize(T)) = T isa Type ? Base.nonmissingtype(Base.nonnothingtype(T)) : Any

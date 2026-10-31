@@ -169,6 +169,9 @@ end
 # whether `mi` is a method of a runtime twin (`Runtime.WASM_IMPLS`), whose calls the code
 # generator replaces by calls of its Wasm implementation (`overlays.jl`)
 function twin_instance(mi::Core.MethodInstance)
+    # (`Runtime.map_type_value`: compiled to a table of its function, which runs natively)
+    m = mi.def
+    m isa Method && m.module === Runtime && m.name === :map_type_value && return true
     F = mi.specTypes isa DataType ? mi.specTypes.parameters[1] : nothing
     return F isa DataType && Base.issingletontype(F) && haskey(Runtime.WASM_IMPLS, F.instance)
 end

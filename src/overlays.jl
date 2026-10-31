@@ -55,6 +55,12 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
     elseif m.module === Runtime && m.name === :map_type
         f = mi.specTypes.parameters[2]
         return emit_map_type!(fc, f.instance, operand(fc, ex.args[4]))
+    elseif m.module === Runtime && m.name === :map_type_symbol
+        f = mi.specTypes.parameters[2]
+        return convert_repr(fc, emit_map_type!(fc, f.instance, operand(fc, ex.args[4])), Symbol)
+    elseif m.module === Runtime && m.name === :map_type_value
+        f = mi.specTypes.parameters[2]
+        return emit_map_type!(fc, f.instance, operand(fc, ex.args[4]))
     elseif m.module === Base && (m.name === :enq_work || (m.name === :wait && length(mi.specTypes.parameters) == 1))
         # one task: waiting can only wait forever, and there is no other task to schedule (in
         # place of the scheduler: task switches, the C runtime's queues and threads)
