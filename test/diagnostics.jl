@@ -15,11 +15,14 @@ end
     s = WasmCodegen.limited_sprint(show, B.big())
     @test occursin("W{W{W{", s) && endswith(s, "…") && sizeof(s) <= maxlen + sizeof("…")
     @test WasmCodegen.limited_sprint(print, "αβγ"; maxlen = 3) == "α…"
-    mi = Base.specialize_method(only(methods(B.apply_dynamic)), Tuple{typeof(B.apply_dynamic), B.big()}, Core.svec())
-    s = WasmCodegen.diagnostic_string("in ", mi)
-    @test startswith(s, "in MethodInstance for apply_dynamic(::") && endswith(s, "…") && sizeof(s) <= maxlen + sizeof("…")
-    small = Base.specialize_method(only(methods(B.nest)), Tuple{typeof(B.nest), Type{Int}, Int}, Core.svec())
-    @test WasmCodegen.diagnostic_string(small) == "MethodInstance for nest(::Type{Int64}, ::Int64)"
+    instance(f, argtypes...) = Base.specialize_method(which(f, argtypes), Tuple{typeof(f), argtypes...}, Core.svec())
+    s = WasmCodegen.diagnostic_string("in ", instance(B.apply_dynamic, B.big()))
+    @test startswith(s, "in MethodInstance for ") && occursin("apply_dynamic(::", s)
+    @test endswith(s, "…") && sizeof(s) <= maxlen + sizeof("…")
+    # printed as `show` prints them
+    for mi in (instance(B.nest, Type{Int}, Int), instance(sum, Vector{Int}), instance(Iterators.reverse, Vector{Int}))
+        @test WasmCodegen.diagnostic_string(mi) == sprint(show, mi)
+    end
 
     c = WasmCodegen.compile(B.apply_dynamic, (B.big(),); config = test_config(trim = :unsafe, optimize = nothing))
     @test length(c.cgm.diagnostics) == 1
@@ -38,6 +41,6 @@ end
     end
     @test startswith(report, "1 unsupported constructs (1 distinct):")
     @test occursin("apply_type of types not known", report) &&
-          occursin("in MethodInstance for apply_dynamic(::", report)
+          occursin(r"in MethodInstance for \S*apply_dynamic\(::", report)
     @test sizeof(report) < 10maxlen
 end
