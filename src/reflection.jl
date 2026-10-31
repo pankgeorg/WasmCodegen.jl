@@ -318,7 +318,7 @@ function finish_egal!(cgm::CGModule)
     end
     for (id, T) in enumerate(copy(ts.typelist))
         # (and tuples of a type of unknown length, their concrete one not in the module)
-        (T isa DataType && (isconcretetype(T) || is_vararg_tuple(T))) || continue
+        (T isa DataType && (isconcretetype(T) || is_array_tuple(T))) || continue
         l = layout(ts, T)
         # the Wasm struct type of T's objects, and what to compare in it
         st, how = if T === String || T === Symbol
@@ -470,7 +470,7 @@ function egal_leaves(ts::Types, @nospecialize(T))
         lf = layout(ts, FT)
         if lf.kind === Inline
             how[r .- off] = egal_leaves(ts, FT)
-        elseif is_vararg_tuple(FT) && lf.elements !== nothing
+        elseif is_array_tuple(FT) && lf.elements !== nothing
             how[first(r) - off] = FT
         end
     end
@@ -669,7 +669,7 @@ function egal_array_elements!(cgm::CGModule, b::Builder, f::Func, st::TypeRef, m
         emit!(b, :i32_reinterpret_f32); emit!(b, :i32_ne)
     elseif stg === I64
         emit!(b, :i64_ne)
-    elseif stg isa RefType && is_vararg_tuple(ml.elem.T) && ml.elem.elements !== nothing
+    elseif stg isa RefType && is_array_tuple(ml.elem.T) && ml.elem.elements !== nothing
         call!(b, tuple_egal_func!(cgm, ml.elem.T, egal)); emit!(b, :i32_eqz)
     elseif stg isa RefType
         # (references to objects, or to boxes of the elements: compared with jl_egal)

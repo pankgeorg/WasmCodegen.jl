@@ -70,7 +70,7 @@ end
 "The elements of the tuple value `t`."
 function tuple_elements(fc::FnCtx, t::CGVal)
     T = t.typ
-    (T isa DataType && T <: Tuple && isconcretetype(T)) ||
+    (T isa DataType && T <: Tuple && (isconcretetype(T) || is_erased_tuple(T))) ||
         unsupported("the elements of a tuple of type ", T)
     return CGVal[get_field(fc, t, i) for i in 1:fieldcount(T)]
 end
@@ -390,6 +390,8 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
         return outlined_memorynew!(fc, constant_value(args[1]), args[2])
     elseif f === Core._apply_iterate
         return emit_apply_iterate!(fc, args, typ)
+    elseif f === Core._expr
+        return new_expr!(fc, args[1]::CGVal, CGVal[a for a in args[2:end]])
     elseif f === Core.fieldtype && length(args) == 2 && args[1] isa CGVal && isconstant(args[1]) &&
            constant_value(args[1]) isa DataType && isconcretetype(constant_value(args[1])) &&
            args[2] isa CGVal && (args[2].typ === Symbol || args[2].typ <: Integer)
@@ -1113,6 +1115,45 @@ memory_type(@nospecialize(R)) = GenericMemory{R.parameters[1],R.parameters[2],R.
 eltype_intersects(@nospecialize(A), @nospecialize(B)) = typeintersect(A, B) !== Union{}
 
 """
+    new_expr!(fc, head, args) -> CGVal
+
+`Core._expr(head, args...)`, what `Expr(head, args...)` calls: an `Expr` whose arguments
+are a new `Vector{Any}` of the values `args`.
+"""
+function new_expr!(fc::FnCtx, head::CGVal, args::Vector{CGVal})
+    if !(head.typ <: Symbol)
+        head = emit_builtin!(fc, Core.typeassert, Any[head, const_value(fc, Symbol)], Symbol)::CGVal
+        head.kind === Bottom && return head
+    end
+    v = call_runtime!(fc, Runtime.Exprs.expr_args, CGVal[const_value(fc, length(args))])
+    for (i, a) in enumerate(args)
+        call_runtime!(fc, Runtime.Exprs.set_arg!, CGVal[v, const_value(fc, i), convert_repr(fc, a, Any)])
+    end
+    return emit_new!(fc, Expr, CGVal[convert_repr(fc, head, Symbol), v])
+end
+
+"""
+    splat_expr!(fc, xs) -> CGVal
+
+`Core._apply_iterate(iterate, Expr, xs...)`, `Expr(xs...)` with the elements of the
+iterables `xs` (tuples, vectors): the elements collected in a `Vector{Any}`, of which the
+first is the head.
+"""
+function splat_expr!(fc::FnCtx, xs::Vector{CGVal})
+    v = call_runtime!(fc, Runtime.Exprs.expr_args, CGVal[const_value(fc, 0)])
+    for x in xs
+        if x.typ isa DataType && x.typ <: Tuple && isconcretetype(x.typ)
+            for e in tuple_elements(fc, x)
+                call_runtime!(fc, Runtime.Exprs.push_arg!, CGVal[v, convert_repr(fc, e, Any)])
+            end
+        else
+            call_runtime!(fc, Runtime.Exprs.append_args!, CGVal[v, x])
+        end
+    end
+    return call_runtime!(fc, Runtime.Exprs.expr_from_args, CGVal[v])
+end
+
+"""
     emit_apply_iterate!(fc, args, typ) -> CGVal
 
 `Core._apply_iterate(iterate, f, xs...)`, the call of `f` with the elements of the `xs`
@@ -1120,6 +1161,7 @@ eltype_intersects(@nospecialize(A), @nospecialize(B)) = typeintersect(A, B) !== 
 """
 function emit_apply_iterate!(fc::FnCtx, args::Vector{Any}, @nospecialize(typ))
     f = args[2]::CGVal
+    isconstant(f) && constant_value(f) === Expr && return splat_expr!(fc, CGVal[a for a in args[3:end]])
     (isconstant(f) && constant_value(f) === Core.tuple) ||
         unsupported("splatting into a call of ", isconstant(f) ? constant_value(f) : f.typ)
     xs = CGVal[a for a in args[3:end]]

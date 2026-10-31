@@ -199,6 +199,16 @@ function image_field(@nospecialize(x), i::Int)
 end
 
 """
+The fields the image leaves undefined: the binding of a `GlobalRef` (the C runtime's
+object of the global, which refers back to `GlobalRef`s: a cycle through an immutable
+object). Globals are the module's own, by name; a `GlobalRef` value is its module and name.
+"""
+const IMAGE_UNDEF_FIELDS = ((GlobalRef, :binding),)
+
+image_field_defined(@nospecialize(x), i::Int) =
+    isdefined(x, i) && !((typeof(x), fieldname(typeof(x), i)) in IMAGE_UNDEF_FIELDS)
+
+"""
     const_leaves(img, x, FT) -> Vector{Inst}
 
 The leaves of the value `x` stored where the declared type is `FT` (a field, an
@@ -447,7 +457,7 @@ function struct_global!(img::Image, @nospecialize(x), l::Layout)
     try
         for i in 1:fieldcount(T)
             FT = fieldtype(T, i)
-            if isdefined(x, i)
+            if image_field_defined(x, i)
                 raw = (T, fieldname(T, i)) in img.cgm.config.image_pointer_fields
                 append!(init, field_init!(img, image_field(x, i), FT, back, first(l.fields[i]) - 1; raw_pointer=raw))
             else

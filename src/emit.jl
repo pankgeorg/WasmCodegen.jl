@@ -459,7 +459,7 @@ function same_repr(fc::FnCtx, @nospecialize(S), @nospecialize(T))
                all(i -> ls.leaves[i].type == lt.leaves[i].type, eachindex(lt.leaves))
     elseif ls.kind === Boxed && lt.kind === Boxed
         # (a tuple of unknown length as an object is of its concrete type: see `convert_repr`)
-        return ls.wtype == lt.wtype || (lt.wtype == fc.cgm.types.jlvalue && !is_vararg_tuple(S))
+        return ls.wtype == lt.wtype || (lt.wtype == fc.cgm.types.jlvalue && !is_array_tuple(S))
     end
     return false
 end
@@ -1079,7 +1079,7 @@ function convert_repr(fc::FnCtx, v, @nospecialize(T))
     else # Boxed
         if lt.wtype == fc.cgm.types.jlvalue
             # an abstract type: any object (a tuple of unknown length: of its concrete type)
-            if is_vararg_tuple(v.typ) && lv.elements !== nothing
+            if is_array_tuple(v.typ) && lv.elements !== nothing
                 isconstant(v) && return box!(fc, v, T)
                 push_val!(fc, v)
                 call!(fc.b, tuple_canon_func!(fc.cgm, v.typ))
@@ -1098,7 +1098,7 @@ function convert_repr(fc::FnCtx, v, @nospecialize(T))
             # a tuple of known length as a tuple of unknown length (an array)
             return new_tuple_array!(fc, T, CGVal[get_field(fc, v, i) for i in 1:fieldcount(v.typ)])
         elseif lv.kind === Boxed && lv.wtype == fc.cgm.types.jlvalue
-            if is_vararg_tuple(T) && lt.elements !== nothing
+            if is_array_tuple(T) && lt.elements !== nothing
                 # any tuple as one of unknown length: an array object
                 push_val!(fc, v)
                 call!(fc.b, tuple_from_func!(fc.cgm, T))

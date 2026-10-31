@@ -153,6 +153,18 @@ end
 "Whether `T` is a tuple type whose length is not known (`Tuple{A, Vararg{B}}`)."
 is_vararg_tuple(@nospecialize T) = T isa DataType && T.name === Tuple.name && Base.isvatuple(T)
 
+"""
+Whether `T` is a tuple type of known length whose values are not inline and of no one
+concrete type (an element of an abstract type: `Tuple{Any,Int}`, whose values are of
+`Tuple{typeof(x),Int}`): its values are objects holding an array of their elements, as those
+of a tuple type of unknown length (see `tuple_array_layout`).
+"""
+is_erased_tuple(@nospecialize T) = T isa DataType && T.name === Tuple.name && !isconcretetype(T) &&
+                                   !Base.isvatuple(T) && !is_inline_tuple(T)
+
+"Whether the values of the tuple type `T` are array objects of `T` (vararg or erased tuples)."
+is_array_tuple(@nospecialize T) = is_vararg_tuple(T) || is_erased_tuple(T)
+
 "The type of the elements of a vararg tuple type: their join."
 function vararg_eltype(@nospecialize T)
     E = Union{}
@@ -261,7 +273,7 @@ function compute_layout(ts::Types, @nospecialize(T))
     # a tuple with singleton `Type{X}` elements (varargs packed by the IR) is not a
     # concrete type, but its values are inline all the same
     is_inline_tuple(T) && return immutable_layout(ts, T)
-    is_vararg_tuple(T) && return tuple_array_layout(ts, T, vararg_eltype(T))
+    is_array_tuple(T) && return tuple_array_layout(ts, T, vararg_eltype(T))
     (T === Core.TypeName || T === Module) && return boxed_layout(ts, T, named_object_type!(ts))
     # a SimpleVector (a type's parameters): its elements in an array, as a large tuple's
     T === Core.SimpleVector && return tuple_array_layout(ts, T, Any)
