@@ -55,11 +55,14 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
     end
     # (the module's gensyms continue the build process's: none repeats one the image holds)
     Runtime.sync_gensym_counter!()
+    t = time_ns()
     mis = Core.MethodInstance[entry_instance(e.f, e.argtypes; world) for e in entries]
     w = collect_world(mis; world, verify=config.verify)
+    progress(config, "collect", t, length(w.order), " functions inferred")
     mode = exception_mode(w)
     local cgm
     while true
+        t = time_ns()
         cgm = CGModule(w, config, mode)
         for (e, mi) in zip(entries, mis)
             info = get_function!(cgm, mi)
@@ -67,6 +70,9 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
         end
         process_worklist!(cgm)
         compile_runtime_cases!(cgm)
+        progress(config, "emit", t, length(cgm.funcs), " functions (exceptions: ", mode, "), ",
+                 length(cgm.diagnostics), " unsupported constructs";
+                 note=string(" (structurizing ", seconds(cgm.structurize_ns), " s)"))
         # the runtime functions the code needed (added to the world as it was emitted) may
         # use exceptions more than the program did: then again, as they need
         m = exception_mode(w)
@@ -76,12 +82,34 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
     if cgm.config.trim === :safe && !isempty(cgm.diagnostics)
         throw(UnsupportedConstructs(cgm.diagnostics))
     end
+    t = time_ns()
     finish_module!(cgm)
+    progress(config, "finish", t, "the image and the tables over types")
+    t = time_ns()
     bytes = to_bytes(cgm.mod)
-    validate && WasmBuilder.validate(bytes)
-    config.optimize === nothing || (bytes = wasm_opt(bytes, config.optimize))
+    progress(config, "write", t, length(bytes), " bytes")
+    if validate
+        t = time_ns()
+        WasmBuilder.validate(bytes)
+        progress(config, "validate", t)
+    end
+    if config.optimize !== nothing
+        t = time_ns()
+        bytes = wasm_opt(bytes, config.optimize)
+        progress(config, "optimize", t, length(bytes), " bytes after wasm-opt ", join(config.optimize.exec, ' '))
+    end
     return Compilation(bytes, w, cgm)
 end
+
+# with `config.progress`, a line on stderr: the phase, what it did, the time since `t` (`time_ns()`)
+function progress(config::Config, phase::String, t::UInt64, what...; note::String="")
+    config.progress || return
+    println(stderr, "WasmCodegen: ", phase, ": ", what..., isempty(what) ? "" : ", ",
+            seconds(time_ns() - t), " s", note)
+    flush(stderr)
+end
+
+seconds(ns) = round(ns / 1e9; digits=1)
 
 compile(f, argtypes::Tuple; kw...) = compile([Entry(f, argtypes)]; kw...)
 
