@@ -47,7 +47,8 @@ const P = TasksProgram
              Dict("fn" => "root_trap", "args" => [10_000_000], "expectTrap" => true),
              Dict("fn" => "discarded", "args" => [70000]),
              Dict("fn" => "pingpong_busy", "args" => [10_000_000], "shutdownAfter" => 20, "expectTrap" => true),
-             Dict("fn" => "sleep_then_print", "shutdownAfter" => 20, "settleAfter" => 300, "expectTrap" => true)]
+             Dict("fn" => "sleep_then_print", "shutdownAfter" => 20, "settleAfter" => 300, "expectTrap" => true),
+             Dict("fn" => "main_safe", "jsHost" => true)]
     out = IOBuffer(); err = IOBuffer()
     cmd = `$(node_cmd()) --disable-warning=ExperimentalWarning $(jspi_flags()) $(joinpath(@__DIR__, "tasks.mjs")) $wasm $(JSON.json(calls))`
     proc = run(pipeline(ignorestatus(cmd); stdout=out, stderr=err))
@@ -67,9 +68,11 @@ const P = TasksProgram
     @test res(1) == 0
     @test stdout_wasm[1:something(findfirst("\ndone\n", stdout_wasm), 0:-1)[end]] == native
     error_lines(ls) = sort!([l for l in ls if !isempty(l) && l != "Stacktrace:" && !startswith(l, ' ') && !startswith(l, "@@ ")])
-    @test error_lines(lines) == error_lines(split(String(take!(native_err)), '\n')) ==
-          ["Error in Timer:", "UNHANDLED TASK ERROR: MyError with code 7", "UNHANDLED TASK ERROR: monitored",
-           "in a callback"]
+    # (each error twice: `main_safe` runs again on js/julia.mjs's WASI, the last call)
+    native_errors = error_lines(split(String(take!(native_err)), '\n'))
+    @test error_lines(lines) == sort!([native_errors; native_errors])
+    @test native_errors == ["Error in Timer:", "UNHANDLED TASK ERROR: MyError with code 7",
+                            "UNHANDLED TASK ERROR: monitored", "in a callback"]
     # (the callback's error as natively without the backtrace: no line break after the text)
     @test occursin("Error in Timer:\nin a callback\n@@ ", errs)
     @test rs[1]["host"]["parked"] == 0 && rs[1]["open"] == 0
@@ -101,6 +104,9 @@ const P = TasksProgram
     @test occursin("shut down", rs[18]["trap"]) && rs[18]["terminal"]
     # ... while a task waits in the host's poll: it does not run any more
     @test occursin("shut down", rs[19]["trap"]) && !occursin("after the shutdown", stdout_wasm)
+    # `main` on js/julia.mjs's WASI (hosts without one): the same stdout as natively
+    @test res(20) == 0 && rs[20]["open"] == 0
+    @test endswith(stdout_wasm, native)
 end
 
 @testset "Config(tasks)" begin
