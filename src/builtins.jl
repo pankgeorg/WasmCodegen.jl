@@ -495,18 +495,7 @@ function get_field_dynamic(fc::FnCtx, x::CGVal, i::CGVal, @nospecialize(typ))
     (T isa DataType && (isconcretetype(T) || (l.kind === Inline && is_inline_tuple(T))) && l.elements === nothing) ||
         unsupported("a field of ", T, " at an index not known at compile time")
     n = fieldcount(T)
-    if i.typ === Symbol
-        # a name that is not a field's: a FieldError
-        name = i
-        i = field_index_of!(fc, T, i)
-        push_val!(fc, i); emit!(fc.b, :i64_eqz)
-        if!(fc.b); throw_error!(fc, Runtime.throw_field_error, () -> convert_repr(fc, const_value(fc, T), Any), name); end!(fc.b)
-    end
-    idx = convert_repr(fc, i, Int)
-    # out of bounds: a BoundsError
-    push_val!(fc, idx); emit!(fc.b, :i64_const, 1); emit!(fc.b, :i64_sub)
-    emit!(fc.b, :i64_const, n); emit!(fc.b, :i64_ge_u)
-    if!(fc.b); throw_error!(fc, Runtime.throw_bounds_error, () -> convert_repr(fc, x, Any), idx); end!(fc.b)
+    idx = checked_field_index!(fc, x, i)
     if T <: Tuple && l.kind === Inline && is_homogeneous_tuple(T) && n > 4
         E = fieldtype(T, 1)
         ml = memory_layout(fc.cgm.types, E)
@@ -519,7 +508,30 @@ function get_field_dynamic(fc::FnCtx, x::CGVal, i::CGVal, @nospecialize(typ))
         end
     end
     res = new_val!(fc, typ)
-    # a chain of ifs on the index, the last field otherwise
+    for_field_at!(k -> assign!(fc, res, get_field(fc, x, k)), fc, idx, n)
+    return res
+end
+
+# the index (an Int) of the field of `x` at the run-time index or name `i`, checked: out of
+# bounds a BoundsError, a name that is not a field's a FieldError
+function checked_field_index!(fc::FnCtx, x::CGVal, i::CGVal)
+    T = x.typ
+    if i.typ === Symbol
+        name = i
+        i = field_index_of!(fc, T, i)
+        push_val!(fc, i); emit!(fc.b, :i64_eqz)
+        if!(fc.b); throw_error!(fc, Runtime.throw_field_error, () -> convert_repr(fc, const_value(fc, T), Any), name); end!(fc.b)
+    end
+    idx = convert_repr(fc, i, Int)
+    push_val!(fc, idx); emit!(fc.b, :i64_const, 1); emit!(fc.b, :i64_sub)
+    emit!(fc.b, :i64_const, fieldcount(T)); emit!(fc.b, :i64_ge_u)
+    if!(fc.b); throw_error!(fc, Runtime.throw_bounds_error, () -> convert_repr(fc, x, Any), idx); end!(fc.b)
+    return idx
+end
+
+# emit `f(k)` for the field `k` (of `n`) that the checked index `idx` is: a chain of ifs on
+# the index, the last field otherwise
+function for_field_at!(f, fc::FnCtx, idx::CGVal, n::Int)
     for k in 1:n
         if k < n
             push_val!(fc, idx)
@@ -527,13 +539,38 @@ function get_field_dynamic(fc::FnCtx, x::CGVal, i::CGVal, @nospecialize(typ))
             emit!(fc.b, :i64_eq)
             if!(fc.b); open_label!(fc)
         end
-        assign!(fc, res, get_field(fc, x, k))
+        f(k)
         k < n && else!(fc.b)
     end
     for k in 1:n-1
         end!(fc.b); close_label!(fc)
     end
-    return res
+end
+
+"""
+    emit_split_field!(fc, ex, typ) -> Union{CGVal,SplitUnion}
+
+The statement `getfield(x, i)` of `analyze_split_unions!`, of the union of concrete types
+`typ`: for an inline tuple `x` of concrete element types, a `SplitUnion` (each field assigns
+the value of its member and the tag); otherwise the field as `emit_stmt!` has it.
+"""
+function emit_split_field!(fc::FnCtx, ex::Expr, @nospecialize(typ))
+    x, i = operand(fc, ex.args[2]), operand(fc, ex.args[3])
+    (x isa CGVal && i isa CGVal && !isconstant(i) && i.typ !== Symbol) || return emit_stmt!(fc, ex, typ)
+    T = x.typ
+    ms = Base.uniontypes(typ)
+    (T isa DataType && T <: Tuple && !Base.isvatuple(T) && isconcretetype(T) &&
+     layout(fc, T).kind === Inline && fieldcount(T) > 0 &&
+     all(k -> any(M -> M === fieldtype(T, k), ms), 1:fieldcount(T))) || return emit_stmt!(fc, ex, typ)
+    idx = checked_field_index!(fc, x, i)
+    tag = new_local!(fc, I32)
+    vals = CGVal[new_val!(fc, M) for M in ms]
+    for_field_at!(fc, idx, fieldcount(T)) do k
+        m = findfirst(M -> M === fieldtype(T, k), ms)
+        emit!(fc.b, :i32_const, m); emit!(fc.b, :local_set, tag)
+        assign!(fc, vals[m], get_field(fc, x, k))
+    end
+    return SplitUnion(typ, ms, tag, vals)
 end
 
 # the index of the field of `T` named by the symbol `s` (an Int), 0 if there is none
@@ -845,6 +882,18 @@ end
 
 `isa(x, T)`: known at compile time from the type of `x`, or a test of its type id.
 """
+function emit_isa!(fc::FnCtx, x::SplitUnion, @nospecialize(T))
+    possible = findall(M -> M <: x.typ, x.members)
+    hits = filter(m -> x.members[m] <: T, possible)
+    isempty(hits) && return const_value(fc, false)
+    length(hits) == length(possible) && return const_value(fc, true)
+    for (j, m) in enumerate(hits)
+        emit!(fc.b, :local_get, x.tag); emit!(fc.b, :i32_const, m); emit!(fc.b, :i32_eq)
+        j > 1 && emit!(fc.b, :i32_or)
+    end
+    return pop_val!(fc, Bool)
+end
+
 function emit_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
     S = x.typ
     S <: T && return const_value(fc, true)
