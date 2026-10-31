@@ -185,9 +185,10 @@ end
 # requires of the yields replacing phis: validate everything else.
 # Loops stay `LoopOp`s and `WhileOp`s, with their own exit conditions: promoting them to
 # counting `ForOp`s gains nothing on Wasm, and a `ForOp` has neither the signedness of the
-# comparison it came from (`ult_int`) nor room for an inclusive bound at `typemax`
+# comparison it came from (`ult_int`) nor room for an inclusive bound at `typemax`.
+# try/catch the program keeps (`prepare_ir`) becomes `TryOp`s.
 function structurize(ir::CC.IRCode)
-    sci = StructuredIRCode(ir; validate=false, promote=false)
+    sci = StructuredIRCode(ir; validate=false, promote=false, exceptions=:structured)
     IRStructurizer.validate_scf(sci.entry)
     IRStructurizer.validate_no_phis(sci.entry)
     return sci
