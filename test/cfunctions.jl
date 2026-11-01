@@ -1,5 +1,6 @@
 # C function pointers, and FunctionWrappers built on them with no code of its own in the compiler.
 using FunctionWrappers: FunctionWrapper
+import FunctionWrappers
 
 add1(x::Float64) = x + 1.0
 twice(x::Int32, y::Float64) = 2.0 * x + y
@@ -53,6 +54,31 @@ end
 fw_vector_result(x::Float64) = FunctionWrapper{Vector{Float64}, Tuple{Float64}}(y -> [y, y + 1])(x)[2]
 fw_any(x::Float64) = FunctionWrapper{Any, Tuple{Float64}}(y -> y + 1)(x)::Float64
 
+# a wrapper of the image: its pointers are null there, and the program sets them
+const IMG = FunctionWrapper{Float64, Tuple{Float64}}(Scale(2.0))
+function set_wrapper!(w::FunctionWrapper{Ret, Args}, ::Type{T}) where {Ret, Args, T}
+    w.ptr = FunctionWrappers.gen_fptr(Ret, Args, T)
+    w.objptr = Base.unsafe_convert(Ref{T}, w.obj::Base.RefValue{T})
+    return nothing
+end
+fw_image(x::Float64) = (set_wrapper!(IMG, Scale); IMG(x))
+function null_img()
+    p, o = IMG.ptr, IMG.objptr
+    IMG.ptr = C_NULL; IMG.objptr = C_NULL
+    return () -> (IMG.ptr = p; IMG.objptr = o; nothing)
+end
+
+# an exception crosses a C function pointer
+fails(x::Float64) = x > 0.0 ? throw(DomainError(x)) : x
+function fw_throw(x::Float64)
+    w = FunctionWrapper{Float64, Tuple{Float64}}(fails)
+    try
+        return w(x)
+    catch e
+        return e isa DomainError ? 7.0 : 8.0
+    end
+end
+
 @testset "C function pointers" begin
     for (f, args) in ((cf_direct, (1.5,)), (cf_two, (0.5,)), (cf_select, (1, 4.0)), (cf_select, (2, 4.0)),
                       (cf_null, (1.0,)), (fw_inline, (1.5, 2.0)), (fw_mutable, (3,)),
@@ -62,4 +88,9 @@ fw_any(x::Float64) = FunctionWrapper{Any, Tuple{Float64}}(y -> y + 1)(x)::Float6
         expected = f(args...)
         @test wasm_run(c, string(nameof(f)), args...; rettype = typeof(expected)) === expected
     end
+    c = compile(fw_throw, (Float64,); config = WasmCodegen.Config(verify = :off))
+    @test wasm_run(c, "fw_throw", 1.0; rettype = Float64) === 7.0
+    @test wasm_run(c, "fw_throw", -1.0; rettype = Float64) === -1.0
+    c = compile(fw_image, (Float64,); config = WasmCodegen.Config(verify = :off, pre_image_hooks = Any[null_img]))
+    @test wasm_run(c, "fw_image", 1.5; rettype = Float64) === fw_image(1.5)
 end
