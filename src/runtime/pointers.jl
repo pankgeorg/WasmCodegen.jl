@@ -85,3 +85,6 @@ no pointers into it); natively, Base's stores. Only for such elements (`trim/was
     Base.@_gc_preserve_end t
     return nothing
 end
+
+"The value of type `S` that a `cfunction` argument of type `Ref{S}` refers to, held by the `RefValue` `o`."
+c_ref_value(::Type{S}, @nospecialize(o)) where {S} = (o::Base.RefValue{S}).x
