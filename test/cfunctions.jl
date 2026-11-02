@@ -129,6 +129,47 @@ struct HoldsVector
     v::Vector{Float64}
 end
 (h::HoldsVector)(x::Float64) = h.v[1] + x
+isptr(x::Any) = x isa Ptr{Float64}
+function c_any_pointer(x::Float64)
+    v = [x]
+    return GC.@preserve v ccall(@cfunction(isptr, Bool, (Any,)), Bool, (Any,), pointer(v))
+end
+c_any_null_pointer(x::Float64) = ccall(@cfunction(isptr, Bool, (Any,)), Bool, (Any,), Ptr{Float64}(0))
+function fw_any_pointer(x::Float64)
+    v = [x]
+    w = FunctionWrapper{Bool, Tuple{Any}}(isptr)
+    return GC.@preserve v w(pointer(v))
+end
+objaddress(v::Vector{Float64}) = pointer_from_objref(v)
+function c_ptr_result_as_ref(x::Float64)
+    v = [x]
+    p = @cfunction(objaddress, Ptr{Cvoid}, (Ref{Vector{Float64}},))
+    return GC.@preserve v ccall(p, Ref{Vector{Float64}}, (Any,), v)[1]
+end
+function c_ref_result_as_ptr(x::Float64)
+    p = @cfunction(identity, Ref{Vector{Float64}}, (Ref{Vector{Float64}},))
+    v = [x]
+    return GC.@preserve v (unsafe_pointer_to_objref(ccall(p, Ptr{Cvoid}, (Any,), v))::Vector{Float64})[1]
+end
+function c_any_result_as_ptr(x::Float64)
+    p = @cfunction(identity, Any, (Any,))
+    v = [x]
+    return GC.@preserve v (unsafe_pointer_to_objref(ccall(p, Ptr{Cvoid}, (Any,), v))::Vector{Float64})[1]
+end
+function c_ptr_result_as_any(x::Float64)
+    v = [x]
+    p = @cfunction(objaddress, Ptr{Cvoid}, (Ref{Vector{Float64}},))
+    return GC.@preserve v (ccall(p, Any, (Any,), v)::Vector{Float64})[1]
+end
+struct InlineReference
+    a::String
+    b::Float64
+end
+field_b(v::InlineReference) = v.b
+function c_ref_into_inline_array(x::Float64)
+    a = [InlineReference("a", 1.0), InlineReference("b", x)]
+    return ccall(@cfunction(field_b, Float64, (Ref{InlineReference},)), Float64, (Ref{InlineReference},), Ref(a, 2))
+end
 const STORED = AF[]
 function fw_stored(x::Float64)
     push!(STORED, AF(HoldsVector([x])))
@@ -221,6 +262,9 @@ end
     P = CFunctionPrograms
     cases = [(P.c_direct, (1.5,)), (P.c_scalars, (0.5,)), (P.c_select, (1, 4.0)), (P.c_select, (2, 4.0)),
              (P.c_notnull, (1.0,)), (P.c_copies, (1.0,)), (P.c_distinct, (1.0,)), (P.c_roundtrip, (1.0,)),
+             (P.c_any_pointer, (1.5,)), (P.c_any_null_pointer, (1.5,)), (P.fw_any_pointer, (1.5,)),
+             (P.c_ptr_result_as_ref, (1.5,)), (P.c_ref_result_as_ptr, (1.5,)), (P.c_any_result_as_ptr, (1.5,)),
+             (P.c_ptr_result_as_any, (1.5,)), (P.c_ref_into_inline_array, (1.5,)),
              (P.c_ref_of_bits, (1.5,)), (P.c_ref_into_array, (1.5,)), (P.c_write_through, (1.5,)),
              (P.c_object_ref, (1.5,)), (P.c_object_address, (1.5,)), (P.c_ref_result, (1.5,)),
              (P.c_any_result, (1.5,)), (P.c_void_result, (1.5,)),

@@ -19,9 +19,6 @@ is_ref_type(@nospecialize(T)) = T isa DataType && T.name === Ref.body.name
 "Whether values of type `T` in a C signature are C pointers."
 c_pointer_slot(@nospecialize(T)) = T === Any || is_ptr_type(T) || is_ref_type(T) || !Base.allocatedinline(T)
 
-"The Julia type carried by a C function's result declared as `rt` (`Ref{T}`: an object)."
-c_result_type(@nospecialize(rt)) = is_ref_type(rt) ? Any : rt
-
 "The type a Julia function receives for an argument of type `T` of a C signature."
 c_julia_type(@nospecialize(T)) = is_ref_type(T) ? T.parameters[1] : T
 
@@ -38,28 +35,42 @@ function check_c_signature(@nospecialize(rt), argts::Vector{Any})
     foreach(check_c_type, argts)
 end
 
+"The Wasm values of a C value of type `T`."
+function c_valtypes(cgm::CGModule, @nospecialize(T))
+    c_pointer_slot(T) && return ValType[I64, jlvalue_ref(cgm.types)]
+    return layout(cgm, T).kind === Ghost ? ValType[] : valtypes(cgm, T)
+end
+
 "The Wasm parameters and results of the C signature `(argts) -> rt`."
 function c_signature(cgm::CGModule, @nospecialize(rt), argts::Vector{Any})
     params = ValType[]
     for T in argts
-        if c_pointer_slot(T)
-            push!(params, I64, jlvalue_ref(cgm.types))
-        else
-            append!(params, valtypes(cgm, T))
-        end
+        append!(params, c_valtypes(cgm, T))
     end
-    R = c_result_type(rt)
-    return params, layout(cgm, R).kind === Ghost ? ValType[] : valtypes(cgm, R)
+    return params, c_valtypes(cgm, rt)
+end
+
+"Pushes the value `v` as a C value of the declared type `T`; a value declared `Any` is an object, whatever its type."
+function push_c_value!(fc::FnCtx, v::CGVal, @nospecialize(T))
+    if !c_pointer_slot(T)
+        layout(fc, T).kind === Ghost || push_val!(fc, convert_repr(fc, v, T))
+    elseif T !== Any && is_ptr_type(v.typ)
+        push_val!(fc, v)
+    else
+        emit!(fc.b, :i64_const, Int64(0))
+        push_val!(fc, convert_repr(fc, v, Any))
+    end
+    return
 end
 
 """
     c_argument(fc, T, a, o) -> CGVal
 
-The argument of type `T` of a `cfunction`, from the locals of its C pointer, its address `a`
-and object `o`. A `Ref{S}` is the object for an `S` stored by reference, else the value of
-type `S` at the pointer.
+The Julia value of a C pointer of declared type `T`, an argument of a `cfunction` or the result
+of a `ccall`, from the locals of its address `a` and object `o`. A `Ref{S}` is the object for an
+`S` stored by reference, else the value of type `S` at the pointer.
 """
-function c_argument(fc::FnCtx, @nospecialize(T), a::Int, o::Int)
+function c_argument(fc::FnCtx, @nospecialize(T), a, o)
     x = CGVal(Any, Boxed, LeafVal[o])
     if is_ptr_type(T)
         # an object the caller passed as such: its address
@@ -88,7 +99,6 @@ arguments, of the function type of the C signature.
 function cfunction_thunk!(fc::FnCtx, @nospecialize(f), @nospecialize(rt), argts::Vector{Any})
     cgm = fc.cgm
     info = runtime_function!(cgm, f, Tuple(Any[c_julia_type(T) for T in argts]))
-    R = c_result_type(rt)
     want = c_julia_type(rt)
     want === Any || info.rettype <: want ||
         unsupported("a cfunction whose function returns ", info.rettype, ", not ", rt)
@@ -111,11 +121,7 @@ function cfunction_thunk!(fc::FnCtx, @nospecialize(f), @nospecialize(rt), argts:
     end
     r = emit_call_info!(hfc, info, vals)
     if !is_unreachable(hfc.b)
-        if r.kind === Bottom
-            unreachable!(hfc.b)
-        elseif layout(cgm, R).kind !== Ghost
-            push_val!(hfc, convert_repr(hfc, r, R))
-        end
+        r.kind === Bottom ? unreachable!(hfc.b) : push_c_value!(hfc, r, rt)
     end
     finish!(hfc.b)
     return t
@@ -225,21 +231,18 @@ function emit_indirect_ccall!(fc::FnCtx, target::CGVal, ex::Expr, args::Vector{A
     calls = get!(() -> Dict{TypeRef,Any}(), cgm.helpers, :cfunction_calls)
     haskey(calls, sig) || (calls[sig] = (fc.info.mi, rt, argts))
     for (v, T) in zip(args, argts)
-        v = v::CGVal
-        if !c_pointer_slot(T)
-            push_val!(fc, convert_repr(fc, v, T))
-        elseif is_ptr_type(v.typ)
-            push_val!(fc, v)
-        else
-            emit!(fc.b, :i64_const, Int64(0))
-            push_val!(fc, convert_repr(fc, v, Any))
-        end
+        push_c_value!(fc, v::CGVal, T)
     end
     push_val!(fc, ptr_address(target))
     call!(fc.b, cfunction_target!(fc, sig))
     emit!(fc.b, :call_ref, sig)
-    R = c_result_type(rt)
-    layout(fc, R).kind === Ghost && return ghost(rt, something(ghost_value(rt)))
-    v = pop_val!(fc, R)
-    return R === rt ? v : convert_repr(fc, v, typ)
+    if c_pointer_slot(rt)
+        o = new_local!(fc, jlvalue_ref(cgm.types))
+        a = new_local!(fc, I64)
+        emit!(fc.b, :local_set, o)
+        emit!(fc.b, :local_set, a)
+        return convert_repr(fc, c_argument(fc, rt, a, o), typ)
+    end
+    layout(fc, rt).kind === Ghost && return ghost(rt, something(ghost_value(rt)))
+    return pop_val!(fc, rt)
 end

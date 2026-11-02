@@ -366,8 +366,8 @@ references: WasmBuilder has no tables, and the task runners are kept the same wa
 `cfunction`'s pointer has no owner and its address is a slot of the table, so it survives a
 round trip through an integer; `ccall` through a pointer reads the slot, checks the function's
 Wasm type and calls it. Every C pointer (`Ptr`, `Ref`, `Any`, a type stored by reference) has
-one Wasm form in a signature, an address and an object, because the two sides declare them
-differently. Unsupported: a `cfunction` of a closure value (`$f`), of a function not known at
+one Wasm form in a signature, argument or result, an address and an object, because the two
+sides declare them differently. Unsupported: a `cfunction` of a closure value (`$f`), of a function not known at
 compile time, or of abstract types; `Ref{T}` of an abstract `T`; a function whose result is not
 the declared one; variadic calls; a call through a constant pointer, or of a signature no
 `cfunction` of the module has. They are reported when the module is compiled. A pointer that
