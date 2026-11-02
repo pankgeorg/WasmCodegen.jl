@@ -42,6 +42,18 @@ twosigs() = ccall((:twice, LIBM), Cdouble, (Cdouble,), 1.0) + ccall((:twice, LIB
 noreturn() = ccall((:abort2, LIBM), Union{}, ())
 shadow(p::Ptr{Cvoid}) = ccall((:free, "libfoo.so"), Cvoid, (Ptr{Cvoid},), p)
 shadow() = shadow(C_NULL)
+# (distinct libraries that normalize to one name)
+same_basename() = ccall((:library_version, "/one/libsame.so"), Cint, ()) + ccall((:library_version, "/two/libsame.so"), Cint, ())
+same_other_symbols() = ccall((:a, "/one/libsame.so"), Cint, ()) + ccall((:b, "/two/libsame.so"), Cint, ())
+dotted_libs() = ccall((:version, "/one/libfoo.v1.so"), Cint, ()) + ccall((:version, "/two/libfoo.v2.so"), Cint, ())
+# (the runtime's, through the name of their library)
+explicit_strlen() = ccall((:strlen, "libc.so.6"), Csize_t, (Cstring,), "abc")
+explicit_utf(x::UInt32) = ccall((:utf8proc_tolower, "libutf8proc"), UInt32, (UInt32,), x)
+# (a library the program would fail to find is not answered by the function's name)
+global never_set_library::String
+unset_builtin() = ccall((:jl_getpagesize, never_set_library), Clong, ())
+const WASI_LAZY = LazyLibrary("wasi_snapshot_preview1")
+lazy_wasi() = ccall((:sched_yield, WASI_LAZY), Int32, ())
 shadow2() = ccall((:memchr, "libfoo.so"), Ptr{Cvoid}, (Ptr{Cvoid}, Cint, Csize_t), C_NULL, 0, 0)
 
 
@@ -84,14 +96,26 @@ end
     @test occursin("a pointer in its signature", message(cstr_res))
     @test occursin("the type ComplexF64", message(struct_val))
     @test occursin("printf2", message(variadic))
+    for f in (same_basename, same_other_symbols)
+        @test occursin("has the same name, libsame", message(f))
+    end
+    @test occursin("has the same name, libfoo", message(dotted_libs))
+    @test occursin("has no value when the module is compiled", message(unset_builtin))
+    @test occursin("jl_getpagesize", message(unset_builtin))
+    @test occursin("the host function sched_yield", message(lazy_wasi))
 end
 
 @testset "not C calls" begin
-    @test occursin("the foreign call", message(unset))
+    @test occursin("its library Main.unset_lib has no value", message(unset))
     @test occursin("the foreign call sin2", message(bare))
     @test occursin("Regex", message(hinted))
     # BLAS is the runtime's, by its library
     c = compile([(blas, (Int,))]; config=raw)
+    @test isempty(requirements(c))
+    @test !any(f -> f.imported !== nothing && startswith(f.imported[1], "c:"), c.cgm.mod.funcs)
+    # the runtime's, naming their libraries, are still the runtime's
+    @test isempty(reqs(explicit_strlen))
+    c = compile([(explicit_utf, (UInt32,))]; config=raw)
     @test isempty(requirements(c))
     @test !any(f -> f.imported !== nothing && startswith(f.imported[1], "c:"), c.cgm.mod.funcs)
     # WASI stays the host's

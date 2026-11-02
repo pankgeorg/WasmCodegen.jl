@@ -141,6 +141,7 @@ end
 "The function signatures of a module whose types are all plain functions: its type section's, and the function's types."
 function signatures(b::Vector{UInt8})
     s = section(b, 1)
+    s === nothing && return Tuple{Vector{Symbol},Vector{Symbol}}[]
     n, i = leb(b, s[2])
     valtype(x) = x == 0x7f ? :i32 : x == 0x7e ? :i64 : x == 0x7d ? :f32 : x == 0x7c ? :f64 : Symbol("t", x)
     types = Tuple{Vector{Symbol},Vector{Symbol}}[]
@@ -177,11 +178,12 @@ function imports(b::Vector{UInt8})
     return out
 end
 
-"The size in bytes of the body of the function `idx` of a module with no imports."
+"The size in bytes of the body of the function `idx` of a module."
 function body_size(b::Vector{UInt8}, idx::Int)
     s = section(b, 10)
     n, i = leb(b, s[2])
-    for k in 0:n-1
+    first = length(imports(b))
+    for k in first:first+n-1
         size, i = leb(b, i)
         k == idx && return size
         i += size
@@ -214,9 +216,27 @@ function c_module(reqs::Vector{CRequirement}, archive::String, dir::String)
     syms = unique(r.symbol for r in reqs)
     log = joinpath(dir, "wasm-ld.log")
     cmd = `$(wasm_ld()) -mwasm64 --no-entry --fatal-warnings --stack-first -z stack-size=65536
-           $(["--export-if-defined=" * s for s in syms]) --export-if-defined=__wasm_call_ctors $archive -o $out`
-    success(pipeline(ignorestatus(cmd); stdout=log, stderr=log)) || fail("wasm-ld failed for ", join(syms, ", "), ":\n", read(log, String))
+           $(["--export-if-defined=" * s for s in syms]) $archive -o $out`
+    success(pipeline(cmd; stdout=log, stderr=log)) || fail("wasm-ld failed for ", join(syms, ", "), ":\n", read(log, String))
     return out
+end
+
+"""
+Refuses an archive with a constructor in any member. A link extracts only the members it needs, so
+one holding a constructor can be left out with nothing to show for it, and the code it initializes
+runs uninitialized: the whole archive is linked to see them all.
+"""
+function check_constructors(archive::String, lib::String, dir::String)
+    out = joinpath(dir, "whole-archive.wasm")
+    log = joinpath(dir, "whole-archive.log")
+    cmd = `$(wasm_ld()) -mwasm64 --no-entry --unresolved-symbols=ignore-all --allow-multiple-definition
+           --export-if-defined=__wasm_call_ctors --whole-archive $archive -o $out`
+    success(pipeline(cmd; stdout=log, stderr=log)) || fail("wasm-ld failed on all of ", lib, ":\n", read(log, String))
+    b = read(out)
+    es = Dict(e[1] => e[3] for e in exports(b) if e[2] == 0x00)
+    # (a body of nothing: no locals, `end`)
+    !haskey(es, "__wasm_call_ctors") || body_size(b, es["__wasm_call_ctors"]) <= 2 ||
+        fail(lib, " has constructors, whose order against the module's initialization this linker does not define")
 end
 
 function check_c_module(reqs::Vector{CRequirement}, path::String)
@@ -229,14 +249,11 @@ function check_c_module(reqs::Vector{CRequirement}, path::String)
         have = sigs[es[r.symbol]+1]
         have == want || fail(r.symbol, " of ", r.library, ": declared as ", want, ", and the provider's takes and returns ", have)
     end
-    # (a body of nothing: no locals, `end`)
-    !haskey(es, "__wasm_call_ctors") || body_size(b, es["__wasm_call_ctors"]) <= 2 ||
-        fail("the C library has constructors, whose order against the module's initialization this linker does not define")
 end
 
 function write_records(dir, reqs, p, versions, inputs, outputs, memories)
     open(joinpath(dir, "requirements.toml"), "w") do io
-        TOML.print(io, Dict("function" => [Dict("library" => r.library, "symbol" => r.symbol,
+        TOML.print(io, Dict("function" => [Dict("library" => r.library, "path" => r.path, "symbol" => r.symbol,
                                                 "package" => r.package === nothing ? "" : string(r.package.uuid),
                                                 "returns" => string(r.rettype), "takes" => string.(r.argtypes)) for r in reqs]))
     end
@@ -260,6 +277,7 @@ function link(c::Compilation, dir::AbstractString; provider::Provider, optimize:
     versions = check_toolchain(toolchain)
     check_provider(reqs, provider, toolchain)
     archive = provider_archive(provider, reqs[1].library)
+    check_constructors(archive, reqs[1].library, dir)
     clib = c_module(reqs, archive, dir)
     check_c_module(reqs, clib)
     jl = joinpath(dir, "julia.wasm")

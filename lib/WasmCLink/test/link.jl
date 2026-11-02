@@ -66,6 +66,7 @@ wrong_arity() = ccall((:sin, OpenLibm_jll.libopenlibm), Cdouble, (Cdouble, Cdoub
 other_lib() = ccall((:f, "libother.so"), Cdouble, (Cdouble,), 0.5)
 two_libs() = good() + other_lib()
 ctor() = ccall((:ctor_f, "libopenlibm"), Cdouble, (Cdouble,), 0.5)
+split_ctor() = reinterpret(UInt64, ccall((:ctor_split, "libopenlibm"), Cdouble, (Cdouble,), 0.5))
 undef() = ccall((:undef_f, "libopenlibm"), Cdouble, (Cdouble,), 0.5)
 nolib() = 1.0
 
@@ -137,6 +138,8 @@ end
     end
     @testset "C code" begin
         refused("has constructors", compile([(ctor, ())]; config=raw), variant(identity; archive=fixture("libctor.a")))
+        # (in a member of the archive the link would not extract)
+        refused("has constructors", compile([(split_ctor, ())]; config=raw), variant(identity; archive=fixture("libsplitctor.a")))
         refused("wasm-ld failed", compile([(undef, ())]; config=raw), variant(identity; archive=fixture("libundef.a")))
     end
 end
