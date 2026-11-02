@@ -397,7 +397,8 @@ them: a case that cannot be compiled traps there, and is not an error of the pro
 function compile_runtime_cases!(cgm::CGModule)
     with_optional_config(cgm) do
         while true
-            n = add_reflection_types!(cgm) + add_objectid_cases!(cgm) + add_tuple_cases!(cgm)
+            n = add_reflection_types!(cgm) + add_objectid_cases!(cgm) + add_tuple_cases!(cgm) +
+                add_dynamic_call_cases!(cgm)
             n == 0 && break
             process_worklist!(cgm)
         end
@@ -429,6 +430,107 @@ function with_optional_config(f, cgm::CGModule)
             info === nothing || push!(get!(() -> Any[], cgm.image.suppressed, info), d)
         end
         resize!(cgm.diagnostics, ndiag)
+    end
+end
+
+## calls of function values whose types are known only at run time
+
+"""
+    dynamic_call_func!(cgm, F, A) -> Func
+
+`jl_dynamic_call(f::\$JlValue, args...) -> RefValue{Any}`: `f(args...)`, for an `f` of the
+abstract type `F` and arguments of types `A`, by the type of `f`: of each callable type of the
+closed world, the code of the call (`Runtime.dynamic_call_as`, compiled with the module's code,
+see `compile_runtime_cases!`). Generated when the module's types are known; a type it has no
+case for traps.
+"""
+dynamic_call_func!(cgm::CGModule, @nospecialize(F), A::Tuple) = get!(cgm.helpers, (:dynamic_call, F, A)) do
+    params = ValType[jlvalue_ref(cgm.types)]
+    foreach(a -> append!(params, valtypes(cgm, a)), A)
+    add_func!(cgm.mod, "jl_dynamic_call_" * string(length(cgm.helpers)), params, valtypes(cgm, Base.RefValue{Any}))
+end
+
+"The value of the call `f(args...)` of a function value of a type known only at run time."
+function emit_dynamic_call!(fc::FnCtx, f::CGVal, args::Vector{CGVal}, @nospecialize(typ))
+    A = Tuple(a.typ for a in args)
+    length(A) <= 4 || unsupported("a call of a function value of type ", f.typ, " with ", length(A), " arguments")
+    func = dynamic_call_func!(fc.cgm, f.typ, A)
+    push_val!(fc, convert_repr(fc, f, Any))
+    foreach(a -> push_val!(fc, a), args)
+    call!(fc.b, func)
+    r = pop_val!(fc, Base.RefValue{Any})
+    x = call_runtime!(fc, Runtime.dynamic_call_result, CGVal[r])
+    return typ === Any ? x : convert_repr(fc, x, typ)
+end
+
+# the types of the objects the image holds
+function image_types(img)
+    s = IdSet{Any}(keys(img.singletons))
+    for d in (img.globals, img.boxes), k in keys(d)
+        push!(s, typeof(k))
+    end
+    return s
+end
+
+# a type whose values a call of a function value of type `F` with arguments `A` may run
+function dynamic_call_case_type(cgm::CGModule, @nospecialize(T), @nospecialize(F), A::Tuple)
+    (objectid_case_type(cgm.types, T) && T <: F) || return false
+    (T <: Core.Builtin || T <: Core.IntrinsicFunction) && return false
+    return Base._which(Tuple{T,A...}; world=cgm.world.world, raise=false) !== nothing
+end
+
+# the cases of each `jl_dynamic_call` (the number of cases added)
+function add_dynamic_call_cases!(cgm::CGModule)
+    sites = [k for k in keys(cgm.helpers) if k isa Tuple && k[1] === :dynamic_call]
+    isempty(sites) && return 0
+    ts = cgm.types
+    only_image = get(ENV, "WCG_DYNAMIC_CALL_TIER", "all") == "image"
+    held = only_image ? image_types(cgm.image) : nothing
+    added = 0
+    for k in sites
+        F, A = k[2], k[3]
+        cases = get!(() -> Dict{Int,FuncInfo}(), cgm.helpers, (:dynamic_cases, F, A))
+        for (id, T) in enumerate(copy(ts.typelist))
+            haskey(cases, id) && continue
+            only_image && !(T in held) && continue
+            dynamic_call_case_type(cgm, T, F, A) || continue
+            cases[id] = runtime_function!(cgm, Runtime.dynamic_call_as, (Any, Type{T}, A...))
+            added += 1
+        end
+    end
+    return added
+end
+
+function finish_dynamic_calls!(cgm::CGModule)
+    trace = get(ENV, "WCG_DYNAMIC_CALL_TRACE", "") == "1"
+    ts = cgm.types
+    for (k, func) in collect(cgm.helpers)
+        (k isa Tuple && k[1] === :dynamic_call) || continue
+        cases = get(cgm.helpers, (:dynamic_cases, k[2], k[3]), Dict{Int,FuncInfo}())
+        if trace
+            println(stderr, "dynamic call: f::", k[2], " args ", map(a -> first(string(a), 70), k[3]), ": ", length(cases), " cases, ",
+                    length(ts.typelist), " types in the module")
+            for id in sort!(collect(keys(cases)))
+                println(stderr, "  case ", first(string(ts.typelist[id]), 150))
+            end
+        end
+        b = Builder(cgm.mod, func)
+        n = sum(a -> length(valtypes(cgm, a)), k[3]; init=0) + 1
+        tid = add_local!(func, I32)
+        emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :local_set, tid)
+        for id in sort!(collect(keys(cases)))
+            info = cases[id]
+            emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+            if!(b)
+            for i in 0:n-1
+                emit!(b, :local_get, i)
+            end
+            call!(b, info.func)
+            layout(cgm, info.rettype).kind === Bottom ? unreachable!(b) : emit!(b, :return)
+            end!(b)
+        end
+        unreachable!(b)
+        finish!(b)
     end
 end
 

@@ -123,3 +123,16 @@ bits_hash(x::NTuple{N,UInt8}) where {N} = murmur3_h2(i -> x[i + 1], N, 0xcafe888
 at run time (see `objectid_any_func!`).
 """
 @noinline objectid_as(@nospecialize(x), ::Type{T}) where {T} = objectid(x::T)
+
+"""
+    dynamic_call_as(f, T, args...)
+
+`f(args...)` for an `f` of type `T`, the case of `T` of a call of a function value of a type
+known only at run time. The result in a `RefValue{Any}`, one form for every case.
+"""
+@noinline dynamic_call_as(@nospecialize(f), ::Type{T}) where {T} = Base.RefValue{Any}((f::T)())
+@noinline dynamic_call_as(@nospecialize(f), ::Type{T}, a) where {T} = Base.RefValue{Any}((f::T)(a))
+@noinline dynamic_call_as(@nospecialize(f), ::Type{T}, a, b) where {T} = Base.RefValue{Any}((f::T)(a, b))
+@noinline dynamic_call_as(@nospecialize(f), ::Type{T}, a, b, c) where {T} = Base.RefValue{Any}((f::T)(a, b, c))
+@noinline dynamic_call_as(@nospecialize(f), ::Type{T}, a, b, c, d) where {T} = Base.RefValue{Any}((f::T)(a, b, c, d))
+dynamic_call_result(r::Base.RefValue{Any}) = r.x
