@@ -87,11 +87,13 @@ no pointers into it); natively, Base's stores. Only for such elements (`trim/was
 end
 
 """
-The value of type `S`, stored inline, that a `cfunction` argument of type `Ref{S}` refers to:
-the pointer `p`, whose owner is `o`, into a `Ref` of it or a `Memory` of it (the low 32 bits of an
-address are the byte offset in its owner), or to its bytes when it has no references.
+The value of type `S`, stored inline, that a C pointer declared `Ref{S}` refers to: the object
+`o` itself when it is an `S`, or through the pointer `p`, whose owner is `o`, into a `Ref` of it or
+a `Memory` of it (the low 32 bits of an address are the byte offset in its owner), or to its bytes
+when it has no references.
 """
 function c_ref_value(::Type{S}, p::Ptr{Cvoid}, @nospecialize(o)) where {S}
+    o isa S && return o
     o isa Base.RefValue{S} && return o.x
     isbitstype(S) && return unsafe_load(Ptr{S}(p))
     o isa Memory{S} && return o[Int(UInt(p) % UInt32) ÷ Base.aligned_sizeof(S) + 1]

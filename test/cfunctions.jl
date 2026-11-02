@@ -170,6 +170,17 @@ function c_ref_into_inline_array(x::Float64)
     a = [InlineReference("a", 1.0), InlineReference("b", x)]
     return ccall(@cfunction(field_b, Float64, (Ref{InlineReference},)), Float64, (Ref{InlineReference},), Ref(a, 2))
 end
+new_inline(x::Float64) = InlineReference("returned", x)
+null_pointer(::Float64) = C_NULL
+c_ref_inline_result(x::Float64) = ccall(@cfunction(new_inline, Ref{InlineReference}, (Float64,)), Ref{InlineReference}, (Float64,), x).b
+c_ref_bits_result(x::Float64) = ccall(@cfunction(add1, Ref{Float64}, (Float64,)), Ref{Float64}, (Float64,), x)
+c_ref_pointer_result(x::Float64) =
+    ccall(@cfunction(null_pointer, Ref{Ptr{Cvoid}}, (Float64,)), Ref{Ptr{Cvoid}}, (Float64,), x) == C_NULL
+read_ref(r::Float64) = 2.0 * r
+c_any_as_ref(x::Float64) = ccall(@cfunction(read_ref, Float64, (Ref{Float64},)), Float64, (Any,), x)
+is_null(p::Ptr{Cvoid}) = p == C_NULL
+c_ref_of_pointer(::Float64) = ccall(@cfunction(is_null, Bool, (Ref{Ptr{Cvoid}},)), Bool, (Ref{Ptr{Cvoid}},), Ref(C_NULL))
+c_ref_bits_result_as_ptr(x::Float64) = ccall(@cfunction(add1, Ref{Float64}, (Float64,)), Ptr{Cvoid}, (Float64,), x) != C_NULL
 const STORED = AF[]
 function fw_stored(x::Float64)
     push!(STORED, AF(HoldsVector([x])))
@@ -265,6 +276,8 @@ end
              (P.c_any_pointer, (1.5,)), (P.c_any_null_pointer, (1.5,)), (P.fw_any_pointer, (1.5,)),
              (P.c_ptr_result_as_ref, (1.5,)), (P.c_ref_result_as_ptr, (1.5,)), (P.c_any_result_as_ptr, (1.5,)),
              (P.c_ptr_result_as_any, (1.5,)), (P.c_ref_into_inline_array, (1.5,)),
+             (P.c_ref_inline_result, (1.5,)), (P.c_ref_bits_result, (1.5,)), (P.c_ref_pointer_result, (1.5,)),
+             (P.c_any_as_ref, (1.5,)), (P.c_ref_of_pointer, (1.5,)), (P.c_ref_bits_result_as_ptr, (1.5,)),
              (P.c_ref_of_bits, (1.5,)), (P.c_ref_into_array, (1.5,)), (P.c_write_through, (1.5,)),
              (P.c_object_ref, (1.5,)), (P.c_object_address, (1.5,)), (P.c_ref_result, (1.5,)),
              (P.c_any_result, (1.5,)), (P.c_void_result, (1.5,)),

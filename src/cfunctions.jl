@@ -50,6 +50,13 @@ function c_signature(cgm::CGModule, @nospecialize(rt), argts::Vector{Any})
     return params, c_valtypes(cgm, rt)
 end
 
+"Pushes the object of the value `v`, as a C pointer."
+function push_c_object!(fc::FnCtx, v::CGVal)
+    emit!(fc.b, :i64_const, Int64(0))
+    push_val!(fc, convert_repr(fc, v, Any))
+    return
+end
+
 "Pushes the value `v` as a C value of the declared type `T`; a value declared `Any` is an object, whatever its type."
 function push_c_value!(fc::FnCtx, v::CGVal, @nospecialize(T))
     if !c_pointer_slot(T)
@@ -57,9 +64,14 @@ function push_c_value!(fc::FnCtx, v::CGVal, @nospecialize(T))
     elseif T !== Any && is_ptr_type(v.typ)
         push_val!(fc, v)
     else
-        emit!(fc.b, :i64_const, Int64(0))
-        push_val!(fc, convert_repr(fc, v, Any))
+        push_c_object!(fc, v)
     end
+    return
+end
+
+"Pushes the result `r` of a `cfunction`'s function: a result declared `Ref{S}` is the object of its `S`, even for an `S` that is a `Ptr`."
+function push_c_result!(fc::FnCtx, r::CGVal, @nospecialize(rt))
+    is_ref_type(rt) ? push_c_object!(fc, r) : push_c_value!(fc, r, rt)
     return
 end
 
@@ -68,7 +80,7 @@ end
 
 The Julia value of a C pointer of declared type `T`, an argument of a `cfunction` or the result
 of a `ccall`, from the locals of its address `a` and object `o`. A `Ref{S}` is the object for an
-`S` stored by reference, else the value of type `S` at the pointer.
+`S` stored by reference, else the value of type `S` the pointer refers to.
 """
 function c_argument(fc::FnCtx, @nospecialize(T), a, o)
     x = CGVal(Any, Boxed, LeafVal[o])
@@ -121,7 +133,7 @@ function cfunction_thunk!(fc::FnCtx, @nospecialize(f), @nospecialize(rt), argts:
     end
     r = emit_call_info!(hfc, info, vals)
     if !is_unreachable(hfc.b)
-        r.kind === Bottom ? unreachable!(hfc.b) : push_c_value!(hfc, r, rt)
+        r.kind === Bottom ? unreachable!(hfc.b) : push_c_result!(hfc, r, rt)
     end
     finish!(hfc.b)
     return t
