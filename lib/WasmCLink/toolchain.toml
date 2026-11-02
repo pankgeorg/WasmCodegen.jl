@@ -1,0 +1,4 @@
+# The link tools this linker was tested with. Other versions are refused, not guessed at.
+abi = "wasm64-lp64-freestanding-v0"
+binaryen = "130"
+lld = "20.1.8"

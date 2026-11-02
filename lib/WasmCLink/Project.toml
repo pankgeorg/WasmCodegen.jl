@@ -1,0 +1,13 @@
+name = "WasmCLink"
+uuid = "9a7f3b52-6f0e-4d8a-8d1c-3e1f5a7c2b44"
+version = "0.1.0"
+
+[deps]
+Binaryen_jll = "a54ac8ab-712d-5a0e-8e11-9296c0d3c20e"
+LLD_jll = "d55e3150-da41-5e91-b323-ecfd1eec6109"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
+WasmCodegen = "5b0f1d7e-3c2a-4e8b-9a61-7d2f4c8e1a93"
+
+[compat]
+julia = "1.12, 1.13"

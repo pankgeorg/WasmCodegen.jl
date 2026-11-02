@@ -1,6 +1,6 @@
 # Foreign calls: the few calls into Julia's C runtime that Base's code makes for things
 # Wasm does natively (allocation, strings as bytes, copies of memory). Others are
-# unsupported; calls into C libraries need runtime functions or host imports.
+# unsupported; calls into C libraries need runtime functions or host imports (`clibrary.jl`).
 
 function foreigncall_name(@nospecialize(x))
     x isa QuoteNode && (x = x.value)
@@ -20,20 +20,27 @@ end
 # the library of a foreign call `ccall((name, library), ...)` given as a constant string, in
 # the forms `foreigncall_name` accepts
 function foreigncall_library(@nospecialize(x))
-    x isa QuoteNode && (x = x.value)
-    x isa Tuple && return length(x) == 2 && x[2] isa String ? x[2] : nothing
     x isa GlobalRef && isconst(x.mod, x.name) && return foreigncall_library(getglobal(x.mod, x.name))
-    lib = if x isa Expr && x.head === :call && length(x.args) == 3 && x.args[1] === Core.tuple
+    lib = foreigncall_parts(x)[2]
+    return lib isa String ? lib : nothing
+end
+
+# the name and the library of the target `(name, library)` of a foreign call, unquoted, or nothings
+function foreigncall_parts(@nospecialize(x))
+    x isa QuoteNode && (x = x.value)
+    parts = if x isa Tuple && length(x) == 2
+        x
+    elseif x isa Expr && x.head === :call && length(x.args) == 3 && x.args[1] === Core.tuple
         # `Core.tuple(name, library)` (Julia 1.12)
-        x.args[3]
+        (x.args[2], x.args[3])
     elseif x isa Expr && x.head === :tuple && length(x.args) == 2
         # (name, library) (Julia 1.13)
-        x.args[2]
+        (x.args[1], x.args[2])
     else
-        nothing
+        return (nothing, nothing)
     end
-    lib isa QuoteNode && (lib = lib.value)
-    return lib isa String ? lib : nothing
+    unquote(y) = y isa QuoteNode ? y.value : y
+    return (unquote(parts[1]), unquote(parts[2]))
 end
 
 "The libraries whose functions are the host's: a `ccall` of one is a call of a Wasm import."
@@ -62,7 +69,12 @@ function emit_import_ccall!(fc::FnCtx, lib::String, name::Symbol, ex::Expr, args
               "UInt64 (or Cvoid as its result): $RT ($(join(ATs, ", ")))")
     # (its pointers are offsets of the runtime's part of the memory: `Runtime.Staging`)
     lib == "wasi_snapshot_preview1" && staging_memory!(fc.cgm)
-    wt(T) = sizeof(T) == 8 ? I64 : I32
+    return call_scalar_import!(fc, lib, name, RT, ATs, args)
+end
+
+# a call of the Wasm import `lib.name`, of numbers of the Julia types `ATs` and `RT`
+function call_scalar_import!(fc::FnCtx, lib::AbstractString, name::Symbol, @nospecialize(RT), ATs::Core.SimpleVector, args::Vector{Any})
+    wt(T) = T === Float64 ? F64 : T === Float32 ? F32 : sizeof(T) == 8 ? I64 : I32
     params = ValType[wt(T) for T in ATs]
     results = RT === Cvoid ? ValType[] : ValType[wt(RT)]
     for (a, T) in zip(args, ATs)
@@ -80,6 +92,8 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     if lib !== nothing && lib in IMPORT_LIBRARIES && name !== nothing
         return emit_import_ccall!(fc, lib, name, ex, args)
     end
+    clib = c_library(fc, ex.args[1])
+    clib === nothing || return emit_c_ccall!(fc, clib..., ex, args)
     if name === nothing && is_llvmcall(ex.args[5])
         iname = llvm_intrinsic_name(ex.args[1])
         iname === nothing || return emit_llvm_intrinsic!(fc, iname, args, typ)

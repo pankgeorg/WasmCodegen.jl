@@ -1,0 +1,12 @@
+name = "OpenLibm_wasm_jll"
+uuid = "2f0c4e6e-1d1a-4b7e-9c55-7a3e6d2b9f10"
+version = "0.8.7+0"
+
+[deps]
+Artifacts = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
+JLLWrappers = "692b3bcd-3c85-4b1f-b108-f13ce0eb3210"
+Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
+
+[compat]
+JLLWrappers = "1.7.0"
+julia = "1.6"

@@ -1,0 +1,7 @@
+# Not hosted. build_openlibm.sh and mk_openlibm_provider.jl make the tarball and set this URL.
+[OpenLibm_wasm]
+git-tree-sha1 = "42b8de0bc4d863b1ee96b09020aac19dd02b00cf"
+
+    [[OpenLibm_wasm.download]]
+    sha256 = "bc6085c40b25f65673b04ac230dc2be8e7b4ab7066ec69552cc404a6e4f73f24"
+    url = "https://example.invalid/OpenLibm_wasm.v0.8.7.any.tar.gz"

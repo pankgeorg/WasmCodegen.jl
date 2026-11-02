@@ -25,6 +25,11 @@ struct Compilation
     cgm::CGModule
 end
 
+"The C library functions a compiled module imports (`CRequirement`s), in a stable order."
+requirements(c::Compilation) =
+    sort!(collect(values(get(c.cgm.helpers, :c_requirements, Dict{Tuple{String,String},CRequirement}())));
+          by=r -> (r.library, r.symbol))
+
 """
     compile(entries; config=Config(), validate=true) -> Compilation
 
