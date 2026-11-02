@@ -125,6 +125,16 @@ function fw_throw(x::Float64)
     end
 end
 
+struct HoldsVector
+    v::Vector{Float64}
+end
+(h::HoldsVector)(x::Float64) = h.v[1] + x
+const STORED = AF[]
+function fw_stored(x::Float64)
+    push!(STORED, AF(HoldsVector([x])))
+    return STORED[end](x)
+end
+
 ## wrappers of the image: their pointers are null there and the program sets them
 
 function set_wrapper!(w::FunctionWrapper{Ret, Args}, ::Type{T}) where {Ret, Args, T}
@@ -242,6 +252,11 @@ end
     @test wasm_run(c, "img_closure", 1.5; rettype = Float64) === P.img_closure(1.5)
     @test wasm_run(c, "img_cycle", 1.5; rettype = Float64) === P.img_cycle(1.5)
     @test wasm_run(c, "img_mutable", 3; rettype = Int) === 8
+
+    # calling a wrapper asks nothing of its callable's type at run time: no type names in the module
+    c = compile(P.fw_stored, (Float64,); config = WasmCodegen.Config(verify = :off))
+    @test wasm_run(c, "fw_stored", 1.5; rettype = Float64) === P.fw_stored(1.5)
+    @test isempty(c.cgm.mod.datas)
 
     # a wrapper of the image with its native pointers is refused
     @test_throws WasmCodegen.UnsupportedConstructs compile(P.img_inline, (Float64,); config = WasmCodegen.Config(verify = :off))
