@@ -80,11 +80,11 @@ a mode provider is installed. Default modes do not enforce access or guarantee 0
 privacy for temporary files/directories. Access checks approximate owner bits, not ACLs or
 effective credentials. Preview 1 metadata timestamps cannot represent times before 1970.
 
-File IOStreams write synchronously to the host; `flush` has no pending file output to drain
-and does not promise durability. After read-ahead, writing or truncating requires a successful
-rewind; nonseekable duplex descriptors fail this transition and retain their read buffer.
-Writes retry EINTR from the unwritten suffix; EAGAIN is reported without waiting for host
-readiness. An error after a partial write can leave a prefix written. Raw `jl_fs_read`,
+File IOStreams buffer as Julia's `ios.c` does (32 KiB; writes held until a flush, a seek, a
+read or a close; reads larger than most of the buffer read directly); `flush` does not promise
+durability. Writes out retry EINTR, EAGAIN and no progress from the unwritten suffix, as
+`ios.c`; an error after a partial write leaves that prefix written and is the flush's or the
+close's error. Raw `jl_fs_read`,
 `jl_fs_write` and `jl_fs_sendfile` return counts or negative errors, permit short IO, and cap
 each request at 1 MiB. Julia's complete-read/write wrappers loop above that interface.
 Positional IO uses `fd_pread`/`fd_pwrite` and never moves the source/current file offset.

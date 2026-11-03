@@ -121,6 +121,241 @@ fs_ops(k::Int) = (out = IOBuffer(); fs_ops(k, out); String(take!(out)))
 # (in Wasm, each record written out at once)
 fs_print(k::Int) = (fs_ops(k, Core.stdout); Int32(0))
 
+# `IOStream`s, buffered as ios.c buffers them (32 KiB, writes held until a flush, a seek or a
+# close): what a stream holds, reads and writes out, seen through other handles on the file
+
+# write `b` at `pos` of `f`, through a handle of its own
+poke(f::String, pos::Int, b::UInt8) = (open(h -> (seek(h, pos); write(h, b)), f, "r+"); nothing)
+
+function ios_ops(k::Int, out::IO)
+    dir = joinpath(ROOT, string("i", k))
+    mkpath(dir)
+    rec(xs...) = (print(out, xs...); println(out))
+    attempt(f, what) = try
+        rec(what, " => ", f())
+    catch e
+        rec(what, " !! ", err_text(e, dir))
+    end
+    # a byte changed behind the stream 40 000 bytes in (past what native buffers), read
+    # after a skip or a `read!` from the first byte
+    z = joinpath(dir, "z")
+    write(z, zeros(UInt8, 100_000))
+    open(z) do io
+        read(io, UInt8)
+        poke(z, 40_000, 0x7f)
+        skip(io, 39_999)
+        rec("skip ", read(io, UInt8), " ", position(io), " ", bytesavailable(io))
+    end
+    open(z) do io
+        read(io, UInt8)
+        poke(z, 40_001, 0x7e)
+        read!(io, Vector{UInt8}(undef, 40_000))
+        rec("read! ", read(io, UInt8), " ", position(io), " ", bytesavailable(io))
+    end
+    # a read of more than most of the buffer (read directly, nothing buffered), then a skip back
+    open(z) do io
+        b = read!(io, Vector{UInt8}(undef, 40_000))
+        poke(z, 39_999, 0x55)
+        rec("direct ", b[end], " ", bytesavailable(io))
+        skip(io, -1)
+        rec("skip back ", read(io, UInt8), " ", bytesavailable(io))
+    end
+    # reads of most of the buffer and across its end, then skips into what native holds and
+    # past it
+    write(z, zeros(UInt8, 100_000))
+    open(z) do io
+        read!(io, Vector{UInt8}(undef, 30_000))
+        rec("most ", bytesavailable(io))
+        foreach(p -> poke(z, p, 0x01), (29_999, 32_767, 32_768, 33_000))
+        skip(io, -1)
+        rec("back ", read(io, UInt8), " ", bytesavailable(io))
+        skip(io, 2_767)
+        rec("end ", read(io, UInt8), " ", read(io, UInt8), " ", bytesavailable(io))
+        skip(io, -1_000)
+        rec("again ", read(io, UInt8), " ", position(io))
+        b = read!(io, Vector{UInt8}(undef, 2_000))
+        rec("across ", sum(b), " ", bytesavailable(io), " ", position(io))
+        foreach(p -> poke(z, p, 0x02), (33_500, 64_000, 66_000))
+        skip(io, 33_500 - position(io))
+        rec("held ", read(io, UInt8), " ", bytesavailable(io))
+        skip(io, 64_000 - position(io))
+        rec("far ", read(io, UInt8), " ", bytesavailable(io))
+        skip(io, 66_000 - position(io))
+        rec("past ", read(io, UInt8), " ", bytesavailable(io))
+    end
+    # integers across the buffer's end (the rest moved back, the buffer refilled)
+    write(z, UInt8[i % UInt8 for i in 0:99_999])
+    open(z) do io
+        read(io, UInt8)
+        skip(io, 32_765)
+        rec("int ", read(io, Int32), " ", read(io, UInt16), " ", bytesavailable(io))
+        poke(z, 65_000, 0xaa)
+        poke(z, 65_600, 0xbb)
+        skip(io, 65_000 - position(io))
+        rec("moved ", read(io, UInt8), " ", bytesavailable(io))
+        skip(io, 65_600 - position(io))
+        rec("then ", read(io, UInt8), " ", read(io, Int64), " ", bytesavailable(io))
+    end
+    # one read call (`all=false`): directly when large
+    open(z) do io
+        b = UInt8[]
+        rec("some ", readbytes!(io, b, 50_000; all=false), " ", bytesavailable(io))
+        rec("some ", readbytes!(io, b, 100; all=false), " ", bytesavailable(io))
+        rec("some ", readbytes!(io, b, 40_000; all=false), " ", bytesavailable(io), " ", position(io))
+    end
+    # writes, held until a flush or a close; past the buffer, what it holds goes first, then
+    # a large write directly
+    g = joinpath(dir, "g")
+    open(g, "w") do io
+        write(io, "hello")
+        rec("unflushed ", repr(read(g, String)), " ", position(io), " ", filesize(io))
+        flush(io)
+        rec("flushed ", repr(read(g, String)), " ", position(io))
+        write(io, " world")
+        write(io, UInt8('!'))
+        rec("again ", repr(read(g, String)), " ", position(io), " ", bytesavailable(io))
+    end
+    rec("closed ", repr(read(g, String)))
+    open(g, "w") do io
+        write(io, "abc")
+        write(io, fill(UInt8('x'), 40_000))
+        rec("large ", filesize(g), " ", position(io))
+        write(io, fill(UInt8('y'), 30_000))
+        rec("most ", filesize(g))
+        write(io, fill(UInt8('z'), 5_000))
+        rec("over ", filesize(g), " ", position(io))
+        for _ in 1:30_000
+            write(io, UInt8('w'))
+        end
+        rec("putc ", filesize(g), " ", position(io))
+    end
+    rec("all ", filesize(g))
+    tp, tio = mktemp(dir)
+    write(tio, "temp")
+    rec("mktemp ", filesize(tp), " ", position(tio))
+    close(tio)
+    rec("mktemp closed ", filesize(tp))
+    # a write then a read on one stream, and seeks, skips and positions around held writes
+    h = joinpath(dir, "h")
+    write(h, "abcdefghij")
+    open(h, "r+") do io
+        rec("r+ ", repr(String(read(io, 2))))
+        write(io, "XY")
+        rec("written ", repr(read(h, String)), " ", position(io), " ", bytesavailable(io))
+        rec("read ", repr(String(read(io, 3))), " ", position(io), " ", repr(read(h, String)))
+        seek(io, 0)
+        write(io, "12345")
+        skip(io, -3)
+        write(io, "Z")
+        rec("skips ", position(io), " ", bytesavailable(io), " ", repr(read(h, String)))
+        skip(io, 1)
+        write(io, "W")
+        rec("skip in ", position(io), " ", repr(read(h, String)))
+        flush(io)
+        rec("flush ", position(io), " ", repr(read(h, String)))
+        seek(io, 0)
+        write(io, "l1\nl2\n")
+        skip(io, -6)
+        rec("lines ", repr(readline(io)), " ", repr(readline(io; keep=true)), " ", position(io), " ",
+            repr(read(h, String)))
+        write(io, "Q")
+        rec("peek ", peek(io), " ", position(io), " ", repr(read(h, String)))
+        seek(io, 14)
+        write(io, "e")
+        rec("end ", position(io), " ", filesize(io), " ", filesize(h))
+    end
+    rec("r+ closed ", repr(read(h, String)))
+    # lines, delimiters, peek, eof, mark and reset; a line across the buffer's end
+    t = joinpath(dir, "t")
+    write(t, "one\r\ntwo\nthree,four;five\n", "y"^40_000, "\nlast")
+    open(t) do io
+        rec("readline ", repr(readline(io)), " ", repr(readline(io; keep=true)), " ", bytesavailable(io))
+        rec("readuntil ", repr(String(readuntil(io, UInt8(',')))), " ", repr(String(readuntil(io, UInt8(';'); keep=true))))
+        rec("peek ", peek(io), " ", position(io), " eof ", eof(io))
+        mark(io)
+        rec("marked ", repr(readline(io)), " ", position(io))
+        reset(io)
+        rec("reset ", position(io), " ", bytesavailable(io), " ", repr(readline(io)))
+        rec("long ", length(readline(io)), " ", position(io), " ", bytesavailable(io))
+        rec("last ", repr(readline(io)), " eof ", eof(io), " ", repr(readline(io)), " ", bytesavailable(io))
+        attempt(() -> peek(io), "peek at the end")
+        attempt(() -> read(io, UInt8), "read at the end")
+    end
+    open(t) do io
+        rec("available ", length(readavailable(io)), " ", length(readavailable(io)), " ", bytesavailable(io))
+        rec("rest ", length(read(io)), " eof ", eof(io))
+        seek(io, 3)
+        rec("from 3 ", length(read(io, String)))
+    end
+    # the end of the input stays until a seek, unless `eof` reads more
+    s = joinpath(dir, "s")
+    write(s, "ab")
+    open(s) do io
+        seekend(io)
+        open(a -> write(a, "cd"), s, "a")
+        attempt(() -> read(io, UInt8), "sticky")
+        rec("eof ", eof(io), " ", bytesavailable(io))
+        rec("then ", read(io, UInt8), " ", position(io))
+        rec("rest ", repr(read(io, String)), " eof ", eof(io))
+        open(a -> write(a, "e"), s, "a")
+        attempt(() -> read(io, UInt8), "grown")
+        rec("eof again ", eof(io))
+        attempt(() -> read(io, UInt8), "read again")
+    end
+    # truncation, with held writes and with read data past the new end (below the position:
+    # a negative count of bytes available, natively)
+    u = joinpath(dir, "u")
+    open(u, "w+") do io
+        write(io, fill(UInt8('a'), 100))
+        truncate(io, 50)
+        rec("truncate ", position(io), " ", filesize(io), " ", filesize(u))
+        write(io, "b")
+        rec("after ", position(io), " ", filesize(u))
+    end
+    rec("truncated ", filesize(u), " ", count(==(0x00), read(u)))
+    write(u, fill(UInt8('c'), 1_000))
+    open(u, "r+") do io
+        read(io, 10)
+        truncate(io, 500)
+        rec("read truncate ", position(io), " ", bytesavailable(io), " ", length(read(io)), " eof ", eof(io))
+    end
+    open(u, "r+") do io
+        read(io, 10)
+        truncate(io, 5)
+        rec("below ", bytesavailable(io), " ", position(io), " ", filesize(io))
+    end
+    # a closed stream keeps its state: its cached position, its flags
+    cio = open(h, "r+")
+    seek(cio, 5)
+    close(cio)
+    rec("closed ", isopen(cio), " ", isreadable(cio), " ", iswritable(cio), " ", eof(cio), " ", bytesavailable(cio))
+    attempt(() -> position(cio), "closed position")
+    attempt(() -> write(cio, "x"), "closed write")
+    attempt(() -> position(cio), "closed position after")
+    attempt(() -> read(cio, UInt8), "closed read")
+    attempt(() -> length(read(cio)), "closed read all")
+    attempt(() -> (skip(cio, 0); 0), "closed skip 0")
+    attempt(() -> (seek(cio, 0); 0), "closed seek")
+    attempt(() -> (flush(cio); 0), "closed flush")
+    attempt(() -> (close(cio); 0), "closed close")
+    # errors
+    open(h) do io
+        attempt(() -> (seek(io, -1); position(io)), "seek -1")
+        read(io, UInt8)
+        attempt(() -> (skip(io, -5); position(io)), "skip before the start")
+        rec("pos ", position(io), " ", bytesavailable(io))
+        attempt(() -> write(io, "x"), "write read-only")
+    end
+    open(g, "w") do io
+        attempt(() -> read(io, UInt8), "read write-only")
+        rec("eof write-only ", eof(io))
+    end
+    rm(dir; recursive=true)
+    return nothing
+end
+ios_ops(k::Int) = (out = IOBuffer(); ios_ops(k, out); String(take!(out)))
+ios_print(k::Int) = (ios_ops(k, Core.stdout); Int32(0))
+
 # a host without file modes: files 0o644, directories 0o755, chmod is ENOTSUP
 function fs_modes(k::Int)
     dir = joinpath(ROOT, string("m", k))
@@ -216,40 +451,25 @@ function raw_io(k::Int)
 end
 
 # Fault tests supplement the native comparison with deterministic host failures.
-function reconcile_fault(k::Int)
-    p = joinpath(ROOT, string("rewind", k))
-    write(p, "abcdef")
-    io = open(p, "r+")
-    read(io, UInt8)
-    code = try
-        k == 3 ? truncate(io, 2) : k == 2 ? write(io, UInt8('X')) : k == 5 ? write(io, "X") : write(io, "XX")
-        0
-    catch e
-        e isa SystemError ? -Int32(e.errnum) : e isa Base.IOError ? e.code : Int32(1)
-    end
-    # The next byte must still come from the preserved buffer after the failed rewind.
-    kept = read(io, UInt8) == UInt8('b')
-    close(io)
-    unchanged = read(p, String) == "abcdef"
-    rm(p)
-    return Int32(code == (k == 4 ? Base.UV_EACCES : Base.UV_EIO) && kept && unchanged)
-end
-
+# (an `IOStream` writes out at a flush, as ios.c: after a short write the rest, again after
+# an interruption, a host not ready (EAGAIN) or no progress; an error is the flush's, after
+# the bytes written before it)
 function retry_write(k::Int)
     p = joinpath(ROOT, string("retry", k))
     io = open(p, "w")
     code = try
         write(io, "abcdef")
+        flush(io)
         Int32(0)
     catch e
-        e isa Base.IOError ? e.code : Int32(1)
+        e isa SystemError ? Int32(e.errnum) : e isa Base.IOError ? e.code : Int32(1)
     end
     close(io)
     b = read(p, String)
     rm(p)
     # No whole-write retries: a committed prefix occurs exactly once.
-    expected = k == 1 ? "abcdef" : "ab"
-    error = k == 1 ? Int32(0) : k == 2 ? Base.UV_EIO : k == 3 ? Base.UV_ENOSPC : Base.UV_EAGAIN
+    expected = k == 3 ? "ab" : "abcdef"
+    error = k == 3 ? Int32(28) : Int32(0)   # (ENOSPC)
     return Int32(code == error && b == expected)
 end
 
@@ -433,7 +653,8 @@ function errno_fault(k::Int)
         io = open(p, "r+")
         k == 7 && read(io, UInt8)
         try
-            k == 3 || k == 7 ? truncate(io, 2) : position(io)
+            # (a seek of the host: a skip past the buffer; `position` is ios.c's cached one)
+            k == 3 ? truncate(io, 2) : skip(io, 100)
         catch e
             code = e isa SystemError ? Int32(e.errnum) : Int32(-1)
         end
@@ -500,11 +721,6 @@ strerror_sum(k::Int) = Int32(sum(codeunits(Base.Libc.strerror(k))))
         WasmCodegen.compile(f, (Int,); config=cfg)
     end, string(nameof(f)), k;
         rettype=Int32, preopens=Dict(ROOT => ROOT), wasi_faults=faults)
-    for k in 1:5
-        errno = k == 4 ? 76 : 29 # denied seek rights and injected EIO
-        @test fault_run(reconcile_fault, k, [Dict("call" => "fd_seek", "negativeSeek" => true,
-            "at" => 1, "errno" => errno)]) == 1
-    end
     for k in 1:4
         faults = [Dict("call" => "fd_write", "at" => 1, "maxBytes" => 2),
                   Dict("call" => "fd_write", "at" => 2, "errno" => (k == 1 ? 27 : k == 2 ? 0 : k == 3 ? 51 : 6))]
@@ -605,6 +821,16 @@ strerror_sum(k::Int) = Int32(sum(codeunits(Base.Libc.strerror(k))))
     end
     # (for JavaScript, unsupported)
     @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(fs_print, (Int,))
+end
+
+@testset "IOStream buffering over WASI" begin
+    expected = ios_ops(1)
+    @test run_fs(ios_print, 2) == 0
+    @test LAST_OUTPUT[] == expected
+    # (the records that differ)
+    for (n, w) in zip(split(expected, '\n'), split(LAST_OUTPUT[], '\n'))
+        n == w || println(Core.stdout, "IOStream: native ", repr(n), "\n wasm ", repr(w))
+    end
 end
 
 end

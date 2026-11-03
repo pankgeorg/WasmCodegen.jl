@@ -881,6 +881,7 @@ function jl_lseek(fd::RawFD, offset::Int64, whence::Cint)
     r == 0 || (set_errno(libc_errno(r)); return Int64(-1))
     return reinterpret(Int64, Staging.load64(Staging.SCRATCH_OUT))
 end
+
 "`uv_fs_ftruncate(loop, req, fd, n, cb)`."
 function uv_fs_ftruncate(loop::Ptr{Cvoid}, req::Ptr{Cvoid}, fd::RawFD, n::Int64, cb::Ptr{Cvoid})
     n < 0 && return Int32(Base.UV_EINVAL)
@@ -905,262 +906,76 @@ end
 "`getpid()`: the process of the host is not the program's: 1."
 getpid() = Int32(1)
 
-## the IO streams of files (`IOStream`): `ios_*`
-#
-# An `IOStream`'s `ios` buffer (`sizeof_ios_t` bytes, the native size) holds: at 0, a magic
-# u32 (`IOS_MAGIC` while open, `IOS_CLOSED` once closed, for good); at 4, the index (u32,
-# 1-based) of its state in `IOS_TABLE` (a slot reused by later streams once closed). The
-# state (the fd, the read buffer, the flags) is a Julia object. Writes go to the fd (after the
-# read buffer is given back with a seek), so `ios_flush` has nothing to do. As in ios.c, a
-# failed read is the end of the input, and a closed stream is one with no fd: reads end,
-# writes and seeks fail.
+## reads and writes of a file descriptor, a staging chunk at a time
 
-const IOS_MAGIC = 0x5753_4f49   # "IOSW"
-const IOS_CLOSED = 0x4453_4f49  # "IOSD"
-
-mutable struct IOS
-    fd::Int32
-    own::Bool      # whether closing the stream closes the fd (not a borrowed one, `fdio(fd)`)
-    readable::Bool
-    writable::Bool
-    open::Bool
-    eof::Bool
-    buf::Vector{UInt8}
-    bpos::Int      # the next byte of `buf` to read (0-based)
-    size::Int      # the bytes of `buf` read from the fd
-end
-
-const IOS_TABLE = Union{Nothing,IOS}[]
-const IOS_BUFSIZE = 64 * 1024
-
-# the state of a closed stream (a new one each time: callers may set its fields)
-closed_ios() = IOS(Int32(-1), false, false, false, false, true, UInt8[], 0, 0)
-
-function ios_state(s::Ptr{Cvoid})
-    p = Ptr{UInt8}(s)
-    magic = load_le(p, 0, 4) % UInt32
-    magic == IOS_CLOSED && return closed_ios()
-    magic == IOS_MAGIC || throw(ArgumentError("not an IOStream of the runtime"))
-    st = IOS_TABLE[Int(load_le(p, 4, 4))]
-    return st === nothing ? closed_ios() : st
-end
-
-set_errno(e::Integer) = ccall(:jl_set_errno, Cvoid, (Cint,), Cint(e))
-
-function new_ios!(s::Ptr{Cvoid}, st::IOS)
-    i = findfirst(isnothing, IOS_TABLE)
-    if i === nothing
-        push!(IOS_TABLE, st)
-        i = length(IOS_TABLE)
-    else
-        IOS_TABLE[i] = st
+# copy `n` bytes of the linear memory at `off` to `dst` (a `Vector{UInt8}` or a pointer)
+# from `i` (0-based), and of `src` from `i` to the linear memory at `off`
+copy_out!(dst::Vector{UInt8}, i::Int, off::UInt32, n::Int) =
+    Staging.copy_from_linear!(dst, i + 1, off, n)
+function copy_out!(dst::Ptr{UInt8}, i::Int, off::UInt32, n::Int)
+    for k in 1:n
+        unsafe_store!(dst, Staging.load8(off + UInt32(k - 1)), i + k)
     end
-    p = Ptr{UInt8}(s)
-    store_le!(p, 0, UInt64(IOS_MAGIC), 4)
-    store_le!(p, 4, UInt64(i), 4)
-    return s
 end
+copy_in!(off::UInt32, src::Vector{UInt8}, i::Int, n::Int) =
+    Staging.copy_to_linear!(off, src, i + 1, n)
+copy_in!(off::UInt32, src::Ptr{UInt8}, i::Int, n::Int) =
+    Staging.copy_ptr_to_linear!(off, src + i, n)
 
-"`ios_file(s, fname, rd, wr, create, trunc)`: `s`, or C_NULL (and errno set)."
-function ios_file(s::Ptr{UInt8}, fname::Cstring, rd::Cint, wr::Cint, create::Cint, trunc::Cint)
-    fail(e) = (set_errno(e); Ptr{Cvoid}(C_NULL))
-    (rd != 0 || wr != 0) || return fail(22)
-    name = unsafe_string(fname)
-    c = check_path(name)
-    c == 0 || return fail(libc_from_uv(c))
-    c = open_check(name, create != 0, wr != 0)
-    c == 0 || return fail(libc_from_uv(c))
-    fd, rel = resolve(name)
-    oflags = (create != 0 ? O_CREAT : UInt32(0)) | (trunc != 0 ? O_TRUNC : UInt32(0))
-    r = Staging.with_scope() do
-        o, ol = Staging.raw_path(rel)
-        path_open(fd, SYMLINK_FOLLOW, o, ol, oflags, open_rights(fd, rd != 0, wr != 0), inheriting_rights(fd), UInt32(0), Staging.SCRATCH_OUT)
-    end
-    r == 0 || return fail(libc_errno(r))
-    nfd = reinterpret(Int32, Staging.load32(Staging.SCRATCH_OUT))
-    return new_ios!(Ptr{Cvoid}(s), IOS(nfd, true, rd != 0, wr != 0, true, false, UInt8[], 0, 0))
-end
+# `_enonfatal`: WASI's EINTR or EAGAIN, after which a read or a write is tried again (as by
+# ios.c; a host interrupting it endlessly is an error, never the end of the input)
+enonfatal(r::Int32) = r == Int32(27) || r == Int32(6)
+const MAX_TRIES = 1_000_000
 
-"`ios_fd(s, fd, isfile, own)`: the stream of an open fd (`fdio`), readable and writable; it
-closes the fd only if it owns it."
-function ios_fd(s::Ptr{Cvoid}, fd::Int, isfile::Cint, own::Cint)
-    return new_ios!(s, IOS(Int32(fd), own != 0, true, true, true, false, UInt8[], 0, 0))
-end
-
-# give the unread bytes of the read buffer back to the fd (before a write or a seek)
-function unread!(st::IOS)
-    n = st.size - st.bpos
-    if n > 0
-        r = fd_seek(st.fd, -Int64(n), UInt32(1), Staging.SCRATCH_OUT)
-        r == 0 || return uv(r)
-    end
-    st.bpos = st.size = 0
-    return Int32(0)
-end
-
-# read up to `n` bytes of the fd into `dst` at `i` (1-based): the bytes read, 0 at EOF; an
-# error is thrown, or (`errors=false`) the end of the input, as ios.c reads
-function os_read!(dst, i::Int, fd::Int32, n::Int; errors::Bool=true)
-    k = min(n, Int(Staging.CHUNK))
+# read up to `k` bytes (at most a chunk) of `fd` into `dst` from `i` (0-based), again while
+# interrupted or not ready: the bytes read (0 at EOF), or a libuv code
+function read_chunk(fd::Int32, dst, i::Int, k::Int)
     return Staging.with_scope() do
         off = Staging.alloc_data(k)
         Staging.store32(Staging.SCRATCH_IOVEC, off)
         Staging.store32(Staging.SCRATCH_IOVEC + UInt32(4), UInt32(k))
         r = fd_read(fd, Staging.SCRATCH_IOVEC, UInt32(1), Staging.SCRATCH_OUT)
-        # (interrupted, or not ready: again, as ios.c's _os_read; a host interrupting it
-        # endlessly is an error, never the end of the input)
         tries = 0
-        while r == Int32(27) || r == Int32(6)
+        while enonfatal(r)
             tries += 1
-            tries > 1_000_000 && throw(Base.IOError("read: " * Errno.uv_message(uv(r)), uv(r)))
+            tries > MAX_TRIES && throw(Base.IOError("read: " * Errno.uv_message(uv(r)), uv(r)))
             r = fd_read(fd, Staging.SCRATCH_IOVEC, UInt32(1), Staging.SCRATCH_OUT)
         end
-        if r != 0
-            errors || return 0
-            throw(Base.IOError("read: " * Errno.uv_message(uv(r)), uv(r)))
-        end
+        r == 0 || return Int(uv(r))
         got = Int(Staging.load32(Staging.SCRATCH_OUT))
-        Staging.copy_from_linear!(dst, i, off, got)
+        copy_out!(dst, i, off, got)
         got
     end
 end
 
-# refill the read buffer (it is empty): false at EOF
-function refill!(st::IOS)
-    (st.open && st.readable) || (st.eof = true; return false)
-    length(st.buf) < IOS_BUFSIZE && resize!(st.buf, IOS_BUFSIZE)
-    got = os_read!(st.buf, 1, st.fd, IOS_BUFSIZE; errors=false)
-    st.bpos, st.size = 0, got
-    got == 0 && (st.eof = true)
-    return got > 0
-end
-
-# `ios_read`/`ios_readall` into the pointer `dest`: as ios.c's `_ios_read`
-function ios_read_to(st::IOS, dest::Ptr{UInt8}, n::Int, all::Bool)
-    tot = 0
-    didread = false
-    while n > 0
-        avail = st.size - st.bpos
-        if avail > 0
-            k = min(avail, n)
-            for j in 1:k
-                unsafe_store!(dest, st.buf[st.bpos+j], tot + j)
-            end
-            st.bpos += k
-            tot += k
-            n -= k
-            n == 0 && return tot
-        end
-        didread && !all && return tot
-        refill!(st) || return tot
-        didread = true
-    end
-    return tot
-end
-
-ios_readall(s::Ptr{Cvoid}, dest::Ptr{Cvoid}, n::Csize_t) = Csize_t(ios_read_to(ios_state(s), Ptr{UInt8}(dest), Int(n), true))
-ios_read(s::Ptr{Cvoid}, dest::Ptr{Cvoid}, n::Csize_t) = Csize_t(ios_read_to(ios_state(s), Ptr{UInt8}(dest), Int(n), false))
-
-"`ios_fillbuf`: the bytes buffered if that is the rest of the file, else -1."
-function ios_fillbuf(s::Ptr{Cvoid})
-    st = ios_state(s)
-    # (as `ios_readprep(s, maxsize - bpos)`: read until the buffer is full or EOF)
-    if st.bpos > 0
-        n = st.size - st.bpos
-        copyto!(st.buf, 1, st.buf, st.bpos + 1, n)
-        st.bpos, st.size = 0, n
-    end
-    length(st.buf) < IOS_BUFSIZE && resize!(st.buf, IOS_BUFSIZE)
-    while st.size < IOS_BUFSIZE
-        (st.open && st.readable) || (st.eof = true; break)
-        got = os_read!(st.buf, st.size + 1, st.fd, IOS_BUFSIZE - st.size; errors=false)
-        got == 0 && (st.eof = true; break)
-        st.size += got
-    end
-    return st.size < IOS_BUFSIZE ? Cssize_t(st.size) : Cssize_t(-1)
-end
-
-"`jl_ios_buffer_n(s, n)`: 0 when `n` bytes are buffered (reading as needed), else 1 (EOF)."
-function jl_ios_buffer_n(s::Ptr{Cvoid}, n::Csize_t)
-    st = ios_state(s)
-    while st.size - st.bpos < Int(n)
-        if st.bpos > 0
-            k = st.size - st.bpos
-            copyto!(st.buf, 1, st.buf, st.bpos + 1, k)
-            st.bpos, st.size = 0, k
-        end
-        length(st.buf) < max(IOS_BUFSIZE, Int(n)) && resize!(st.buf, max(IOS_BUFSIZE, Int(n)))
-        (st.open && st.readable) || return Cint(1)
-        got = os_read!(st.buf, st.size + 1, st.fd, length(st.buf) - st.size; errors=false)
-        got == 0 && (st.eof = true; return Cint(1))
-        st.size += got
-    end
-    return Cint(0)
-end
-"`jl_ios_get_nbyte_int(s, n)`: the `n`-byte little-endian integer at the read position."
-function jl_ios_get_nbyte_int(s::Ptr{Cvoid}, n::Csize_t)
-    st = ios_state(s)
-    x = UInt64(0)
-    for i in 0:Int(n)-1
-        x |= UInt64(st.buf[st.bpos+i+1]) << (8i)
-    end
-    st.bpos += Int(n)
-    return x
-end
-
-jl_nb_available(s::Ptr{Cvoid}) = Int32(ios_state(s).size - ios_state(s).bpos)
-
-function ios_getc(s::Ptr{Cvoid})
-    st = ios_state(s)
-    st.bpos < st.size || refill!(st) || return Cint(-1)
-    st.bpos += 1
-    return Cint(st.buf[st.bpos])
-end
-function ios_peekc(s::Ptr{Cvoid})
-    st = ios_state(s)
-    st.bpos < st.size || refill!(st) || return Cint(-1)
-    return Cint(st.buf[st.bpos+1])
-end
-function ios_eof_blocking(s::Ptr{Cvoid})
-    st = ios_state(s)
-    st.bpos < st.size && return Cint(0)
-    return refill!(st) ? Cint(0) : Cint(1)
-end
-
-function ios_write(s::Ptr{Cvoid}, p::Ptr{Cvoid}, n::Csize_t)
-    st = ios_state(s)
-    st.open || return Csize_t(0)
-    r = unread!(st)
-    r == 0 || throw(Base.IOError("write: " * Errno.uv_message(r), r))
-    write_ptr(st.fd, Ptr{UInt8}(p), Int(n))
-    return n
-end
-
-# write the `n` bytes at `p` to `fd`, in chunks
-function write_ptr(fd::Int32, p::Ptr{UInt8}, n::Int)
-    i = 0
-    while i < n
-        k = min(n - i, Int(Staging.CHUNK))
-        write_ptr_chunk(fd, p + i, k)
-        i += k
-    end
-end
-write_ptr_chunk(fd::Int32, p::Ptr{UInt8}, k::Int) = Staging.with_scope() do
+# write the `k` bytes (at most a chunk) of `src` (a `Vector{UInt8}` or a pointer) from `i`
+# (0-based) to `fd`, each write again while interrupted or not ready: (the guest's errno or
+# 0, the bytes written)
+write_chunk(fd::Int32, src, i::Int, k::Int) = Staging.with_scope() do
     off = Staging.alloc_data(k)
-    Staging.copy_ptr_to_linear!(off, p, k)
-    write_all(fd, off, UInt32(k))
-end
-function ios_putc(c::Cint, s::Ptr{Cvoid})
-    st = ios_state(s)
-    st.open || return Cint(-1)
-    r = unread!(st)
-    r == 0 || throw(Base.IOError("write: " * Errno.uv_message(r), r))
-    Staging.with_scope() do
-        off = Staging.alloc_data(1)
-        Staging.store8(off, c % UInt8)
-        write_all(st.fd, off, UInt32(1))
+    copy_in!(off, src, i, k)
+    w = 0
+    tries = 0
+    while w < k
+        Staging.store32(Staging.SCRATCH_IOVEC, off + UInt32(w))
+        Staging.store32(Staging.SCRATCH_IOVEC + UInt32(4), UInt32(k - w))
+        r = WASI.fd_write(fd, Staging.SCRATCH_IOVEC, UInt32(1), Staging.SCRATCH_OUT)
+        if enonfatal(r)
+            tries += 1
+            tries > MAX_TRIES && throw(Base.IOError("write: " * Errno.uv_message(uv(r)), uv(r)))
+            continue
+        end
+        r == 0 || return (libc_errno(r), w)
+        n = Int(Staging.load32(Staging.SCRATCH_OUT))
+        if n == 0
+            # (no progress: again, as ios.c's `_os_write_all` loops)
+            tries += 1
+            tries > MAX_TRIES && throw(Base.IOError("write: no progress", Int32(Base.UV_EIO)))
+            continue
+        end
+        w += n
     end
-    return Cint(1)
+    return (Int32(0), w)
 end
 
 # Synchronous hosts can retry EINTR, but cannot wait for readiness on EAGAIN.
@@ -1189,102 +1004,723 @@ function read_once(fd::Int32, off::UInt32, n::UInt32, offset::Int64=Int64(-1))
     end
 end
 
-function write_all(fd::Int32, off::UInt32, n::UInt32)
-    while n > 0
-        k = write_once(fd, off, n)
-        k < 0 && throw(Base.IOError("write: " * Errno.uv_message(k), k))
-        k == 0 && throw(Base.IOError("write: no progress", Int32(Base.UV_EIO)))
-        off += UInt32(k)
-        n -= UInt32(k)
-    end
+## the IO streams of files (`IOStream`): `ios_*`, ported from src/support/ios.c
+#
+# An `IOStream`'s `ios` buffer (`sizeof_ios_t` bytes, the native size) holds: at 0, a magic
+# u32 (`IOS_MAGIC` while open, `IOS_CLOSED` once closed, for good); at 4, the index (u32,
+# 1-based) of its state (an `IOS`, ios.c's `ios_t`) in `IOS_TABLE`. Closing a stream gives
+# its slot up for later streams and keeps in the bytes what a closed `ios_t` still holds
+# (`ios_close`). The functions are ios.c's, and sys.c's that read an `ios_t`, for a stream of
+# a file descriptor: an IOStream is never a memory stream (`bm_mem`, its branches and
+# `_write_grow` are left out), and never has the inline buffer (`local`) or one it does not
+# own. Its system calls are over WASI (`_os_read`, `_os_write_all`, `lseek`, `ftruncate`,
+# below). As natively, a read error is the end of the input, a write error a short count
+# (and errno), and a closed stream one whose fd is -1.
+
+const IOS_MAGIC = 0x5753_4f49   # "IOSW"
+const IOS_CLOSED = 0x4453_4f49  # "IOSD"
+
+const IOS_BUFSIZE = 32768
+const IOS_EOF = Cint(-1)
+const LINE_CHUNK_SIZE = 160
+# `bufmode_t`: when written data moves out to the fd
+const BM_NONE = Int32(1000)
+const BM_LINE = Int32(1001)
+const BM_BLOCK = Int32(1002)
+# `bufstate_t`: where the fd's position is relative to the buffer: reading, at its end;
+# writing, at its start
+const BST_NONE = Int32(0)
+const BST_RD = Int32(1)
+const BST_WR = Int32(2)
+
+"`MOST_OF(x)`: what fits comfortably in a buffer of `x` bytes."
+most_of(x::Int) = x - (x >> 4)
+
+"""
+The state of a stream, ios.c's `ios_t`: `buf` holds `size` bytes of the file, of which the
+first `ndirty` are to be written out; `bpos` is the position in it (0-based, offsets as in
+C); `fpos` caches the fd's position (-1: unknown). Of `ios_t`'s other fields: `rereadable`,
+`lineno` and `u_colno` are not read by any function here, `growable` and `ownbuf` are always
+set.
+"""
+mutable struct IOS
+    buf::Vector{UInt8}   # (of `maxsize` bytes; empty once closed, `NULL`)
+    bm::Int32
+    state::Int32
+    maxsize::Int
+    size::Int
+    bpos::Int
+    ndirty::Int
+    fpos::Int64
+    fd::Int
+    readable::Bool
+    writable::Bool
+    ownfd::Bool
+    _eof::Bool
 end
 
-ios_flush(s::Ptr{Cvoid}) = Cint(0)
-ios_isopen(s::Ptr{Cvoid}) = Cint(ios_state(s).open)
-ios_get_readable(s::Ptr{Cvoid}) = Cint(ios_state(s).readable)
-ios_get_writable(s::Ptr{Cvoid}) = Cint(ios_state(s).writable)
-jl_ios_fd(s::Ptr{Cvoid}) = Int(ios_state(s).fd)
+const IOS_TABLE = Union{Nothing,IOS}[]
 
-function ios_close(s::Ptr{Cvoid})
+set_errno(e::Integer) = ccall(:jl_set_errno, Cvoid, (Cint,), Cint(e))
+
+# a closed stream's bytes: what `ios_close` leaves of its `ios_t` but its fd (-1) and its
+# buffer (none): at 8, its state, `_eof`, `readable` and `writable`, a byte each; at 12, its
+# buffer mode (u32); at 16, its cached position (i64)
+closed_ios(p::Ptr{UInt8}) =
+    IOS(UInt8[], load_le(p, 12, 4) % Int32, load_le(p, 8, 1) % Int32, 0, 0, 0, 0,
+        reinterpret(Int64, load_le(p, 16, 8)), -1, load_le(p, 10, 1) != 0, load_le(p, 11, 1) != 0,
+        false, load_le(p, 9, 1) != 0)
+function save_closed!(p::Ptr{UInt8}, s::IOS)
+    store_le!(p, 8, UInt64(s.state), 1)
+    store_le!(p, 9, UInt64(s._eof), 1)
+    store_le!(p, 10, UInt64(s.readable), 1)
+    store_le!(p, 11, UInt64(s.writable), 1)
+    store_le!(p, 12, UInt64(s.bm), 4)
+    store_le!(p, 16, reinterpret(UInt64, s.fpos), 8)
+end
+
+"""
+    with_ios(f, s)
+
+`f(st)`, of the state `st` of the stream whose `ios_t` is at `s`: an open stream's, in
+`IOS_TABLE`; a closed one's, made from its bytes and written back to them.
+"""
+function with_ios(f::F, s::Ptr{Cvoid}) where {F}
     p = Ptr{UInt8}(s)
-    load_le(p, 0, 4) % UInt32 == IOS_MAGIC || return Cint(0)   # (closed already, or never opened)
-    i = Int(load_le(p, 4, 4))
-    st = IOS_TABLE[i]
-    store_le!(p, 0, UInt64(IOS_CLOSED), 4)
-    IOS_TABLE[i] = nothing
-    st === nothing && return Cint(0)
-    st.open = false
-    st.own || return Cint(0)
-    r = fd_close(st.fd)
-    r == 0 && return Cint(0)
-    set_errno(libc_errno(r))
-    return Cint(-1)
+    magic = load_le(p, 0, 4) % UInt32
+    magic == IOS_MAGIC && return f(IOS_TABLE[Int(load_le(p, 4, 4))]::IOS)
+    magic == IOS_CLOSED || throw(ArgumentError("not an IOStream of the runtime"))
+    st = closed_ios(p)
+    r = f(st)
+    save_closed!(p, st)
+    return r
 end
 
-# positions: the fd's, less what is buffered. A failure sets errno (Base's `systemerror`).
-function seek_fd(fd::Int32, off::Int64, whence::UInt32)
-    r = fd_seek(fd, off, whence, Staging.SCRATCH_OUT)
-    r == 0 || (set_errno(libc_errno(r)); return Int64(-1))
-    return reinterpret(Int64, Staging.load64(Staging.SCRATCH_OUT))
-end
-function ios_pos(s::Ptr{Cvoid})
-    st = ios_state(s)
-    p = seek_fd(st.fd, Int64(0), UInt32(1))
-    return p < 0 ? p : p - (st.size - st.bpos)
-end
-# seek to `off` (`whence`), the read buffer given up once it succeeded
-function seek_to!(st::IOS, off::Int64, whence::UInt32)
-    if whence == 1
-        p = seek_fd(st.fd, Int64(0), UInt32(1))
-        p < 0 && return Int64(-1)
-        pos = p - (st.size - st.bpos) + off
-        # (before the start: EINVAL, as lseek(2))
-        pos < 0 && (set_errno(22); return Int64(-1))
+function new_ios!(s::Ptr{Cvoid}, st::IOS)
+    i = findfirst(isnothing, IOS_TABLE)
+    if i === nothing
+        push!(IOS_TABLE, st)
+        i = length(IOS_TABLE)
     else
-        pos = off
+        IOS_TABLE[i] = st
     end
-    r = whence == 2 ? seek_fd(st.fd, off, UInt32(2)) : seek_fd(st.fd, pos, UInt32(0))
-    r < 0 && return Int64(-1)
-    st.bpos = st.size = 0
-    st.eof = false
+    p = Ptr{UInt8}(s)
+    store_le!(p, 0, UInt64(IOS_MAGIC), 4)
+    store_le!(p, 4, UInt64(i), 4)
+    return s
+end
+
+## ios.c's system calls, over WASI: they set errno on failure, as the C library does; a
+## negative fd (a closed stream's) is EBADF
+
+const EBADF = Int32(9)
+const SEEK_SET = UInt32(0)
+const SEEK_CUR = UInt32(1)
+const SEEK_END = UInt32(2)
+
+# the WASI fd of `fd`: -1 for one out of WASI's range (EBADF)
+wasi_fd(fd::Int) = 0 <= fd <= typemax(Int32) ? Int32(fd) : Int32(-1)
+
+"""
+`_os_read(fd, buf, n, &nread)`: one read of up to `n` bytes of `fd` into `dst` (a
+`Vector{UInt8}` or a pointer) from `i` (0-based): (errno or 0, the bytes read). A staging
+chunk is read at a time, and the next while they come back full: one `read(2)` of a file
+reads all it can.
+"""
+function _os_read(fd::Int, dst, i::Int, n::Int)
+    wfd = wasi_fd(fd)
+    wfd < 0 && (set_errno(EBADF); return (EBADF, 0))
+    got = 0
+    while got < n
+        k = min(n - got, Int(Staging.CHUNK))
+        r = read_chunk(wfd, dst, i + got, k)
+        if r < 0
+            # (after some bytes, those: the error comes with the next read)
+            got > 0 && break
+            e = libc_from_uv(r)
+            set_errno(e)
+            return (e, 0)
+        end
+        got += r
+        r < k && break
+    end
+    return (Int32(0), got)
+end
+
+# `_os_read_all`: reads until `n` bytes, the end of the input or an error
+function _os_read_all(fd::Int, dst, i::Int, n::Int)
+    nread = 0
+    while n > 0
+        err, got = _os_read(fd, dst, i + nread, n)
+        n -= got
+        nread += got
+        (err != 0 || got == 0) && return (err, nread)
+    end
+    return (Int32(0), nread)
+end
+
+"""
+`_os_write_all(fd, buf, n, &nwritten)`: the `n` bytes of `src` (a `Vector{UInt8}` or a
+pointer) from `i` (0-based) to `fd`: (errno or 0, the bytes written).
+"""
+function _os_write_all(fd::Int, src, i::Int, n::Int)
+    wfd = wasi_fd(fd)
+    wfd < 0 && (set_errno(EBADF); return (EBADF, 0))
+    nwritten = 0
+    while nwritten < n
+        err, wrote = write_chunk(wfd, src, i + nwritten, min(n - nwritten, Int(Staging.CHUNK)))
+        nwritten += wrote
+        err == 0 || (set_errno(err); return (err, nwritten))
+    end
+    return (Int32(0), nwritten)
+end
+
+"`lseek(fd, offset, whence)`: the new position, or -1 (errno set)."
+function lseek(fd::Int, offset::Int64, whence::UInt32)
+    wfd = wasi_fd(fd)
+    wfd < 0 && (set_errno(EBADF); return Int64(-1))
+    return jl_lseek(RawFD(wfd), offset, Cint(whence))
+end
+
+"`ftruncate(fd, length)`: 0, or -1 (errno set)."
+function ftruncate(fd::Int, length::Int64)
+    wfd = wasi_fd(fd)
+    wfd < 0 && (set_errno(EBADF); return Cint(-1))
+    length < 0 && (set_errno(22); return Cint(-1))
+    r = fd_filestat_set_size(wfd, UInt64(length))
+    r == 0 || (set_errno(libc_errno(r)); return Cint(-1))
+    return Cint(0)
+end
+
+# `memcpy` between the buffer and a caller's bytes (a `Vector{UInt8}` or a pointer), and
+# `memmove` within the buffer: `n` bytes, offsets 0-based
+memcpy!(dst::Vector{UInt8}, di::Int, src::Vector{UInt8}, si::Int, n::Int) =
+    (copyto!(dst, di + 1, src, si + 1, n); nothing)
+function memcpy!(dst::Ptr{UInt8}, di::Int, src::Vector{UInt8}, si::Int, n::Int)
+    for k in 1:n
+        unsafe_store!(dst, src[si+k], di + k)
+    end
+end
+function memcpy!(dst::Vector{UInt8}, di::Int, src::Ptr{UInt8}, si::Int, n::Int)
+    for k in 1:n
+        dst[di+k] = unsafe_load(src, si + k)
+    end
+end
+memmove!(buf::Vector{UInt8}, di::Int, si::Int, n::Int) =
+    (copyto!(buf, di + 1, buf, si + 1, n); nothing)
+
+# `memchr`: the offset of the first `c` of the `n` bytes of `buf` from `i`, or -1 (the
+# search stops at the end of the buffer, past which C would read)
+function memchr(buf::Vector{UInt8}, i::Int, c::UInt8, n::UInt)
+    stop = i + Int(min(n, UInt(max(length(buf) - i, 0))))
+    for k in i:stop-1
+        buf[k+1] == c && return k
+    end
+    return -1
+end
+# `memrchr`: the offset (from `i`) of the last `c` of the `n` bytes of `data` (a
+# `Vector{UInt8}` or a pointer) from `i`, or -1
+function memrchr(data, i::Int, c::UInt8, n::Int)
+    for k in n-1:-1:0
+        byte_at(data, i + k) == c && return k
+    end
+    return -1
+end
+byte_at(data::Vector{UInt8}, i::Int) = data[i+1]
+byte_at(data::Ptr{UInt8}, i::Int) = unsafe_load(data, i + 1)
+
+## ios.c's internals
+
+# `_buf_realloc`: room for `sz` bytes in the buffer, its data kept (an IOStream's buffer is
+# its own and growable: this does not fail)
+function _buf_realloc(s::IOS, sz::Int)
+    if sz > s.maxsize
+        resize!(s.buf, sz)
+        s.maxsize = sz
+    end
+    return nothing
+end
+
+function _write_update_pos(s::IOS)
+    s.bpos > s.ndirty && (s.ndirty = s.bpos)
+    s.bpos > s.size && (s.size = s.bpos)
+    return nothing
+end
+
+# `_ios_read`: up to `n` bytes into `dest` (a pointer or a `Vector{UInt8}`); with `all`, until
+# `n` or the end of the input. What does not fit comfortably in the buffer is read directly,
+# leaving it empty.
+function _ios_read(s::IOS, dest, n::Int, all::Bool)
+    tot = 0
+    didread = false
+    s.state == BST_WR && ios_seek(s, ios_pos(s))
+    s.state = BST_RD
+    while n > 0
+        # (`size_t`: a buffer truncated below the position has "all" of it, as in C)
+        avail = (s.size - s.bpos) % UInt
+        if avail > 0
+            ncopy = avail >= n ? n : Int(avail)
+            memcpy!(dest, tot, s.buf, s.bpos, ncopy)
+            s.bpos += ncopy
+            ncopy >= n && return tot + ncopy
+        end
+        if s.fd == -1
+            # (no more data)
+            avail == 0 && (s._eof = true)
+            return Int(avail)
+        end
+        n -= Int(avail)
+        tot += Int(avail)
+        didread && !all && return tot
+        ios_flush(s)
+        s.bpos = s.size = 0
+        s.fpos = -1
+        if n > most_of(s.maxsize)
+            # (it doesn't fit comfortably in the buffer: directly)
+            _, got = all ? _os_read_all(s.fd, dest, tot, n) : _os_read(s.fd, dest, tot, n)
+            tot += got
+            got == 0 && (s._eof = true)
+            return tot
+        else
+            # (refill the buffer)
+            err, got = _os_read(s.fd, s.buf, 0, s.maxsize)
+            if err != 0 || got == 0
+                s._eof = true
+                return tot
+            end
+            s.size = got
+        end
+        didread = true
+    end
+    return tot
+end
+
+"""
+`ios_readprep(s, n)`: `n` bytes buffered if possible (the data moved back, or the buffer
+grown, to fit them): the bytes available.
+"""
+function ios_readprep(s::IOS, n::UInt)
+    if s.state == BST_WR
+        ios_flush(s)
+        s.bpos = s.size = 0
+    end
+    space = (s.size - s.bpos) % UInt
+    s.state = BST_RD
+    (space >= n || s.fd == -1) && return space
+    if s.maxsize < s.bpos + n
+        # (it won't fit: grow the buffer or move the data back)
+        if n <= s.maxsize && space <= s.maxsize >> 2
+            space != 0 && memmove!(s.buf, 0, s.bpos, Int(space))
+            s.size -= s.bpos
+            s.bpos = 0
+        else
+            _buf_realloc(s, s.bpos + Int(n))
+        end
+    end
+    s.fpos = -1
+    err, got = _os_read(s.fd, s.buf, s.size, s.maxsize - s.size)
+    err != 0 && return space
+    s.size += got
+    return (s.size - s.bpos) % UInt
+end
+
+"""
+`ios_fillbuf(s)`: the buffer filled: the bytes available if that is the whole rest of the
+file, else -1.
+"""
+function ios_fillbuf(s::IOS)
+    nb = (s.maxsize - s.bpos) % UInt
+    got = ios_readprep(s, nb)
+    got < nb && return got % Cssize_t
+    return Cssize_t(-1)
+end
+
+"""
+`ios_write(s, data, n)`: `n` bytes of `data` (a pointer or a `Vector{UInt8}`) from `i`,
+held in the buffer as its mode says: the bytes written.
+"""
+function ios_write(s::IOS, data, i::Int, n::Int)
+    s.writable || return 0
+    n == 0 && return 0
+    wrote = 0
+    s.state == BST_RD && ios_seek(s, ios_pos(s))
+    s.state = BST_WR
+    space = (s.maxsize - s.bpos) % UInt
+    if s.bm == BM_NONE
+        s.fpos = -1
+        _, wrote = _os_write_all(s.fd, data, i, n)
+        return wrote
+    elseif n <= space
+        if s.bm == BM_LINE
+            nl = memrchr(data, i, UInt8('\n'), n)
+            if nl >= 0
+                linesz = nl + 1
+                s.bm = BM_BLOCK
+                wrote += ios_write(s, data, i, linesz)
+                ios_flush(s)
+                s.bm = BM_LINE
+                n -= linesz
+                i += linesz
+            end
+        end
+        memcpy!(s.buf, s.bpos, data, i, n)
+        s.bpos += n
+        wrote += n
+    else
+        ios_flush(s)
+        if n > most_of(s.maxsize)
+            s.fpos = -1
+            _, wrote = _os_write_all(s.fd, data, i, n)
+            return wrote
+        end
+        return ios_write(s, data, i, n)
+    end
+    _write_update_pos(s)
+    return wrote
+end
+
+"`ios_seek(s, pos)`: 0, or -1 (errno set)."
+function ios_seek(s::IOS, pos::Int64)
+    s._eof = false
+    ios_flush(s)
+    fdpos = lseek(s.fd, pos, SEEK_SET)
+    fdpos == -1 && return fdpos
+    s.fpos = fdpos
+    s.bpos = s.size = 0
     return Int64(0)
 end
-ios_seek(s::Ptr{Cvoid}, pos::Int64) = seek_to!(ios_state(s), pos, UInt32(0))
-ios_seek_end(s::Ptr{Cvoid}) = seek_to!(ios_state(s), Int64(0), UInt32(2))
-ios_skip(s::Ptr{Cvoid}, n::Int64) = seek_to!(ios_state(s), n, UInt32(1))
-function ios_filesize(s::Ptr{Cvoid})
-    st = ios_state(s)
-    r = fd_filestat_get(st.fd, Staging.SCRATCH_OUT)
-    r == 0 || (set_errno(libc_errno(r)); return Int64(-1))
-    return reinterpret(Int64, Staging.load64(Staging.SCRATCH_OUT + UInt32(32)))
-end
-function ios_trunc(s::Ptr{Cvoid}, n::Csize_t)
-    st = ios_state(s)
-    r = unread!(st)
-    r == 0 || (set_errno(libc_from_uv(r)); return Cint(1))
-    r = fd_filestat_set_size(st.fd, UInt64(n))
-    r == 0 && return Cint(0)
-    set_errno(libc_errno(r))
-    return Cint(1)
+
+"`ios_seek_end(s)`: 0, or -1 (errno set); the input has ended."
+function ios_seek_end(s::IOS)
+    s._eof = true
+    ios_flush(s)
+    fdpos = lseek(s.fd, Int64(0), SEEK_END)
+    fdpos == -1 && return fdpos
+    s.fpos = fdpos
+    s.bpos = s.size = 0
+    return Int64(0)
 end
 
-"`jl_readuntil(s, delim, str, chomp)`: the bytes up to `delim` (a `String` or a `Vector{UInt8}`)."
-function jl_readuntil(s::Ptr{Cvoid}, delim::UInt8, str::UInt8, chomp::UInt8)
-    st = ios_state(s)
-    out = UInt8[]
-    while true
-        st.bpos < st.size || refill!(st) || break
-        st.bpos += 1
-        b = st.buf[st.bpos]
-        push!(out, b)
-        b == delim && break
+"`ios_skip(s, offs)`: a relative seek, within the buffer if it can: 0, or -1 (errno set)."
+function ios_skip(s::IOS, offs::Int64)
+    if offs != 0
+        if offs > 0
+            if offs <= s.size - s.bpos
+                s.bpos += offs
+                return Int64(0)
+            end
+        elseif -offs <= s.bpos
+            s.bpos += offs
+            s._eof = false
+            return Int64(0)
+        end
+        ios_flush(s)
+        if s.state == BST_WR
+            offs += s.bpos
+        elseif s.state == BST_RD
+            offs -= s.size - s.bpos
+        end
+        fdpos = lseek(s.fd, offs, SEEK_CUR)
+        fdpos == -1 && return fdpos
+        s.fpos = fdpos
+        s.bpos = s.size = 0
+        s._eof = false
     end
-    if chomp != 0 && !isempty(out) && out[end] == delim
-        pop!(out)
-        chomp == 0x02 && !isempty(out) && out[end] == UInt8('\r') && pop!(out)
-    end
-    return str != 0 ? String(out) : out
+    return Int64(0)
 end
+
+"`ios_pos(s)`: the position, from the fd's (cached), or -1 (errno set)."
+function ios_pos(s::IOS)
+    fdpos = s.fpos
+    if fdpos == -1
+        fdpos = lseek(s.fd, Int64(0), SEEK_CUR)
+        fdpos == -1 && return fdpos
+        s.fpos = fdpos
+    end
+    if s.state == BST_WR
+        fdpos += s.bpos
+    elseif s.state == BST_RD
+        fdpos -= s.size - s.bpos
+    end
+    return fdpos
+end
+
+"`ios_filesize(s)`: the size of the file (what is written out), or -1 (errno set)."
+function ios_filesize(s::IOS)
+    fdpos = s.fpos
+    if fdpos == -1
+        fdpos = lseek(s.fd, Int64(0), SEEK_CUR)
+        fdpos == -1 && return fdpos
+        s.fpos = fdpos
+    end
+    sz = lseek(s.fd, Int64(0), SEEK_END)
+    lseek(s.fd, fdpos, SEEK_SET)
+    return sz
+end
+
+"`ios_trunc(s, size)`: 0, or 1 (errno set)."
+function ios_trunc(s::IOS, size::UInt)
+    ios_flush(s)
+    if s.state == BST_RD
+        p = ios_pos(s)
+        # (compared unsigned, as in C)
+        if size < (p + (s.size - s.bpos)) % UInt
+            s.size -= p + (s.size - s.bpos) - size % Int
+        end
+    end
+    return ftruncate(s.fd, size % Int64) == 0 ? Cint(0) : Cint(1)
+end
+
+# `ios_eof`: whether the input has ended, without reading
+function ios_eof(s::IOS)
+    s.state == BST_RD && s.bpos < s.size && return false
+    s._eof && return true
+    return s.fd == -1
+end
+
+"`ios_eof_blocking(s)`: whether the input has ended, reading to know."
+function ios_eof_blocking(s::IOS)
+    s.state == BST_RD && s.bpos < s.size && return Cint(0)
+    s.fd == -1 && return Cint(1)
+    return ios_readprep(s, UInt(1)) < 1 ? Cint(1) : Cint(0)
+end
+
+"`ios_flush(s)`: the dirty bytes written out: 0, an errno, or -1 (a short write)."
+function ios_flush(s::IOS)
+    (s.ndirty == 0 || isempty(s.buf)) && return Cint(0)
+    s.fd == -1 && return Cint(-1)
+    s.state == BST_RD && lseek(s.fd, -Int64(s.size), SEEK_CUR)
+    ntowrite = s.ndirty
+    s.fpos = -1
+    err, nw = _os_write_all(s.fd, s.buf, 0, ntowrite)
+    if s.state == BST_RD
+        lseek(s.fd, Int64(s.size - nw), SEEK_CUR)
+    elseif s.state == BST_WR
+        s.bpos != nw && lseek(s.fd, Int64(s.bpos - nw), SEEK_CUR)
+        # (the data to write begins at the start of the buffer again, and `size` counts the
+        # file's data it holds)
+        s.size > s.ndirty && memmove!(s.buf, 0, s.ndirty, s.size - s.ndirty)
+        s.size -= s.ndirty
+        s.bpos = 0
+    end
+    s.ndirty = 0
+    err != 0 && return err
+    nw < ntowrite && return Cint(-1)
+    return Cint(0)
+end
+
+"`ios_putc(c, s)`: the byte `c` written: 1, or 0."
+function ios_putc(c::Cint, s::IOS)
+    ch = c % UInt8
+    if s.state == BST_WR && s.bpos < s.maxsize && s.bm != BM_NONE
+        s.buf[s.bpos+1] = ch
+        s.bpos += 1
+        _write_update_pos(s)
+        s.bm == BM_LINE && ch == UInt8('\n') && ios_flush(s)
+        return Cint(1)
+    end
+    return Cint(ios_write(s, UInt8[ch], 0, 1))
+end
+
+"`ios_getc(s)`: the next byte, or `IOS_EOF`."
+function ios_getc(s::IOS)
+    if s.state == BST_RD && s.bpos < s.size
+        ch = s.buf[s.bpos+1]
+        s.bpos += 1
+    else
+        s._eof && return IOS_EOF
+        b = UInt8[0x00]
+        _ios_read(s, b, 1, false) < 1 && return IOS_EOF
+        ch = b[1]
+    end
+    return Cint(ch)
+end
+
+"`ios_peekc(s)`: the next byte, left to read, or `IOS_EOF`."
+function ios_peekc(s::IOS)
+    s.bpos < s.size && return Cint(s.buf[s.bpos+1])
+    s._eof && return IOS_EOF
+    ios_readprep(s, UInt(1)) == 0 && return IOS_EOF
+    return Cint(s.buf[s.bpos+1])
+end
+
+# `ios_copyuntil(to, from, delim, keep)`: the bytes of `from` up to `delim` (it too, with
+# `keep`) appended to `to` (natively a memory stream): their number
+function ios_copyuntil(to::Vector{UInt8}, from::IOS, delim::UInt8, keep::Bool)
+    total = 0
+    avail = (from.size - from.bpos) % UInt
+    while !ios_eof(from)
+        if avail == 0
+            avail = ios_readprep(from, UInt(LINE_CHUNK_SIZE))
+            avail == 0 && break
+        end
+        pd = memchr(from.buf, from.bpos, delim, avail)
+        if pd == -1
+            total += append_bytes!(to, from.buf, from.bpos, Int(avail))
+            from.bpos += Int(avail)
+            avail = UInt(0)
+        else
+            ntowrite = pd - from.bpos + keep
+            total += append_bytes!(to, from.buf, from.bpos, ntowrite)
+            from.bpos += ntowrite + !keep
+            return total
+        end
+    end
+    from._eof = true
+    return total
+end
+
+# (`ios_write` to a memory stream: the `n` bytes of `buf` from `i` appended to `to`)
+function append_bytes!(to::Vector{UInt8}, buf::Vector{UInt8}, i::Int, n::Int)
+    m = length(to)
+    resize!(to, m + n)
+    copyto!(to, m + 1, buf, i + 1, n)
+    return n
+end
+
+# `ios_nchomp(from, n)`: the bytes to drop from the `n` up to a line's end: 2 for "\r\n"
+ios_nchomp(from::IOS, n::Int) = n > 1 && from.buf[from.bpos+n-1] == UInt8('\r') ? 2 : 1
+
+## the functions of the C runtime (`RUNTIME_CCALLS`), of the stream whose `ios_t` is at `s`
+
+"""
+`ios_fd(s, fd, isfile, own)`: a stream of the open fd `fd` (`fdio`), buffered by block
+(stderr unbuffered, stdout by line); closing it closes the fd if it owns it.
+"""
+function ios_fd(s::Ptr{Cvoid}, fd::Int, isfile::Cint, own::Cint)
+    # (`_ios_init`, then `_buf_init(s, bm_block)`)
+    st = IOS(Vector{UInt8}(undef, IOS_BUFSIZE), BM_BLOCK, BST_NONE, IOS_BUFSIZE, 0, 0, 0,
+             Int64(-1), fd, true, true, own != 0, false)
+    fd == 2 && (st.bm = BM_NONE)
+    fd == 1 && (st.bm = BM_LINE)
+    return new_ios!(s, st)
+end
+
+"`ios_file(s, fname, rd, wr, create, trunc)`: `s`, or C_NULL (and errno set)."
+function ios_file(s::Ptr{UInt8}, fname::Cstring, rd::Cint, wr::Cint, create::Cint, trunc::Cint)
+    fail(e) = (set_errno(e); Ptr{Cvoid}(C_NULL))
+    (rd != 0 || wr != 0) || return fail(22)
+    name = unsafe_string(fname)
+    c = check_path(name)
+    c == 0 || return fail(libc_from_uv(c))
+    c = open_check(name, create != 0, wr != 0)
+    c == 0 || return fail(libc_from_uv(c))
+    fd, rel = resolve(name)
+    oflags = (create != 0 ? O_CREAT : UInt32(0)) | (trunc != 0 ? O_TRUNC : UInt32(0))
+    r = Staging.with_scope() do
+        o, ol = Staging.raw_path(rel)
+        path_open(fd, SYMLINK_FOLLOW, o, ol, oflags, open_rights(fd, rd != 0, wr != 0), inheriting_rights(fd), UInt32(0), Staging.SCRATCH_OUT)
+    end
+    r == 0 || return fail(libc_errno(r))
+    nfd = reinterpret(Int32, Staging.load32(Staging.SCRATCH_OUT))
+    p = ios_fd(Ptr{Cvoid}(s), Int(nfd), Cint(1), Cint(1))
+    with_ios(p) do st
+        st.fpos = 0
+        rd == 0 && (st.readable = false)
+        wr == 0 && (st.writable = false)
+    end
+    return p
+end
+
+ios_read(s::Ptr{Cvoid}, dest::Ptr{Cvoid}, n::Csize_t) =
+    with_ios(st -> Csize_t(_ios_read(st, Ptr{UInt8}(dest), Int(n), false)), s)
+ios_readall(s::Ptr{Cvoid}, dest::Ptr{Cvoid}, n::Csize_t) =
+    with_ios(st -> Csize_t(_ios_read(st, Ptr{UInt8}(dest), Int(n), true)), s)
+ios_fillbuf(s::Ptr{Cvoid}) = with_ios(ios_fillbuf, s)
+ios_write(s::Ptr{Cvoid}, p::Ptr{Cvoid}, n::Csize_t) =
+    with_ios(st -> Csize_t(ios_write(st, Ptr{UInt8}(p), 0, Int(n))), s)
+ios_putc(c::Cint, s::Ptr{Cvoid}) = with_ios(st -> ios_putc(c, st), s)
+ios_flush(s::Ptr{Cvoid}) = with_ios(ios_flush, s)
+ios_getc(s::Ptr{Cvoid}) = with_ios(ios_getc, s)
+ios_peekc(s::Ptr{Cvoid}) = with_ios(ios_peekc, s)
+ios_eof_blocking(s::Ptr{Cvoid}) = with_ios(ios_eof_blocking, s)
+ios_seek(s::Ptr{Cvoid}, pos::Int64) = with_ios(st -> ios_seek(st, pos), s)
+ios_seek_end(s::Ptr{Cvoid}) = with_ios(ios_seek_end, s)
+ios_skip(s::Ptr{Cvoid}, offs::Int64) = with_ios(st -> ios_skip(st, offs), s)
+ios_pos(s::Ptr{Cvoid}) = with_ios(ios_pos, s)
+ios_filesize(s::Ptr{Cvoid}) = with_ios(ios_filesize, s)
+ios_trunc(s::Ptr{Cvoid}, size::Csize_t) = with_ios(st -> ios_trunc(st, UInt(size)), s)
+ios_isopen(s::Ptr{Cvoid}) = with_ios(st -> Cint(st.fd != -1), s)
+ios_get_readable(s::Ptr{Cvoid}) = with_ios(st -> Cint(st.readable), s)
+ios_get_writable(s::Ptr{Cvoid}) = with_ios(st -> Cint(st.writable), s)
+
+"""
+`ios_close(s)`: the dirty bytes written out and the fd closed (if owned): 0, or an error
+(errno set).
+"""
+function ios_close(s::Ptr{Cvoid})
+    p = Ptr{UInt8}(s)
+    # (closed already: nothing to write out and no fd, as natively; or never opened)
+    load_le(p, 0, 4) % UInt32 == IOS_MAGIC || return Cint(0)
+    i = Int(load_le(p, 4, 4))
+    st = IOS_TABLE[i]::IOS
+    err = ios_flush(st)
+    if st.fd != -1 && st.ownfd
+        r = fd_close(wasi_fd(st.fd))
+        r == 0 || (set_errno(libc_errno(r)); err = Cint(-1))
+    end
+    st.fd = -1
+    st.buf = UInt8[]
+    st.size = st.maxsize = st.bpos = 0
+    store_le!(p, 0, UInt64(IOS_CLOSED), 4)
+    save_closed!(p, st)
+    IOS_TABLE[i] = nothing
+    return err
+end
+
+## sys.c's functions of an `ios_t`
+
+jl_ios_fd(s::Ptr{Cvoid}) = with_ios(st -> st.fd, s)
+jl_nb_available(s::Ptr{Cvoid}) = with_ios(st -> (st.size - st.bpos) % Int32, s)
+
+"`jl_ios_buffer_n(s, n)`: 0 once `n` bytes are buffered, 1 if they cannot be."
+function jl_ios_buffer_n(s::IOS, n::UInt)
+    while true
+        space = (s.size - s.bpos) % UInt
+        ret = ios_readprep(s, n)
+        space == ret && ret < n && return Cint(1)
+        ret < n || return Cint(0)
+    end
+end
+jl_ios_buffer_n(s::Ptr{Cvoid}, n::Csize_t) = with_ios(st -> jl_ios_buffer_n(st, UInt(n)), s)
+
+"`jl_ios_get_nbyte_int(s, n)`: the `n`-byte little-endian integer at the position (buffered)."
+function jl_ios_get_nbyte_int(s::IOS, n::Int)
+    x = UInt64(0)
+    for i in 0:n-1
+        x |= UInt64(s.buf[s.bpos+i+1]) << (8i)
+    end
+    s.bpos += n
+    return x
+end
+jl_ios_get_nbyte_int(s::Ptr{Cvoid}, n::Csize_t) =
+    with_ios(st -> jl_ios_get_nbyte_int(st, Int(n)), s)
+
+"""
+`jl_readuntil(s, delim, str, chomp)`: the bytes up to `delim` (a `String` if `str`, else a
+`Vector{UInt8}`): with it (`chomp` 0), without it (1), or without it and a `\\r` before it (2).
+"""
+function jl_readuntil(s::IOS, delim::UInt8, str::UInt8, chomp::UInt8)
+    # (the common case: `delim` in the buffer)
+    pd = memchr(s.buf, s.bpos, delim, (s.size - s.bpos) % UInt)
+    if pd != -1
+        n = pd - s.bpos + 1
+        nchomp = chomp == 0 ? 0 : chomp == 2 ? ios_nchomp(s, n) : 1
+        a = s.buf[s.bpos+1:s.bpos+n-nchomp]
+        s.bpos += n
+    else
+        a = UInt8[]
+        n = ios_copyuntil(a, s, delim, true)
+        if chomp != 0 && n > 0 && a[n] == delim
+            n -= 1
+            chomp == 2 && n > 0 && a[n] == UInt8('\r') && (n -= 1)
+            resize!(a, n)
+        end
+    end
+    return str != 0 ? String(a) : a
+end
+jl_readuntil(s::Ptr{Cvoid}, delim::UInt8, str::UInt8, chomp::UInt8) =
+    with_ios(st -> jl_readuntil(st, delim, str, chomp), s)
 
 end # FS
 
