@@ -1067,7 +1067,7 @@ end
 end
 
 
-# seeks and skips of an `IOStream` relative to its 64 KiB read buffer (inside it, before and
+# seeks and skips of an `IOStream` relative to its 32 KiB read buffer (inside it, before and
 # after it, at and after the end), with writes between them, and reads into byte arrays,
 # arrays of other types and views; paths not in normal form
 function io_seeks(k::Int, out::IO)
@@ -1079,7 +1079,7 @@ function io_seeks(k::Int, out::IO)
         rec(what, " !! ", err_text(e, dir))
     end
     mkpath(dir)
-    n = 150_000   # (three buffers)
+    n = 150_000   # (more than four buffers)
     f = joinpath(dir, "data.bin")
     write(f, UInt8[i % 251 for i in 0:n-1])
     at(io) = (position(io), eof(io))
@@ -1088,8 +1088,8 @@ function io_seeks(k::Int, out::IO)
         seek(io, 1000); rec("in fwd ", read(io, UInt8), " ", at(io))
         seek(io, 10); rec("in back ", read(io, UInt8), " ", at(io))
         seek(io, 0); rec("buffer start ", read(io, UInt8), " ", at(io))
-        seek(io, 65535); rec("buffer last ", read(io, UInt8), " ", at(io))
-        seek(io, 65536); rec("buffer end ", read(io, UInt8), " ", at(io))
+        seek(io, 32767); rec("buffer last ", read(io, UInt8), " ", at(io))
+        seek(io, 32768); rec("buffer end ", read(io, UInt8), " ", at(io))
         seek(io, 140_000); rec("after ", read(io, UInt8), " ", at(io))
         seek(io, 5); rec("before ", read(io, UInt8), " ", at(io))
         skip(io, 100); rec("skip in ", read(io, UInt8), " ", at(io))
@@ -1120,12 +1120,19 @@ function io_seeks(k::Int, out::IO)
         rec("uint32 ", sum(u), " ", u[1], " ", at(io))
         r = Ref{UInt64}(0); unsafe_read(io, r, 8)
         rec("ref ", r[], " ", at(io))
+        i8 = Vector{Int8}(undef, 30); read!(io, i8)
+        rec("int8 ", sum(i8), " ", i8[1], " ", at(io))
+        # (a pointer of another type into a memory of bytes: the bytes from its offset)
+        c = zeros(UInt8, 20)
+        got = GC.@preserve c ccall(:ios_readall, Csize_t, (Ptr{Cvoid}, Ptr{UInt32}, Csize_t), io.ios,
+                                   Ptr{UInt32}(pointer(c, 5)), 8)
+        rec("cast ", Int(got), " ", c, " ", at(io))
         rec("readbytes ", readbytes!(io, b, 70_000), " ", length(b), " ", sum(b), " ", at(io))
         seek(io, n - 100); rec("readbytes at end ", readbytes!(io, b, 500), " ", at(io))
         # scalars across the end of a full buffer (its compaction), then back by a seek and a skip
-        seek(io, 0); read(io, UInt8); skip(io, 65_533)
+        seek(io, 0); read(io, UInt8); skip(io, 32_765)
         rec("scalar across ", read(io, UInt64), " ", at(io))
-        seek(io, 65_534); rec("scalar again ", read(io, UInt64), " ", at(io))
+        seek(io, 32_766); rec("scalar again ", read(io, UInt64), " ", at(io))
         skip(io, -8); rec("scalar skip back ", read(io, UInt32), " ", at(io))
         # the rest, with bytes buffered (its compaction)
         seek(io, 70_000); read(io, UInt8); x = read(io)
