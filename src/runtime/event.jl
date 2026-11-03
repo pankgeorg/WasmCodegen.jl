@@ -73,7 +73,9 @@ module Host
 import ..Staging
 import ..JuliaIO
 import ..showerror_any
+import ..showerror_as
 import ..Errno
+import ..Runtime
 using ..Runtime: @wasm_method
 
 """
@@ -185,14 +187,16 @@ end
     error_text(e) -> String
 
 The text `showerror` shows for the exception `e`, of any type: in a closed world a caught
-exception is of no known type, and `sprint(showerror, e)` is a dynamic call
-(`showerror_any` shows the runtime's and Base's usual exceptions).
+exception is of no known type, and `sprint(showerror, e)` is a dynamic call. By its type
+(`by_type`), the `showerror` of the type where the module can compile it, else
+`showerror_any`'s (the runtime's and Base's usual exceptions).
 """
 function error_text(@nospecialize(e))
     e isa HostCallError && return sprint(showerror, e::HostCallError)
     e isa SystemError && return system_error_text(e)
     io = IOBuffer()
-    showerror_any(io, e)
+    # (its type's `showerror`, where the module can compile it, see `BY_TYPE_CASES`)
+    Runtime.by_type(showerror_as, e, io) || showerror_any(io, e)
     return String(take!(io))
 end
 

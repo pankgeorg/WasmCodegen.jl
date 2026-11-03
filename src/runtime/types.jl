@@ -122,6 +122,19 @@ typeinfo_eltype(@nospecialize(T)) = (e = Base.typeinfo_eltype(T); e === nothing 
 pair_first_type(@nospecialize(T)) = T isa Type && T !== Union{} && T <: Pair ? fieldtype(T, 1) : Any
 pair_second_type(@nospecialize(T)) = T isa Type && T !== Union{} && T <: Pair ? fieldtype(T, 2) : Any
 
+"""
+    by_type(f, x, y) -> Bool
+
+`f(x, y, typeof(x))` for the type of `x`, if the module has a case of `f` for it: the code
+generator compiles `f(x, y, T)` for each type `T` of the module `f` is for (`BY_TYPE_CASES`), and
+calls the one of the type of `x` (`false` if none). The call of a function of a value of a type
+not known at compile time that a closed world can make, by its type. Natively, `false`.
+"""
+@noinline by_type(f::F, @nospecialize(x), @nospecialize(y)) where {F} = (NO_BY_TYPE[] = x; NO_CASE[])
+const NO_BY_TYPE = Ref{Any}(nothing)
+# (read through a global, so that inference does not fold the result into the callers)
+const NO_CASE = Ref(false)
+
 "The type a value shown in a context of `typeinfo` `T` is printed as (`nonnothing_nonmissing_typeinfo`)."
 nonnothing_nonmissing(@nospecialize(T)) = T isa Type ? Base.nonmissingtype(Base.nonnothingtype(T)) : Any
 

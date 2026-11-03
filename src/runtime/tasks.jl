@@ -36,6 +36,7 @@ module Tasks
 import ..Staging
 import ..JuliaIO
 import ..Host
+import ..Runtime
 using ..Runtime: @wasm_method, original
 
 const EINVAL = Int32(28)
@@ -225,17 +226,37 @@ function switch()
     t = NEXT[]
     ct = current_task()
     t === ct && return nothing
+    # (as `jl_switch`: a task that ended does not run again)
+    is_started(t) && t._state !== task_state_runnable && error("attempt to switch to exited task")
     exc = get_exception()
     SWITCHES[] += 1
-    # (the thread is the task's from its first run, as `jl_switch` sets it)
+    # (the thread is the task's while it runs, as `jl_switch` sets it)
     set_task_tid(t, Cint(0))
+    PREVIOUS[] = ct
     host_switch(task_id(ct), task_id!(t))
     # resumed (a stack only runs as the current task)
     set_current!(ct)
     set_exception!(exc)
+    unpin_previous!()
     return nothing
 end
 const SWITCHES = Ref(0)
+
+"The task that ran before the current one: the one a switch or an end was from."
+const PREVIOUS = Ref{Task}()
+
+"""
+    unpin_previous!()
+
+After a switch, as `jl_switch` and `start_task` (`MIGRATE_TASKS`): the task switched from is
+no longer the thread's unless it is sticky (its thread id is -1 again while it waits).
+"""
+function unpin_previous!()
+    isassigned(PREVIOUS) || return nothing
+    p = PREVIOUS[]
+    p.sticky || is_root(p) || (p.pad00 = 0x00)
+    return nothing
+end
 
 """
     wait_forever()
@@ -259,6 +280,7 @@ function task_entry(id::Int32)::Int32
     t = TASKS[id]::Task
     set_current!(t)
     clear_exception!()
+    unpin_previous!()
     if t._isexception
         # thrown into before it ran (`throwto`, `schedule(t, e; error=true)`)
         t.result = t.result
@@ -272,6 +294,7 @@ function task_entry(id::Int32)::Int32
     # (the next task's id first: it must differ from this one, which is free once its stack
     # can no longer run: no task runs before `host_exit`)
     nxt === nothing || set_task_tid(nxt, Cint(0))
+    PREVIOUS[] = t
     to = nxt === nothing ? NO_TASK_ID : task_id!(nxt)
     push!(FREE, id)
     nxt === nothing || set_current!(nxt)
@@ -360,31 +383,34 @@ function process_events(timeout_ns::Int64)
     end
     sort!(INTEREST)
     n = length(INTEREST)
-    n > 1024 && error("more than 1024 host waits")
     empty!(READY)
-    r = Int32(0)
+    r = 0
     if n > 0
         POLLS[] += 1
         # (closes to complete: no waiting)
         wait_ns = isempty(CLOSING) ? timeout_ns : Int64(0)
-        r = Staging.with_scope() do
-            interest = Staging.alloc_record(4n)
-            out = Staging.alloc_record(4n)
-            for (i, h) in enumerate(INTEREST)
-                Staging.store32(interest + UInt32(4(i - 1)), h % UInt32)
+        if n <= POLL_MAX
+            got = poll!(1, n, wait_ns)
+            if got == -EINVAL && wait_ns == -1
+                fail_waiters!(Host.HostCallError(EINVAL, Host.errmsg(Int32(-1))))
+                got = Int32(0)
             end
-            got = JuliaIO.poll(interest, Int32(n), wait_ns, out, Int32(n))
-            # (all ready handles first: a timer's callback calls the host)
-            for k in 0:Int(got)-1
-                push!(READY, Staging.load32(out + UInt32(4k)) % Int32)
+            got < 0 && Host.throw_host(-got, Int32(-1))
+        else
+            # (more handles than a poll takes: polls of each part of them, which do not wait;
+            # for a wait, while none is ready, a wait of a millisecond on the first part)
+            while true
+                for i in 1:POLL_MAX:n
+                    got = poll!(i, min(i + POLL_MAX - 1, n), Int64(0))
+                    got < 0 && Host.throw_host(-got, Int32(-1))
+                end
+                (isempty(READY) && wait_ns != 0) || break
+                got = poll!(1, POLL_MAX, Int64(1_000_000))
+                got < 0 && Host.throw_host(-got, Int32(-1))
+                isempty(READY) || break
             end
-            got
         end
-        if r == -EINVAL && wait_ns == -1
-            fail_waiters!(Host.HostCallError(EINVAL, Host.errmsg(Int32(-1))))
-            r = Int32(0)
-        end
-        r < 0 && Host.throw_host(-r, Int32(-1))
+        r = length(READY)
     end
     for h in READY
         tm = get(TIMERS, h, nothing)
@@ -396,9 +422,31 @@ function process_events(timeout_ns::Int64)
     while !isempty(CLOSING)
         timer_closed!(popfirst!(CLOSING))
     end
-    return Int(r)
+    return r
 end
 const POLLS = Ref(0)
+
+"The handles one `julia_io.poll` takes at most."
+const POLL_MAX = 1024
+
+# one `julia_io.poll` of `INTEREST[i:j]`, waiting `wait_ns`: the handles ready appended to
+# `READY` (all of them first: a timer's callback calls the host); their count, or the negated
+# errno
+function poll!(i::Int, j::Int, wait_ns::Int64)
+    n = j - i + 1
+    return Staging.with_scope() do
+        interest = Staging.alloc_record(4n)
+        out = Staging.alloc_record(4n)
+        for k in 0:n-1
+            Staging.store32(interest + UInt32(4k), INTEREST[i + k] % UInt32)
+        end
+        got = JuliaIO.poll(interest, Int32(n), wait_ns, out, Int32(n))
+        for k in 0:Int(got)-1
+            push!(READY, Staging.load32(out + UInt32(4k)) % Int32)
+        end
+        got
+    end
+end
 
 function fail_waiters!(e::Host.HostCallError)
     for ws in values(WAITERS), t in ws
@@ -618,11 +666,9 @@ function errormonitor_wasm(t::Task)
 end
 
 """
-`wait(r)` of an object `@sync` collected, by its type: of each type Base can wait for that a
-program of tasks has, `Base.wait` of it (`wait(r)` of a value of no known type is a dynamic
-call). Of another, natively a `MethodError`, or the wait of an object the module cannot wait
-for (a `Channel` of another element type than `Any`, of a type not known here; `Process`,
-`AsyncCondition`, `FileWatching`'s, which the module has not): a `MethodError`.
+`wait(r)` of an object `@sync` collected, by its type (`wait(r)` of a value of no known type is
+a dynamic call): `Base.wait` of each type of the module Base has a `wait` for (`by_type`), and
+for another, a `MethodError`, as natively.
 """
 function wait_synced(@nospecialize(r))
     if r isa Base.UnwrapTaskFailedException
@@ -634,21 +680,14 @@ function wait_synced(@nospecialize(r))
             ex isa TaskFailedException || rethrow()
             throw((ex::TaskFailedException).task.result)
         end
-    elseif r isa Timer
-        Base.wait(r)
-    elseif r isa Base.Event
-        Base.wait(r)
-    elseif r isa Condition
-        Base.wait(r)
-    elseif r isa Threads.Condition
-        Base.wait(r)
-    elseif r isa Channel{Any}
-        Base.wait(r)
     else
-        Core.throw_methoderror(Base.wait, r)
+        Runtime.by_type(wait_as, r, nothing) || Core.throw_methoderror(Base.wait, r)
     end
     return nothing
 end
+
+"`Base.wait(r)` of a value `r` of type `T` (a case of `by_type`)."
+@noinline wait_as(@nospecialize(r), @nospecialize(_), ::Type{T}) where {T} = (Base.wait(r::T); true)
 
 """
 `Base.sync_end` (`@sync`), as Base's: the tasks `@async`/`@spawn` put in its channel, and the

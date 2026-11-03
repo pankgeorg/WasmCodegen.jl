@@ -4,11 +4,11 @@
 // runs on a new instance unless `fresh` is false (then on the previous call's: tasks it left
 // parked may run). `jsTimer`: a setTimeout(0) is armed before the call; the result says
 // whether it fired before the call returned. `shutdownAfter`: the host is shut down that many
-// ms into the call (which then fails). A call that deadlocks (it never returns, as the native
-// program hangs) is reported, and its instance dropped. Prints the module's stdout as it goes
-// and one JSON line per call (prefixed with "@@ ") on stderr: {fn, result, ms, host, open,
-// jsTimerFired}, {fn, trap, terminal} or {fn, deadlock, host}, and {shutdown: abandoned} when an
-// instance is dropped.
+// ms into the call (which then fails); `settleAfter`: that many ms are waited after the call.
+// A call that deadlocks (it never returns, as the native program hangs) is reported, and its
+// instance dropped. Prints the module's stdout as it goes and one JSON line per call (prefixed
+// with "@@ ") on stderr: {fn, result, ms, host, open, jsTimerFired}, {fn, trap, terminal} or
+// {fn, deadlock, host}, and {shutdown: abandoned} when an instance is dropped.
 import { WASI } from 'node:wasi';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -28,7 +28,7 @@ async function instantiate() {
   const paths = makeJuliaIOPaths({ preopens: [dir] });
   const deadlock = {};
   deadlock.promise = new Promise((r) => { deadlock.resolve = r; });
-  const jt = makeJuliaTask({ onDeadlock: () => deadlock.resolve({ deadlock: true }) });
+  const jt = makeJuliaTask({ events, onDeadlock: () => deadlock.resolve({ deadlock: true }) });
   const instance = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: wasi.wasiImport,
                                                         julia_io: { ...paths.imports, ...events.imports }, ...jt.imports });
   events.bindMemory(instance.exports.memory);
@@ -68,6 +68,8 @@ for (const c of calls) {
     if (!c.expectTrap) code = 1;
     out({ fn: c.fn, trap: String((e && e.message) || e), terminal: !!jt.terminal(), host: jt.stats() });
   }
+  // (time for what would still run after the call)
+  if (c.settleAfter !== undefined) await new Promise((r) => setTimeout(r, c.settleAfter));
 }
 if (cur) out({ shutdown: cur.jt.shutdown() });
 fs.rmSync(dir, { recursive: true, force: true });

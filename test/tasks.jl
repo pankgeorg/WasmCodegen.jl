@@ -27,7 +27,7 @@ const P = TasksProgram
            P.pingpong_channel => (Int32,), P.shared_handle => (), P.early_return => (),
            P.deadlock_child => (), P.deadlock_root => (), P.deadlock_exit => (), P.child_trap => (Int32,),
            P.root_trap => (Int32,), P.stress => (Int32, Int32), P.task_stats => (),
-           P.discarded => (Int32,)]
+           P.discarded => (Int32,), P.sleep_then_print => ()]
     c = WasmCodegen.compile([Entry(f, T; name=string(nameof(f))) for (f, T) in fns];
                             config=WasmCodegen.Config(host=:wasi, host_extensions=[:julia_io], tasks=:jspi,
                                                       verify=:error))
@@ -46,7 +46,8 @@ const P = TasksProgram
              Dict("fn" => "task_stats", "fresh" => false, "expectTrap" => true),
              Dict("fn" => "root_trap", "args" => [10_000_000], "expectTrap" => true),
              Dict("fn" => "discarded", "args" => [70000]),
-             Dict("fn" => "pingpong_busy", "args" => [10_000_000], "shutdownAfter" => 20, "expectTrap" => true)]
+             Dict("fn" => "pingpong_busy", "args" => [10_000_000], "shutdownAfter" => 20, "expectTrap" => true),
+             Dict("fn" => "sleep_then_print", "shutdownAfter" => 20, "settleAfter" => 300, "expectTrap" => true)]
     out = IOBuffer(); err = IOBuffer()
     cmd = `$(node_cmd()) --disable-warning=ExperimentalWarning $(jspi_flags()) $(joinpath(@__DIR__, "tasks.mjs")) $wasm $(JSON.json(calls))`
     proc = run(pipeline(ignorestatus(cmd); stdout=out, stderr=err))
@@ -67,7 +68,8 @@ const P = TasksProgram
     @test stdout_wasm[1:something(findfirst("\ndone\n", stdout_wasm), 0:-1)[end]] == native
     error_lines(ls) = sort!([l for l in ls if !isempty(l) && l != "Stacktrace:" && !startswith(l, ' ') && !startswith(l, "@@ ")])
     @test error_lines(lines) == error_lines(split(String(take!(native_err)), '\n')) ==
-          ["Error in Timer:", "UNHANDLED TASK ERROR: monitored", "in a callback"]
+          ["Error in Timer:", "UNHANDLED TASK ERROR: MyError with code 7", "UNHANDLED TASK ERROR: monitored",
+           "in a callback"]
     # (the callback's error as natively without the backtrace: no line break after the text)
     @test occursin("Error in Timer:\nin a callback\n@@ ", errs)
     @test rs[1]["host"]["parked"] == 0 && rs[1]["open"] == 0
@@ -97,6 +99,8 @@ const P = TasksProgram
     @test num(17) == 7 << 32
     # the host shut down during a root call: the call fails
     @test occursin("shut down", rs[18]["trap"]) && rs[18]["terminal"]
+    # ... while a task waits in the host's poll: it does not run any more
+    @test occursin("shut down", rs[19]["trap"]) && !occursin("after the shutdown", stdout_wasm)
 end
 
 @testset "Config(tasks)" begin

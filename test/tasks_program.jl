@@ -466,6 +466,76 @@ function timer_error()
     close(tm)
 end
 
+# transfers to a task that ended: `throwto` (`jl_switch`'s error), `schedule`, `yieldto`
+function exited_switch()
+    t = @async nothing
+    wait(t)
+    r = try
+        Base.throwto(t, ErrorException("x"))
+        "no error"
+    catch e
+        e isa ErrorException ? (e::ErrorException).msg::String : "other"
+    end
+    s = try
+        schedule(t)
+        "no error"
+    catch e
+        e isa ErrorException ? (e::ErrorException).msg::String : "other"
+    end
+    println(Core.stdout, "exited: ", r, "; ", s, "; ", yieldto(t, 5)::Int)
+end
+
+# the thread of a task waiting: none for one not sticky (`Threads.@spawn`), the one for a
+# sticky one
+function waiting_threads()
+    c = Condition()
+    s = Threads.@spawn wait(c)
+    yield()
+    a = Threads.threadid(s)
+    notify(c)
+    wait(s)
+    u = @async wait(c)
+    yield()
+    b = Threads.threadid(u)
+    notify(c)
+    wait(u)
+    println(Core.stdout, "threads of waiting tasks ", a, " ", Threads.threadid(s), " ", b)
+end
+
+# more timers than a host poll takes
+function many_timers()
+    ts = [Timer(60) for _ in 1:1500]
+    yield()
+    yield()
+    foreach(close, ts)
+    println(Core.stdout, "many timers, open ", count(isopen, ts))
+end
+
+# `@sync` of a Channel of an element type other than `Any`
+function sync_typed_channel()
+    q = Channel{Any}(2)
+    c = Channel{Int}(1)
+    put!(c, 1)
+    put!(q, c)
+    Base.sync_end(q)
+    println(Core.stdout, "sync of a Channel{Int}: ", isready(c))
+end
+
+# an exception of the program's, with its `showerror`: on stderr as natively (`errormonitor`)
+struct MyError <: Exception
+    code::Int
+end
+Base.showerror(io::IO, e::MyError) = print(io, "MyError with code ", e.code)
+function monitor_own()
+    t = errormonitor(@async throw(MyError(7)))
+    try
+        wait(t)
+    catch
+    end
+    yield()
+    println(Core.stdout, "own error monitored ", istaskfailed(t))
+end
+
 function main()::Int32
     root_state()
     producer_consumer()
@@ -478,6 +548,7 @@ function main()::Int32
     yield_until_timer()
     timers()
     monitor()
+    monitor_own()
     channels()
     sync_spawn()
     rng()
@@ -493,6 +564,10 @@ function main()::Int32
     interval_late()
     timers_order()
     timer_error()
+    exited_switch()
+    waiting_threads()
+    many_timers()
+    sync_typed_channel()
     println(Core.stdout, "done")
     return Int32(0)
 end
@@ -623,6 +698,9 @@ function discarded(n::Int32)::Int64
     _, _, live = WasmCodegen.Runtime.Tasks.stats()
     return Int64(v) << 32 | Int64(live)
 end
+
+# sleeps (in the host's poll) while the host shuts down: it does not run any more
+sleep_then_print()::Int32 = (sleep(0.1); println(Core.stdout, "after the shutdown"); Int32(0))
 
 "(switches, polls, live task ids) of the module, as one number: switches * 2^32 + live"
 function task_stats()::Int64

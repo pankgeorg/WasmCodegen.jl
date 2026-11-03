@@ -325,10 +325,12 @@ export function makeJuliaIOEvents(opts = {}) {
   let lastError = ''; // errmsg(-1)
   let inPoll = false;
   let waker = null; // resolves the suspended poll
+  let pollTimer = null; // the suspended poll's timeout
+  let stopped = false; // the instance is done (`stop`): nothing resumes it
   const stats = { maxOpen: 0, started: 0 };
 
   // ---- bookkeeping ----
-  function notify() { if (waker) { const w = waker; waker = null; w(); } }
+  function notify() { if (waker && !stopped) { const w = waker; waker = null; w(); } }
   function newHandle(entry) {
     const h = nextHandle++;
     entry.id = h;
@@ -340,6 +342,7 @@ export function makeJuliaIOEvents(opts = {}) {
   function get(h) { return handles.get(h | 0); }
   function guard(name) {
     if (inPoll) throw new JuliaIOAssertion(`${name} called while poll is suspended (two promising calls in flight on one instance)`);
+    if (stopped) throw new JuliaIOAssertion(`${name} called after stop()`);
   }
   // an import: an assertion is rethrown; any other exception is an errno, by `fail`
   function wrap(name, f, fail) {
@@ -441,15 +444,15 @@ export function makeJuliaIOEvents(opts = {}) {
 
   async function suspend(interest, timeout_ns, out_off, cap) {
     inPoll = true;
-    let timer = null, timedOut = false;
+    let timedOut = false;
     try {
       if (timeout_ns > 0n) {
         // (armed again until the deadline: a timeout is at most 2^31 - 1 ms, 24.8 days)
         const deadline = performance.now() + Number(timeout_ns) / 1e6;
         const arm = () => {
           const ms = deadline - performance.now();
-          if (ms <= 0) { timer = null; timedOut = true; notify(); return; }
-          timer = setTimeout(arm, Math.min(Math.ceil(ms), 0x7fffffff));
+          if (ms <= 0) { pollTimer = null; timedOut = true; notify(); return; }
+          pollTimer = setTimeout(arm, Math.min(Math.ceil(ms), 0x7fffffff));
         };
         arm();
       }
@@ -467,7 +470,7 @@ export function makeJuliaIOEvents(opts = {}) {
       if (e instanceof JuliaIOAssertion) throw e;
       return neg(e);
     } finally {
-      if (timer) clearTimeout(timer);
+      if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
       inPoll = false;
       waker = null;
     }
@@ -526,6 +529,15 @@ export function makeJuliaIOEvents(opts = {}) {
       const x = get(h);
       if (!x) return null;
       return { kind: 'timer', fired: x.fired, cancelled: x.cancelled, ready: isReady(x) };
+    },
+    // The instance is done (it trapped, or its embedder shut it down: `julia_task.mjs` calls
+    // this): a suspended `poll` never resumes its stack, the timers are released, and later
+    // calls are errors.
+    stop() {
+      stopped = true;
+      waker = null;
+      if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+      for (const x of handles.values()) disarm(x);
     },
   };
 }

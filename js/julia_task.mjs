@@ -19,7 +19,7 @@
 //       calls `exit(id, _)` before it returns 0.
 //
 //   const events = makeJuliaIOEvents();                                     // js/julia_io.mjs
-//   const jt = makeJuliaTask({ onDeadlock: () => jt.shutdown() });
+//   const jt = makeJuliaTask({ events, onDeadlock: () => jt.shutdown() });
 //   const instance = await WebAssembly.instantiate(mod, {
 //     wasi_snapshot_preview1: wasi.wasiImport, julia_io: events.imports, ...jt.imports });
 //   events.bindMemory(instance.exports.memory); wasi.initialize(instance);
@@ -49,8 +49,10 @@
 // ending without its exit fails the root call in flight, and the instance becomes terminal;
 // `shutdown()` makes it terminal when it is no longer needed. Terminal: parked stacks are
 // dropped (never resumed), a resumption or start already queued does not run, later failures
-// go nowhere and later root calls are refused. The `finally` blocks of abandoned tasks do not
-// run: host handles they held stay open until the embedder releases the `julia_io` adapter.
+// go nowhere and later root calls are refused; a stack suspended in julia_io's `poll` is
+// dropped too (`events`, the julia_io events adapter, is stopped). The `finally` blocks of
+// abandoned tasks do not run: host handles they held stay open until the embedder releases
+// the `julia_io` adapter.
 
 export const JULIA_TASK_VERSION = 1;
 export const MAX_TASK_ID = 65535;
@@ -62,6 +64,7 @@ export const importsJuliaTask = (mod) => WebAssembly.Module.imports(mod).some((i
 
 export function makeJuliaTask(opts = {}) {
   const onDeadlock = opts.onDeadlock || (() => {});
+  const events = opts.events || null; // the julia_io events, stopped with the instance
   const keepAlive = opts.keepAlive !== false;
   let entry = null;          // promising(jl_task_entry)
   const parked = new Map();  // task id -> resolve of its parked stack's promise
@@ -88,6 +91,8 @@ export function makeJuliaTask(opts = {}) {
     live.clear();
     current = -1;
     if (keeper) { clearInterval(keeper); keeper = null; }
+    // (a stack suspended in julia_io's poll must not resume either)
+    if (events) events.stop();
   }
   // The deferred resumption or start: at most one at a time (exactly one stack runs, or is
   // about to), in one slot, run by one function (no allocation per switch)

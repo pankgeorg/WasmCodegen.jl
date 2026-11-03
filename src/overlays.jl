@@ -73,6 +73,13 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
     elseif m.module === Runtime && m.name === :map_type_value
         f = mi.specTypes.parameters[2]
         return emit_map_type!(fc, f.instance, operand(fc, ex.args[4]))
+    elseif m.module === Runtime && m.name === :by_type
+        # (`f(x, y, typeof(x))` of the module's case for the type of `x`, see `BY_TYPE_CASES`)
+        f = mi.specTypes.parameters[2].instance
+        push_val!(fc, convert_repr(fc, operand(fc, ex.args[4]), Any))
+        push_val!(fc, convert_repr(fc, operand(fc, ex.args[5]), Any))
+        call!(fc.b, by_type_func!(fc.cgm, f))
+        return pop_val!(fc, Bool)
     elseif m.module === Runtime.Tasks && m.name in TASK_PRIMITIVES
         return emit_task_primitive!(fc, m.name, mi, ex)
     elseif fc.cgm.config.tasks === :none && m.module === Base &&
@@ -147,7 +154,9 @@ end
     finish_task_runners!(cgm)
 
 The body of the function `call_body` compiles to: by the type id of the task's body, a call of
-its runner (a trap for another type: a task's body is of a type `Task` was made of).
+its runner. A body of another type traps: a task's body is of a type `Task` was made of, unless
+its `code` was replaced by a function of a type never given to `Task` (natively, `start_task`
+calls whatever `code` holds; here only the types `Task` was made of have a runner).
 """
 function finish_task_runners!(cgm::CGModule)
     f = get(cgm.helpers, :task_runner_dispatch, nothing)

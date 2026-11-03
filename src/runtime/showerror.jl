@@ -3,6 +3,10 @@
 # a dynamic call: `showerror_any` shows the exceptions of Base whose message is text, each
 # as Base shows it, by testing for their types. Needs `Errno` (`staging.jl`) before it.
 
+"`showerror(io, e)` of an exception `e` of type `T` (a case of `by_type`): `true`."
+@noinline showerror_as(@nospecialize(e), @nospecialize(io), ::Type{T}) where {T} =
+    (showerror(io::IOBuffer, e::T); true)
+
 """
     showerror_any(io, e)
 
