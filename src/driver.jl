@@ -65,8 +65,9 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
     Runtime.sync_gensym_counter!()
     # (the bindings that name functions and enums, as of this compilation)
     empty!(Runtime.FUNCTION_SHOWS); empty!(Runtime.ENUM_SHOWS)
-    mis = Core.MethodInstance[entry_instance(e.f, e.argtypes; world) for e in entries]
-    w = collect_world(mis; world, verify=config.verify)
+    extensions = config.host_extensions
+    mis = Core.MethodInstance[entry_instance(e.f, e.argtypes; world, extensions) for e in entries]
+    w = collect_world(mis; world, verify=config.verify, extensions)
     restores = Any[]
     local result
     try

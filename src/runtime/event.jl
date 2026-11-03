@@ -23,6 +23,8 @@ a value ≥ 0 or a negated WASI errno.
 """
 module JuliaIO
 
+import ..FS
+
 timer_start(ns::Int64) = ccall((:timer_start, "julia_io"), Int32, (Int64,), ns)
 poll(interest::UInt32, n_interest::Int32, timeout_ns::Int64, out::UInt32, cap::Int32) =
     ccall((:poll, "julia_io"), Int32, (UInt32, Int32, Int64, UInt32, Int32),
@@ -40,12 +42,23 @@ path_chmod(path::UInt32, len::UInt32, mode::Int32) =
 path_symlink(target::UInt32, tlen::UInt32, link::UInt32, llen::UInt32) =
     ccall((:path_symlink, "julia_io"), Int32, (UInt32, UInt32, UInt32, UInt32), target, tlen, link, llen)
 
+"""
+The methods the module compiles in place of the native ones when its host has `julia_io`
+(`EXTENSION_METHODS[:julia_io]`): the seams of `FS` on the host's file modes and symbolic links.
+Other modules keep their defaults, a host without modes.
+"""
+Base.Experimental.@MethodTable(METHODS)
+
+Base.Experimental.@overlay METHODS FS.path_mode(path::UInt32, len::UInt32, follow::Int32) =
+    path_mode(path, len, follow)
+Base.Experimental.@overlay METHODS FS.path_chmod(path::UInt32, len::UInt32, mode::Int32) =
+    path_chmod(path, len, mode)
+Base.Experimental.@overlay METHODS FS.path_symlink_io(target::UInt32, tlen::UInt32, link::UInt32, llen::UInt32) =
+    path_symlink(target, tlen, link, llen)
+
 end # JuliaIO
 
-# (only in modules whose host has `julia_io`: others keep the defaults, a host without modes)
-EXTENSION_IMPLS[:julia_io] = IdDict{Any,Any}(FS.path_mode => JuliaIO.path_mode,
-                                             FS.path_chmod => JuliaIO.path_chmod,
-                                             FS.path_symlink_io => JuliaIO.path_symlink)
+EXTENSION_METHODS[:julia_io] = JuliaIO.METHODS
 
 """
     Host

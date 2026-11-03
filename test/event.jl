@@ -185,6 +185,12 @@ end
     native = EV.modes(d1)
     @test native == "mode 640;chmod ok;symlink ok /nonexistent/target;"
     @test filemode(joinpath(d1, "f")) & 0o777 == 0o604
+    # the seams: the methods of the extension's table with it, the defaults without it
+    F = WasmCodegen.Runtime.FS
+    sig = (UInt32, UInt32, Int32)
+    @test WasmCodegen.entry_instance(F.path_mode, sig; extensions=[:julia_io]).def.external_mt ===
+          WasmCodegen.Runtime.JuliaIO.METHODS
+    @test !isdefined(WasmCodegen.entry_instance(F.path_mode, sig).def, :external_mt)
     # with the extension: the host's modes, as natively (and no events: no JSPI)
     cfg = WasmCodegen.Config(host=:wasi, host_extensions=[:julia_io])
     c = WasmCodegen.compile(EV.modes_print, (Int,); config=cfg)

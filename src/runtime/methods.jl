@@ -2,7 +2,9 @@
 # method table (`interpreter.jl`). Natively, in the build process, a function with such a
 # method does what Julia does there (reads the process's options, ...); inference for Wasm
 # finds the method of `WASM_METHODS` instead, so the module runs it. They are defined with
-# `@wasm_method`, as `Base.Experimental.@overlay` defines methods of a GPU's method table.
+# `@wasm_method`, as `Base.Experimental.@overlay` defines methods of a GPU's method table. An
+# extension of the host has a table of its own (`EXTENSION_METHODS`), consulted before this one
+# in modules whose host provides it.
 
 "The methods the module compiles in place of the native ones (see above)."
 Base.Experimental.@MethodTable(WASM_METHODS)
@@ -38,25 +40,28 @@ function a patch calls can call the method the patch replaced.
 original(f, args...; kw...) = Base.invoke_in_world(PRE_PATCH_WORLD[], f, args...; kw...)
 
 """
-The implementations of runtime functions for an extension of the host (see
-`Config(host_extensions = ...)`): `EXTENSION_IMPLS[ext][f]` is compiled in place of `f` only
-in modules whose host provides `ext`. (A function whose default implementation is right for
-hosts without the extension, `FS.path_mode` and the like.)
+The method tables of the host's extensions (`Config(host_extensions)`): the methods of
+`EXTENSION_METHODS[ext]` are compiled in place of the native ones, and of those of
+`WASM_METHODS`, only in modules whose host provides `ext` (where a function's method for other
+hosts is right without the extension: `FS.path_mode` and the like). They are defined with
+`Base.Experimental.@overlay`, under the rule of `@wasm_method`.
 """
-const EXTENSION_IMPLS = Dict{Symbol,IdDict{Any,Any}}()
+const EXTENSION_METHODS = Dict{Symbol,Core.MethodTable}()
+
+"The extensions of `extensions` that have a method table, each once, in order."
+table_extensions(extensions) = unique!(Symbol[ext for ext in extensions if haskey(EXTENSION_METHODS, ext)])
 
 """
-    extension_impl(f, extensions) -> Union{Nothing,Function}
+    overlay_tables(extensions) -> Vector{Core.MethodTable}
 
-The function compiled in place of the runtime function `f`, in a module whose host provides
-the extensions `extensions`, or `nothing`.
+The overlay method tables of a module whose host provides `extensions`, in the order they are
+consulted: the extensions' (in the order given), then `WASM_METHODS`.
 """
-function extension_impl(@nospecialize(f), extensions)
-    for ext in extensions
-        impls = get(EXTENSION_IMPLS, ext, nothing)
-        impls === nothing && continue
-        impl = get(impls, f, nothing)
-        impl === nothing || return impl
-    end
-    return nothing
+function overlay_tables(extensions)
+    tables = Core.MethodTable[EXTENSION_METHODS[ext] for ext in table_extensions(extensions)]
+    return push!(tables, WASM_METHODS)
 end
+
+"Whether `m` is a method of `WASM_METHODS` or of an extension's table."
+overlay_method(m::Method) = isdefined(m, :external_mt) &&
+    (m.external_mt === WASM_METHODS || any(mt -> mt === m.external_mt, values(EXTENSION_METHODS)))

@@ -122,23 +122,31 @@ end
     @test_throws WasmCodegen.TrimFailure WasmCodegen.compile(T.through_invoke, (Int,); config=WasmCodegen.Config(verify=:error))
 end
 
-# no method of `WASM_METHODS` is more `:consistent` than the native one it replaces: inference
-# evaluates calls at compile time with the native methods (see `@wasm_method`)
+# no method of `WASM_METHODS`, or of an extension's table, is more `:consistent` than the native
+# one it replaces: inference evaluates calls at compile time with the native methods (see
+# `@wasm_method`)
 @testset "methods of WASM_METHODS" begin
-    ms = Method[]
-    Base.visit(m -> Base.moduleroot(m.module) === WasmCodegen && push!(ms, m), WasmCodegen.Runtime.WASM_METHODS)
-    @test !isempty(ms)
+    R = WasmCodegen.Runtime
+    tables = Any[(Symbol[], R.WASM_METHODS); [([ext], mt) for (ext, mt) in R.EXTENSION_METHODS]]
+    @test length(tables) > 1
     WasmCodegen.with_trim_patches() do _, w
-        interp = WasmCodegen.WasmInterpreter(; world=w)
-        for m in ms
-            sig = Base.unwrap_unionall(m.sig)
-            ft = sig.parameters[1]
-            ft === typeof(Core.kwcall) && continue
-            f = Base.issingletontype(ft) ? ft.instance : ft.parameters[1]
-            tt = Tuple(sig.parameters[2:end])
-            replacement = Base.infer_effects(f, tt; interp, world=w)
-            native = Base.infer_effects(f, tt; world=w)
-            @test !Base.Compiler.is_consistent(replacement) || Base.Compiler.is_consistent(native)
+        for (extensions, mt) in tables
+            ms = Method[]
+            Base.visit(m -> Base.moduleroot(m.module) === WasmCodegen && push!(ms, m), mt)
+            @test !isempty(ms)
+            interp = WasmCodegen.WasmInterpreter(; world=w, extensions)
+            for m in ms
+                sig = Base.unwrap_unionall(m.sig)
+                ft = sig.parameters[1]
+                ft === typeof(Core.kwcall) && continue
+                f = Base.issingletontype(ft) ? ft.instance : ft.parameters[1]
+                tt = Tuple(sig.parameters[2:end])
+                # (the module's method is this one)
+                @test Base.Compiler.findsup(m.sig, WasmCodegen.WasmMethodTable(w, extensions))[1].method === m
+                replacement = Base.infer_effects(f, tt; interp, world=w)
+                native = Base.infer_effects(f, tt; world=w)
+                @test !Base.Compiler.is_consistent(replacement) || Base.Compiler.is_consistent(native)
+            end
         end
     end
 end

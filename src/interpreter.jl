@@ -1,27 +1,32 @@
 # The abstract interpreter that infers code for Wasm: Julia's native inference, with its own
 # code cache. What Wasm needs replaced is mostly replaced by method definitions in a newer
 # world (`patches.jl`), as juliac does, so inference (and its concrete evaluation) is the
-# native one. The methods of `Runtime.WASM_METHODS` (an overlay method table, `methods.jl`)
-# replace those whose native method the build process needs itself (`WasmMethodTable`).
+# native one. The methods of `Runtime.WASM_METHODS` (an overlay method table, `methods.jl`),
+# and of the tables of the host's extensions the module has, replace those whose native method
+# the build process needs itself (`WasmMethodTable`).
 
 """
-The owner of the CodeInstances inferred for Wasm in Julia's code cache, for the methods of
-`Runtime.WASM_METHODS` as they are: how many were defined, and how many are in force. Code
-inferred before one was defined or deleted is not reused, since that does not invalidate it
-(a caller that found the native method has no backedge to the overlay method table).
+The owner of the CodeInstances inferred for Wasm in Julia's code cache, for the overlay method
+tables of the host's extensions `extensions` and `Runtime.WASM_METHODS` as they are: how many
+methods were defined in them, and how many are in force. Code inferred for other extensions, or
+before a method was defined or deleted, is not reused, since that does not invalidate it (a
+caller that found the native method has no backedge to an overlay method table).
 """
 struct WasmCacheOwner
+    extensions::Tuple{Vararg{Symbol}}
     defined::Int
     in_force::Int
 end
 
-function WasmCacheOwner()
+function WasmCacheOwner(extensions=())
     defined = in_force = 0
-    Base.visit(Runtime.WASM_METHODS) do m
-        defined += 1
-        m.dispatch_status == 0 || (in_force += 1)
+    for mt in Runtime.overlay_tables(extensions)
+        Base.visit(mt) do m
+            defined += 1
+            m.dispatch_status == 0 || (in_force += 1)
+        end
     end
-    return WasmCacheOwner(defined, in_force)
+    return WasmCacheOwner(Tuple(Runtime.table_extensions(extensions)), defined, in_force)
 end
 
 """
@@ -60,28 +65,66 @@ Base.length(d::CodegenSources) = length(d.dict)
 Base.iterate(d::CodegenSources, s...) = iterate(d.dict, s...)
 
 """
-    WasmMethodTable(world)
+    WasmMethodTable(world, extensions=())
 
-The methods of `world`, with those of `Runtime.WASM_METHODS` in place of the native ones they
-replace (an overlay method table), reported as not overlaid: inference evaluates calls at
-compile time with the native methods, as for native code. (Compiler does not evaluate code
-an overlay method table could reach, which includes every dynamic call, so reflection code
-evaluated at compile time would no longer be.) That is sound because no method of
-`WASM_METHODS` is more `:consistent` than the native one it replaces (see `@wasm_method`).
+The methods of `world`, with those of the overlay method tables of a module whose host has the
+extensions `extensions` in place of the native ones they replace: the extensions' tables, then
+`Runtime.WASM_METHODS` (`Runtime.overlay_tables`), each falling back to the next and the last
+to the native methods, as `CC.OverlayMethodTable` falls back. Reported as not overlaid:
+inference evaluates calls at compile time with the native methods, as for native code.
+(Compiler does not evaluate code an overlay method table could reach, which includes every
+dynamic call, so reflection code evaluated at compile time would no longer be.) That is sound
+because no method of these tables is more `:consistent` than the native one it replaces (see
+`@wasm_method`).
 """
 struct WasmMethodTable <: CC.MethodTableView
-    table::CC.OverlayMethodTable
+    world::UInt
+    tables::Vector{Core.MethodTable}
 end
-WasmMethodTable(world::UInt) = WasmMethodTable(CC.OverlayMethodTable(world, Runtime.WASM_METHODS))
-CC.findall(@nospecialize(sig::Type), t::WasmMethodTable; limit::Int=-1) = CC.findall(sig, t.table; limit)
-CC.findsup(@nospecialize(sig::Type), t::WasmMethodTable) = CC.findsup(sig, t.table)
+WasmMethodTable(world::UInt, extensions=()) = WasmMethodTable(world, Runtime.overlay_tables(extensions))
+
+# (`CC.OverlayMethodTable`'s, for a list of tables: the matches of each table but those a
+# match of an earlier table covers, up to the first table whose last match covers `sig`)
+function CC.findall(@nospecialize(sig::Type), t::WasmMethodTable; limit::Int=-1)
+    matches = Any[]
+    min_world, max_world = typemin(UInt), typemax(UInt)
+    ambig = false
+    for mt in Union{Nothing,Core.MethodTable}[t.tables; nothing]
+        result = CC._findall(sig, mt, t.world, limit)
+        result === nothing && return nothing
+        earlier = length(matches)
+        for match in result.matches
+            dominated = any(i -> (match::Core.MethodMatch).method.sig <: (matches[i]::Core.MethodMatch).method.sig,
+                            1:earlier)
+            dominated || push!(matches, match)
+        end
+        min_world = max(min_world, result.valid_worlds.min_world)
+        max_world = min(max_world, result.valid_worlds.max_world)
+        ambig |= result.ambig
+        nr = length(result)
+        nr ≥ 1 && result[nr].fully_covers && break
+    end
+    return CC.MethodLookupResult(matches, CC.WorldRange(min_world, max_world), ambig)
+end
+
+# (the match of the first table that has one)
+function CC.findsup(@nospecialize(sig::Type), t::WasmMethodTable)
+    min_world, max_world = typemin(UInt), typemax(UInt)
+    for mt in Union{Nothing,Core.MethodTable}[t.tables; nothing]
+        match, valid_worlds = CC._findsup(sig, mt, t.world)
+        min_world = max(min_world, valid_worlds.min_world)
+        max_world = min(max_world, valid_worlds.max_world)
+        match === nothing || return match, CC.WorldRange(min_world, max_world)
+    end
+    return nothing, CC.WorldRange(min_world, max_world)
+end
 CC.isoverlayed(::WasmMethodTable) = false
 
 """
-    WasmInterpreter(; world)
+    WasmInterpreter(; world, extensions=())
 
 Julia's native inference and optimization in `world`, with its own code cache and the
-methods of `Runtime.WASM_METHODS`.
+methods of `Runtime.WASM_METHODS` and of the tables of the host's extensions `extensions`.
 """
 struct WasmInterpreter <: CC.AbstractInterpreter
     world::UInt
@@ -93,8 +136,8 @@ struct WasmInterpreter <: CC.AbstractInterpreter
     codegen::CodegenSources
 end
 
-function WasmInterpreter(; world::UInt=Base.get_world_counter())
-    mt = CC.CachedMethodTable(WasmMethodTable(world))
+function WasmInterpreter(; world::UInt=Base.get_world_counter(), extensions=())
+    mt = CC.CachedMethodTable(WasmMethodTable(world, extensions))
     inf_params = CC.InferenceParams(; force_enable_inference=true)
     # calls target the method instance of their argument types, not the signature native
     # code would be compiled for, which widens arguments of type Function, Type and Vararg
@@ -102,7 +145,7 @@ function WasmInterpreter(; world::UInt=Base.get_world_counter())
     # `down::Function`): a closed world has no dynamic dispatch to fall back on
     opt_params = CC.OptimizationParams(; compilesig_invokes=false)
     return WasmInterpreter(world, mt, CC.InferenceResult[], inf_params, opt_params,
-                           CodegenSources(WasmCacheOwner()))
+                           CodegenSources(WasmCacheOwner(extensions)))
 end
 
 CC.InferenceParams(interp::WasmInterpreter) = interp.inf_params
