@@ -42,9 +42,15 @@ function utc_fields(t::Int64)
             Int32(y - 1900), Int32(wday), Int32(yday))
 end
 
+"""
+The offset of the local time zone from UTC, in seconds: WASI has no time zone, so local time
+is UTC. (Read, as the C library reads the zone, rather than a constant: see `@wasm_method`.)
+"""
+const LOCAL_OFFSET = Ref(0)
+
 # (the seconds as an integer, as C's time_t: exact for integers, floored for others)
 @wasm_method function Base.Libc.TmStruct(t::Real)
-    f = utc_fields(t isa Integer ? Int64(t) : Int64(floor(t)))
+    f = utc_fields((t isa Integer ? Int64(t) : Int64(floor(t))) + LOCAL_OFFSET[])
     return Base.Libc.TmStruct(f..., Int32(0))
 end
 

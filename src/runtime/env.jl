@@ -128,12 +128,11 @@ function setenv(name::Cstring, value::Cstring, overwrite::Int32)
     return Int32(0)
 end
 
-"`unsetenv(name)`: 0, or -1 (EINVAL) for an empty name or one with `=`."
+"`unsetenv(name)`: 0, or -1 (EINVAL) for an empty name or one with `=`. Every entry of the name goes, as glibc's (a host's environment may repeat one)."
 function unsetenv(name::Cstring)
     n = unsafe_string(name)
     valid_name(n) || (set_errno(22); return Int32(-1))
-    i = find(n)
-    i == 0 || deleteat!(entries(), i)
+    filter!(e -> e.name != n, entries())
     return Int32(0)
 end
 
