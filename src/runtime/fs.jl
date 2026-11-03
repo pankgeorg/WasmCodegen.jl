@@ -1008,6 +1008,12 @@ copy_in!(off::UInt32, src::Ptr{UInt8}, i::Int, n::Int) =
 enonfatal(r::Int32) = r == Int32(27) || r == Int32(6)
 const MAX_TRIES = 1_000_000
 
+# the WASI errno of a read or write of a descriptor: one without the right to it (WASI's
+# ENOTCAPABLE, 76, its rights those of how it was opened) is EBADF (8), as natively a
+# descriptor not open for reading or writing is (for a path, ENOTCAPABLE is EACCES: one
+# leaving the preopens)
+fd_errno(r::Int32) = r == Int32(76) ? Int32(8) : r
+
 # Synchronous hosts can retry EINTR, but cannot wait for readiness on EAGAIN: libuv reports
 # it; ios.c's `_os_read` and `_os_write` try again (`eagain`).
 """
@@ -1028,7 +1034,7 @@ function write_once(fd::Int32, off::UInt32, n::UInt32, offset::Int64=Int64(-1); 
             (tries += 1) > MAX_TRIES && throw(Base._UVError("write", uv(r)))
             continue
         end
-        r == 0 || return uv(r)
+        r == 0 || return uv(fd_errno(r))
         return reinterpret(Int32, Staging.load32(Staging.SCRATCH_OUT))
     end
 end
@@ -1045,7 +1051,7 @@ function read_once(fd::Int32, off::UInt32, n::UInt32, offset::Int64=Int64(-1); e
             (tries += 1) > MAX_TRIES && throw(Base._UVError("read", uv(r)))
             continue
         end
-        r == 0 || return uv(r)
+        r == 0 || return uv(fd_errno(r))
         return reinterpret(Int32, Staging.load32(Staging.SCRATCH_OUT))
     end
 end
