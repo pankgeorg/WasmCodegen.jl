@@ -173,16 +173,13 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return convert_repr(fc, emit_new!(fc, constant_value(T), CGVal[]), Any)
     elseif name in (:jl_gc_disable_finalizers_internal, :jl_gc_enable_finalizers_internal,
                     :jl_cpu_suspend, :jl_cpu_pause, :jl_cpu_wake, :jl_gc_safepoint,
-                    :jl_gc_run_pending_finalizers, :jl_threadid, :jl_get_task_tid)
+                    :jl_gc_run_pending_finalizers, :jl_threadid)
         # (one thread: the first; no finalizers run during code)
         return typ === Nothing ? ghost(Nothing, nothing) : const_value(fc, zero(typ))
     elseif name === :jl_clock_now
         # (`time()`) the host's time of day, seconds since the Unix epoch
         call!(fc.b, host_func!(fc.cgm, :clock_now))
         return pop_val!(fc, Float64)
-    elseif fc.cgm.config.tasks === :jspi && name in (:jl_set_task_tid, :jl_set_task_threadpoolid)
-        # (tasks on one thread: every task is the first thread's, in the default pool)
-        return const_value(fc, convert(typ, 1))
     elseif name === :jl_hrtime
         # (`time_ns`) the host's monotonic clock
         call!(fc.b, host_func!(fc.cgm, :hrtime))

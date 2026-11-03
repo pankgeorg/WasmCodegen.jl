@@ -162,6 +162,7 @@ end
 
 # (the image first, then the type maps, which add types: the tables over types after them)
 function finish_module!(cgm::CGModule)
+    finish_task_runners!(cgm)
     finish_exports!(cgm)
     finish_gensym_counter!(cgm)
     finish_modules!(cgm)

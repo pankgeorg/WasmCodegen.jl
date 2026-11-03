@@ -12,22 +12,24 @@
 # stacks.
 #
 # A task's body is a closure of a type known where the task is created (`Task(f)` is
-# specialized on `f` by the patch): `entry_slot!(F)` stores a reference to the compiled
-# `run_body(::Task, ::Type{F})` in a table of the module, at a slot of its own for `F`, which
-# `call_entry` calls on the new stack: no dynamic dispatch. A task gets its id (for the host)
-# at its first run and gives it back at its end: Tasks that never run hold none, and are not
-# kept alive by the runtime.
+# specialized on `f` by the patch): `add_runner!(F)` has the module compile
+# `run_body(::Task, ::Type{F})`, which `call_body` calls on the new stack by the type of the
+# task's `code`, as the C runtime's `start_task` calls it: no dynamic dispatch. A task gets its
+# id (for the host) at its first run and gives it back at its end: Tasks that never run hold
+# none, and are not kept alive by the runtime.
 #
 # Task-local state of the C runtime that is not a field of `Task`: the current exception
 # (what `rethrow()` throws, a global of the module) is kept by `switch` in its frame across
-# the suspension and restored when the task resumes; a new task starts with none.
+# the suspension and restored when the task resumes; a new task starts with none. The task's
+# thread (`jl_get_task_tid`), set when it is scheduled or runs, is in its padding byte `pad00`.
 #
-# Waits on the host (`julia_io` handles: sleeps) register the waiting task in `WAITERS`
-# (any number of tasks per handle); active `Timer`s are in `TIMERS`. The scheduler's
-# `process_events` is one `julia_io.poll` over all of them, as native `wait()` runs libuv's
-# events. A poll suspends the stack of the task that calls it while every other task is
-# parked; its records are allocated in a scope that ends before any task switch (the staging
-# arenas are LIFO and shared by all tasks).
+# Waits on the host (`julia_io` handles) register the waiting task in `WAITERS` (any number of
+# tasks per handle); active `Timer`s are in `TIMERS`, closed ones whose close is not complete in
+# `CLOSING`. The scheduler's `process_events` is libuv's loop as native `wait()` runs it: the
+# host's event loop turns, then one `julia_io.poll` over all of them runs the timers' callbacks,
+# then the close callbacks. A poll suspends the stack of the task that calls it while every
+# other task is parked; its records are allocated in a scope that ends before any task switch
+# (the staging arenas are LIFO and shared by all tasks).
 
 module Tasks
 
@@ -42,20 +44,21 @@ const EINVAL = Int32(28)
 
 host_switch(from::Int32, to::Int32) = ccall((:switch, "julia_task"), Cvoid, (Int32, Int32), from, to)
 host_exit(from::Int32, to::Int32) = ccall((:exit, "julia_task"), Cvoid, (Int32, Int32), from, to)
+"The task of `host_switch` and `host_exit` when no task can run: the program waits forever."
+const NO_TASK_ID = Int32(-1)
 
 ## primitives the code generator compiles (`overlays.jl`); natively, placeholders
 
 const NO_TASK = Ref{Task}()
 const NO_EXCEPTION = Ref{Any}(nothing)
-const NO_SLOT = Ref(Int32(1))
 "A new `Task` object, every field zero or null (`struct.new`)."
 @noinline alloc_task() = NO_TASK[]
 "Make `t` the task `current_task()` returns (`global.set`)."
 @noinline set_current!(t::Task) = (NO_TASK[] = t; nothing)
-"The slot (≥ 1) of the body runner of tasks of closures of type `F`, stored there."
-@noinline entry_slot!(::Type{F}) where {F} = (NO_SLOT[] = NO_SLOT[]; NO_SLOT[])
-"Call the body runner in the slot `slot` on `t` (`call_ref`)."
-@noinline call_entry(slot::Int32, t::Task) = (NO_TASK[] = t; nothing)
+"Have the module compile `run_body(::Task, F)`, for `call_body` of a task body of type `F`."
+@noinline add_runner!(::Type{F}) where {F} = (NO_TASK[] = NO_TASK[]; nothing)
+"Call the `run_body` of the type of `code` (the task's body, `t.code`) on `t`."
+@noinline call_body(@nospecialize(code), t::Task) = (NO_TASK[] = t; nothing)
 "The current exception (the global `rethrow()` reads; null outside handlers)."
 @noinline get_exception() = NO_EXCEPTION[]
 "Make `x` (from `get_exception`) the current exception again."
@@ -80,40 +83,36 @@ function run_body(t::Task, ::Type{F}) where {F}
 end
 
 ## task ids: the host knows tasks by id, from a task's first run to its end; the root task
-## (the exported entry the host called) is 0. `t.priority` (unused by the one-thread queue)
-## holds a task's runner slot until it has an id, then its id
+## (the exported entry the host called) is 0
 
 const MAX_ID = Int32(typemax(UInt16))
 const TASKS = Union{Nothing,Task}[]   # TASKS[id]: the task of id ≥ 1, until it ends
-const SLOTS = Int32[]                  # SLOTS[id]: its runner slot
-const STARTED = Bool[]                 # STARTED[id]: its `jl_task_entry` ran
+const IDS = IdDict{Task,Int32}()       # the ids of the tasks that have one
 const FREE = Int32[]
+"The root task: the one of the root calls, the first that made a task."
 const ROOT = Ref{Task}()
 
 @noinline too_many_tasks() = throw(ErrorException(string("more than ", MAX_ID, " live tasks")))
 
-has_id(t::Task) = (k = Int(t.priority); 1 <= k <= length(TASKS) && TASKS[k] === t)
+is_root(t::Task) = isassigned(ROOT) ? t === ROOT[] : t === current_task()
 
 "The id of `t` (the running task, or one that ran), 0 for the root."
-task_id(t::Task) = Int32(t.priority)
+task_id(t::Task) = is_root(t) ? Int32(0) : IDS[t]
 
 "The id of `t`, given at its first run (the next to run, which may not have run yet)."
 function task_id!(t::Task)
-    (t.priority == 0 || has_id(t)) && return Int32(t.priority)
-    slot = Int32(t.priority)
+    is_root(t) && return Int32(0)
+    id = get(IDS, t, Int32(0))
+    id == 0 || return id
     if isempty(FREE)
         length(TASKS) < MAX_ID || too_many_tasks()
         push!(TASKS, t)
-        push!(SLOTS, slot)
-        push!(STARTED, false)
         id = Int32(length(TASKS))
     else
         id = pop!(FREE)
         TASKS[id] = t
-        SLOTS[id] = slot
-        STARTED[id] = false
     end
-    t.priority = id % UInt16
+    IDS[t] = id
     return id
 end
 
@@ -121,9 +120,19 @@ const task_state_runnable = UInt8(0)
 const task_state_done = UInt8(1)
 const task_state_failed = UInt8(2)
 
-"`jl_is_task_started`"
-function is_started(t::Task)
-    return t.priority == 0 || t._state !== task_state_runnable || (has_id(t) && STARTED[Int(t.priority)])
+"`jl_is_task_started`: it ran (the root task, one with an id, one that ended)."
+is_started(t::Task) = is_root(t) || t._state !== task_state_runnable || haskey(IDS, t)
+
+"`jl_get_task_tid`: the one thread's (0) once it was set (the task scheduled, or run), else -1."
+task_tid(t::Task) = is_root(t) || t.pad00 != 0x00 ? Int16(0) : Int16(-1)
+
+"`jl_set_task_tid`: the task's thread, once (the one thread's: 0); 0 if it is another's."
+function set_task_tid(t::Task, tid::Cint)
+    was = task_tid(t)
+    was == tid && return Cint(1)
+    (was == -1 && tid == 0) || return Cint(0)
+    t.pad00 = 0x01
+    return Cint(1)
 end
 
 # `jl_rng_split` (src/task.c): the child's xoshiro256 state from the parent's, advancing the
@@ -157,7 +166,8 @@ with a random state split from the current task's.
 """
 function new_task(f::F) where {F}
     ct = current_task()
-    task_id(ct) == 0 && !isassigned(ROOT) && (ROOT[] = ct)
+    # (the first task is made by the root task: no other runs before)
+    isassigned(ROOT) || (ROOT[] = ct)
     t = alloc_task()
     t.next = nothing
     t.queue = nothing
@@ -170,7 +180,7 @@ function new_task(f::F) where {F}
     t.sticky = true
     t._isexception = false
     rng_split!(t, ct)
-    t.priority = entry_slot!(F) % UInt16
+    add_runner!(F)
     return t
 end
 
@@ -179,9 +189,20 @@ end
 const RUNQ = Base.IntrusiveLinkedList{Task}()
 const NEXT = Ref{Task}()
 
-"`enq_work` on one thread: the task joins the run queue."
+"""
+`enq_work` on one thread, as Base's: a sticky task not stuck to the thread yet is, and so is
+the current task (so that they are scheduled together, #41324); the task joins the run queue.
+"""
 function enqueue!(t::Task)
     (t._state === task_state_runnable && t.queue === nothing) || error("schedule: Task not runnable")
+    if t.sticky
+        if task_tid(t) == -1
+            current_task().sticky = true
+            set_task_tid(t, Cint(0))
+        end
+    else
+        set_task_tid(t, Cint(0))
+    end
     push!(RUNQ, t)
     return t
 end
@@ -198,15 +219,16 @@ end
     switch()
 
 `jl_switch`: run `NEXT[]`; return when the current task is switched to again, with its
-current exception as it was. When the next task is the current one, it still goes through the
-host (`switch(id, id)`), whose event loop runs when it has work outstanding (natively,
-`jl_process_events` runs libuv's events in place).
+current exception as it was. A switch to the current task does nothing.
 """
 function switch()
     t = NEXT[]
     ct = current_task()
+    t === ct && return nothing
     exc = get_exception()
     SWITCHES[] += 1
+    # (the thread is the task's from its first run, as `jl_switch` sets it)
+    set_task_tid(t, Cint(0))
     host_switch(task_id(ct), task_id!(t))
     # resumed (a stack only runs as the current task)
     set_current!(ct)
@@ -214,6 +236,17 @@ function switch()
     return nothing
 end
 const SWITCHES = Ref(0)
+
+"""
+    wait_forever()
+
+No task can run and nothing can wake one (a deadlock): the current task waits forever, as the
+program natively does. The host leaves the root call unfinished (`js/julia_task.mjs`).
+"""
+function wait_forever()
+    host_switch(task_id(current_task()), NO_TASK_ID)
+    error("julia_task: a task resumed after a deadlock")
+end
 
 """
     task_entry(id) -> Int32
@@ -226,22 +259,22 @@ function task_entry(id::Int32)::Int32
     t = TASKS[id]::Task
     set_current!(t)
     clear_exception!()
-    STARTED[id] = true
     if t._isexception
         # thrown into before it ran (`throwto`, `schedule(t, e; error=true)`)
         t.result = t.result
     else
-        call_entry(SLOTS[id], t)
+        call_body(t.code, t)
     end
     finish!(t)
     TASKS[id] = nothing
-    t.code = nothing
-    nxt = next_after_exit()
+    delete!(IDS, t)
+    nxt = idle_next()
     # (the next task's id first: it must differ from this one, which is free once its stack
     # can no longer run: no task runs before `host_exit`)
-    to = task_id!(nxt)
+    nxt === nothing || set_task_tid(nxt, Cint(0))
+    to = nxt === nothing ? NO_TASK_ID : task_id!(nxt)
     push!(FREE, id)
-    set_current!(nxt)
+    nxt === nothing || set_current!(nxt)
     host_exit(id, to)
     return Int32(0)
 end
@@ -260,27 +293,15 @@ function finish!(t::Task)
     return nothing
 end
 
-@noinline deadlock_error() = ConcurrencyViolationError(
-    "deadlock detected: no task can run and none waits for the host")
-
-"The next runnable task, waiting for host events while there is none (`jl_task_get_next`)."
+"""
+The next runnable task, waiting for the host's events while there is none
+(`jl_task_get_next`); `nothing` if nothing can make one runnable (a deadlock).
+"""
 function idle_next()
     t = next_runnable()
     while t === nothing
-        idle_wait() || throw(deadlock_error())
-        t = next_runnable()
-    end
-    return t
-end
-
-# after a task's end: as `idle_next`, but a deadlock is thrown into the root task (the one
-# the host called, waiting), not into the task that ended
-function next_after_exit()
-    t = next_runnable()
-    while t === nothing
-        if !idle_wait()
-            schedule(ROOT[], deadlock_error(); error=true)
-        end
+        has_handles() || return nothing
+        process_events(Int64(-1))
         t = next_runnable()
     end
     return t
@@ -290,7 +311,11 @@ end
 
 const WAITERS = Dict{Int32,Vector{Task}}()
 const TIMERS = Dict{Int32,Timer}()
+const CLOSING = Timer[]
 const READY = Int32[]
+const INTEREST = Int32[]
+
+has_handles() = !isempty(WAITERS) || !isempty(TIMERS) || !isempty(CLOSING)
 
 function add_waiter!(h::Int32, t::Task)
     push!(get!(Vector{Task}, WAITERS, h), t)
@@ -312,51 +337,64 @@ wake!(t::Task) = (t._state === task_state_runnable && t.queue === nothing && sch
 """
     process_events(timeout_ns) -> n
 
-`jl_process_events` (`timeout_ns = 0`) and the idle sleep of `jl_task_get_next`
-(`timeout_ns = -1`): one `julia_io.poll` over the handles tasks wait for and the active
-timers. A ready handle schedules every task waiting for it (each checks its handle again:
-readiness is level-triggered and retired by the operation it waits for) and fires its
-timer. When none of them can become ready any more (`EINVAL` from an indefinite poll), the
-waiting tasks get that error, as a single task's wait does. (A handle that can no longer
-become ready while others still can is waited for, as natively a wait that nothing will end.)
+`jl_process_events` (`timeout_ns = 0`), an iteration of libuv's loop, and the idle sleep of
+`jl_task_get_next` (`timeout_ns = -1`), for the program's handles (host waits, timers, timers
+closing). The host's event loop turns first (a switch of the task to itself; an idle sleep
+waits in `poll` instead), then one `julia_io.poll` over the handles: the timers due run their
+callbacks (`uv_timercb`) in the order they are due, and a ready handle schedules every task
+waiting for it (each checks its handle again: readiness is level-triggered and retired by the
+operation it waits for); then the closed timers' close callbacks run (`_uv_hook_close`). When
+none of the handles can become ready any more (`EINVAL` from an indefinite poll), the waiting
+tasks get that error, as a single task's wait does.
 """
 function process_events(timeout_ns::Int64)
-    n = length(WAITERS) + length(TIMERS)
-    n == 0 && return 0
+    has_handles() || return 0
+    if timeout_ns == 0
+        ct = current_task()
+        host_switch(task_id(ct), task_id(ct))
+    end
+    empty!(INTEREST)
+    append!(INTEREST, keys(WAITERS))
+    for h in keys(TIMERS)
+        haskey(WAITERS, h) || push!(INTEREST, h)
+    end
+    sort!(INTEREST)
+    n = length(INTEREST)
     n > 1024 && error("more than 1024 host waits")
-    POLLS[] += 1
-    r = Staging.with_scope() do
-        interest = Staging.alloc_record(4n)
-        out = Staging.alloc_record(4n)
-        i = 0
-        for h in keys(WAITERS)
-            Staging.store32(interest + UInt32(4i), h % UInt32)
-            i += 1
+    empty!(READY)
+    r = Int32(0)
+    if n > 0
+        POLLS[] += 1
+        # (closes to complete: no waiting)
+        wait_ns = isempty(CLOSING) ? timeout_ns : Int64(0)
+        r = Staging.with_scope() do
+            interest = Staging.alloc_record(4n)
+            out = Staging.alloc_record(4n)
+            for (i, h) in enumerate(INTEREST)
+                Staging.store32(interest + UInt32(4(i - 1)), h % UInt32)
+            end
+            got = JuliaIO.poll(interest, Int32(n), wait_ns, out, Int32(n))
+            # (all ready handles first: a timer's callback calls the host)
+            for k in 0:Int(got)-1
+                push!(READY, Staging.load32(out + UInt32(4k)) % Int32)
+            end
+            got
         end
-        for h in keys(TIMERS)
-            haskey(WAITERS, h) && continue
-            Staging.store32(interest + UInt32(4i), h % UInt32)
-            i += 1
+        if r == -EINVAL && wait_ns == -1
+            fail_waiters!(Host.HostCallError(EINVAL, Host.errmsg(Int32(-1))))
+            r = Int32(0)
         end
-        got = JuliaIO.poll(interest, Int32(i), timeout_ns, out, Int32(i))
-        # (all ready handles first: a timer's callback calls the host)
-        empty!(READY)
-        for k in 0:Int(got)-1
-            push!(READY, Staging.load32(out + UInt32(4k)) % Int32)
-        end
-        got
+        r < 0 && Host.throw_host(-r, Int32(-1))
     end
-    if r == -EINVAL && timeout_ns == -1
-        fail_waiters!(Host.HostCallError(EINVAL, Host.errmsg(Int32(-1))))
-        return 0
-    end
-    r < 0 && Host.throw_host(-r, Int32(-1))
     for h in READY
         tm = get(TIMERS, h, nothing)
         tm === nothing || timer_fire!(tm, h)
         ws = pop!(WAITERS, h, nothing)
         ws === nothing && continue
         foreach(wake!, ws)
+    end
+    while !isempty(CLOSING)
+        timer_closed!(popfirst!(CLOSING))
     end
     return Int(r)
 end
@@ -368,13 +406,6 @@ function fail_waiters!(e::Host.HostCallError)
     end
     empty!(WAITERS)
     return nothing
-end
-
-# wait for host events while no task can run: `false` if there is nothing to wait for
-function idle_wait()
-    isempty(WAITERS) && isempty(TIMERS) && return false
-    process_events(Int64(-1))
-    return true
 end
 
 """
@@ -405,8 +436,11 @@ function await_handle(h::Int32)
 end
 
 ## Timers: libuv's timer handles as `julia_io` timers. An active timer's handle is in
-## `TIMERS` (its `handle` field holds the host's handle); `process_events` runs the timer's
-## callback (`uv_timercb`) when it fires: an interval timer is restarted for its interval
+## `TIMERS` (its `handle` field holds the host's handle). `process_events` runs the timer's
+## callback (`uv_timercb`) when it is due; a repeating timer is started again for its interval
+## first, from the time it is processed, as libuv restarts it from the loop's time. A closed
+## timer (`jl_close_uv`) keeps its handle until its close callback (`_uv_hook_close`), at the
+## end of the next `process_events`, as libuv closes handles
 
 timer_handle(t::Timer) = Int32(UInt(t.handle))
 
@@ -422,8 +456,11 @@ function timer_new(timeout::Real, interval::Real)
     timeout ≥ 0 || throw(ArgumentError("timer cannot have negative timeout of $timeout seconds"))
     interval ≥ 0 || throw(ArgumentError("timer cannot have negative repeat interval of $interval seconds"))
     # (as natively: whole ms, +1 ms but for zero, which the host does not need)
-    timeoutms = ceil(UInt64, timeout * 1000) + !iszero(timeout)
-    intervalms = ceil(UInt64, interval * 1000)
+    return timer_ms(ceil(UInt64, timeout * 1000) + !iszero(timeout), ceil(UInt64, interval * 1000))
+end
+
+"A `Timer` of `timeoutms` and `intervalms` milliseconds, as `Timer(timeout; interval)` makes it."
+function timer_ms(timeoutms::UInt64, intervalms::UInt64)
     h = start_timer(ms_ns(timeoutms))
     t = new_timer(Ptr{Cvoid}(UInt(h)), timeoutms, intervalms)
     TIMERS[h] = t
@@ -432,20 +469,36 @@ end
 @eval new_timer(h::Ptr{Cvoid}, tms::UInt64, ims::UInt64) =
     $(Expr(:new, Timer, :h, :(Base.ThreadSynchronizer()), true, false, :tms, :ims))
 
-"`uv_timercb`"
+# `jl_close_uv` of a timer: its host timer stopped, its close callback at the end of the next
+# `process_events`
+function close_handle!(t::Timer)
+    h = timer_handle(t)
+    if haskey(TIMERS, h)
+        delete!(TIMERS, h)
+        JuliaIO.close(h)
+    end
+    push!(CLOSING, t)
+    return nothing
+end
+
+"`uv_timercb`: the timer `t` (of the host's timer `h`) is due."
 function timer_fire!(t::Timer, h::Int32)
+    delete!(TIMERS, h)
+    JuliaIO.close(h)
+    if t.interval_ms != 0
+        h2 = start_timer(ms_ns(t.interval_ms))
+        TIMERS[h2] = t
+        @atomic :monotonic t.handle = Ptr{Cvoid}(UInt(h2))
+    end
     lock(t.cond)
     try
         @atomic :monotonic t.set = true
-        delete!(TIMERS, h)
-        JuliaIO.close(h)
         if t.interval_ms == 0
-            @atomic :release t.isopen = false
-            @atomic :monotonic t.handle = C_NULL
-        else
-            h2 = start_timer(ms_ns(t.interval_ms))
-            TIMERS[h2] = t
-            @atomic :monotonic t.handle = Ptr{Cvoid}(UInt(h2))
+            # (stopped: closed now, as natively)
+            if t.isopen
+                @atomic :release t.isopen = false
+                push!(CLOSING, t)
+            end
         end
         notify(t.cond, true)
     finally
@@ -454,36 +507,63 @@ function timer_fire!(t::Timer, h::Int32)
     return nothing
 end
 
-"`close(::Timer)`: the host's timer released; its waiters see it closed."
-function timer_close!(t::Timer)
+"`_uv_hook_close`: the close of `t` is complete."
+function timer_closed!(t::Timer)
     lock(t.cond)
     try
         @atomic :release t.isopen = false
-        h = timer_handle(t)
-        if h != 0
-            delete!(TIMERS, h)
-            JuliaIO.close(h)
-            @atomic :monotonic t.handle = C_NULL
-            notify(t.cond, false)
-        end
+        @atomic :monotonic t.handle = C_NULL
+        notify(t.cond, false)
     finally
         unlock(t.cond)
     end
     return nothing
 end
 
-"`Base._trywait(::Timer)`: `true` once it fired (reset), `false` once it is closed."
-function timer_trywait(t::Timer)
-    set = t.set
-    if !set
+"`close(::Timer)`, as Base's: it waits for the close to complete (a scheduling point)."
+function timer_close!(t::Timer)
+    t.handle == C_NULL && !t.isopen && return nothing
+    if t.handle != C_NULL
+        if t.isopen
+            @atomic :release t.isopen = false
+            close_handle!(t)
+        end
         lock(t.cond)
         try
-            set = t.set
-            if !set && t.handle != C_NULL
-                set = Base.wait(t.cond)::Bool
+            while t.handle != C_NULL
+                Base.wait(t.cond)
             end
         finally
             unlock(t.cond)
+        end
+    elseif t.isopen
+        @atomic :release t.isopen = false
+    end
+    return nothing
+end
+
+"`Base._trywait(::Timer)`, as Base's: `true` once it fired (reset), `false` once it is closed."
+function timer_trywait(t::Timer)
+    set = t.set
+    if !set
+        if !isopen(t)
+            set = t.set
+            if !set
+                Base.close(t) # wait for the close to complete
+                return false
+            end
+        end
+        set = t.set
+        if !set
+            lock(t.cond)
+            try
+                set = t.set
+                if !set && t.handle != C_NULL # wait for set or handle, but not the isopen flag
+                    set = Base.wait(t.cond)::Bool
+                end
+            finally
+                unlock(t.cond)
+            end
         end
     end
     @atomic :monotonic t.set = false
@@ -499,8 +579,8 @@ function timer_callback(cb::F, timeout::Real, spawn::Union{Nothing,Bool}, interv
             try
                 cb(timer)
             catch err
-                # (natively `showerror` with the backtrace; here the error's text)
-                print(Core.stderr, "Error in Timer:\n", Host.error_text(err), "\n")
+                # (natively `showerror` with the backtrace, which the module has not)
+                print(Core.stderr, "Error in Timer:\n", Host.error_text(err))
                 return
             end
             isopen(timer) || return
@@ -516,10 +596,15 @@ function timer_callback(cb::F, timeout::Real, spawn::Union{Nothing,Bool}, interv
     return timer
 end
 
+"`sleep` on tasks: on a `Timer` of the milliseconds `Host.sleep_ms` waits for, as Base's."
+sleep_timer(ms::UInt64) = (Base.wait(timer_ms(ms, UInt64(0))); nothing)
+
 ## Base's task utilities that need the C runtime or untyped code
 
-"`errormonitor(t)`: the failure of `t`, if it fails, on stderr (as natively without color, but
-its message only: no backtrace)."
+"""
+`errormonitor(t)`: the failure of `t`, if it fails, on stderr, as natively without color, but
+for the backtrace, which the module has not (and for nested exceptions: its last only).
+"""
 function errormonitor_wasm(t::Task)
     t2 = Task() do
         if istaskfailed(t)
@@ -533,10 +618,42 @@ function errormonitor_wasm(t::Task)
 end
 
 """
-`Base.sync_end` (`@sync`) for the tasks `@async`/`@spawn` put in its channel: Base's, but
-a waitable object other than a `Task` is an error (its `wait` would be a dynamic call).
-Failures are collected in a `CompositeException` as natively, tasks scheduled after the
-end first.
+`wait(r)` of an object `@sync` collected, by its type: of each type Base can wait for that a
+program of tasks has, `Base.wait` of it (`wait(r)` of a value of no known type is a dynamic
+call). Of another, natively a `MethodError`, or the wait of an object the module cannot wait
+for (a `Channel` of another element type than `Any`, of a type not known here; `Process`,
+`AsyncCondition`, `FileWatching`'s, which the module has not): a `MethodError`.
+"""
+function wait_synced(@nospecialize(r))
+    if r isa Base.UnwrapTaskFailedException
+        # (Base's `unwrap_task_failed`, but for the failed task's exception: its result, which
+        # `getproperty(::Task, :exception)` is, a call not trim-safe on Julia 1.12)
+        try
+            Base.wait(r.task)
+        catch ex
+            ex isa TaskFailedException || rethrow()
+            throw((ex::TaskFailedException).task.result)
+        end
+    elseif r isa Timer
+        Base.wait(r)
+    elseif r isa Base.Event
+        Base.wait(r)
+    elseif r isa Condition
+        Base.wait(r)
+    elseif r isa Threads.Condition
+        Base.wait(r)
+    elseif r isa Channel{Any}
+        Base.wait(r)
+    else
+        Core.throw_methoderror(Base.wait, r)
+    end
+    return nothing
+end
+
+"""
+`Base.sync_end` (`@sync`), as Base's: the tasks `@async`/`@spawn` put in its channel, and the
+other objects (`wait_synced`); failures collected in a `CompositeException`, objects scheduled
+after the end first.
 """
 function sync_end_wasm(c::Channel{Any})
     local c_ex
@@ -551,10 +668,14 @@ function sync_end_wasm(c::Channel{Any})
                 push!(c_ex, TaskFailedException(r))
             end
         else
-            if !@isdefined(c_ex)
-                c_ex = CompositeException()
+            try
+                wait_synced(r)
+            catch e
+                if !@isdefined(c_ex)
+                    c_ex = CompositeException()
+                end
+                push!(c_ex, e)
             end
-            push!(c_ex, ArgumentError("@sync in Wasm: waiting for an object other than a Task is not supported"))
         end
     end
     Base.close(c)
@@ -579,20 +700,40 @@ end
 ## Base's own (the patches are in the latest world, where libuv's callbacks also run), and in
 ## the module methods of `WASM_METHODS` (the above)
 
-"`Base.wait()` on one thread: host events, then the run queue, then an idle wait on the host."
-function wait_wasm()
-    process_events(Int64(0))
-    NEXT[] = idle_next()
-    return try_yieldto_wasm(Base.ensure_rescheduled)
+@static if VERSION >= v"1.13-"
+    """
+    `Base.wait()` on one thread, as Julia 1.13's: the host's events (but for a task that is
+    done), then the run queue, then an idle wait on the host.
+    """
+    function wait_wasm()
+        istaskdone(current_task()) || process_events(Int64(0))
+        t = idle_next()
+        t === nothing && wait_forever()
+        NEXT[] = t
+        return try_yieldto_wasm(Base.ensure_rescheduled)
+    end
+else
+    """
+    `Base.wait()` on one thread, as Julia 1.12's: the run queue, or an idle wait on the host;
+    once resumed, the host's events.
+    """
+    function wait_wasm()
+        t = idle_next()
+        t === nothing && wait_forever()
+        NEXT[] = t
+        result = try_yieldto_wasm(Base.ensure_rescheduled)
+        process_events(Int64(0))
+        return result
+    end
 end
 
+"`Base.ensure_rescheduled`, as Base's on the run queue."
 function ensure_rescheduled_wasm(othertask::Task)
     ct = current_task()
     if ct !== othertask && othertask._state === task_state_runnable && othertask.queue === nothing
         pushfirst!(RUNQ, othertask)
     end
-    q = ct.queue
-    q === nothing || Base.list_deletefirst!(q::Base.IntrusiveLinkedList{Task}, ct)
+    Base.list_deletefirst!(RUNQ, ct)
     return nothing
 end
 
@@ -625,6 +766,7 @@ set_next_task_wasm(t::Task) = (NEXT[] = t; nothing)
 @noinline try_yieldto(undo::F) where {F} = original(Base.try_yieldto, undo)
 @noinline task(f::F) where {F} = original(Core.Task, f)::Task
 @noinline await(h::Int32) = (original(Host.await_handle, h); nothing)
+@noinline sleep_ms(ms::UInt64) = (original(Host.sleep_ms, ms); nothing)
 @noinline istaskstarted(t::Task) = original(Base.istaskstarted, t)::Bool
 @noinline timer(timeout::Real, interval::Real) = original(Timer, timeout; interval=interval)::Timer
 @noinline timer_cb(cb::F, timeout::Real, spawn::Union{Nothing,Bool}, interval::Real) where {F} =
@@ -640,6 +782,7 @@ set_next_task_wasm(t::Task) = (NEXT[] = t; nothing)
 @wasm_method try_yieldto(undo::F) where {F} = try_yieldto_wasm(undo)
 @wasm_method task(f::F) where {F} = new_task(f)
 @wasm_method await(h::Int32) = await_handle(h)
+@wasm_method sleep_ms(ms::UInt64) = sleep_timer(ms)
 @wasm_method istaskstarted(t::Task) = is_started(t)
 @wasm_method timer(timeout::Real, interval::Real) = timer_new(timeout, interval)
 @wasm_method timer_cb(cb::F, timeout::Real, spawn::Union{Nothing,Bool}, interval::Real) where {F} =
@@ -649,7 +792,7 @@ set_next_task_wasm(t::Task) = (NEXT[] = t; nothing)
 @wasm_method errormonitor(t::Task) = errormonitor_wasm(t)
 @wasm_method sync_end(c::Channel{Any}) = sync_end_wasm(c)
 
-"Counters for the overhead measurements: (switches, polls, live task slots)."
+"Counters for the overhead measurements: (switches, polls, live task ids)."
 stats() = (SWITCHES[], POLLS[], length(TASKS) - length(FREE))
 
 end # Tasks

@@ -1,8 +1,8 @@
 # Julia Tasks on JSPI stacks (`Config(tasks = :jspi)`, `runtime/tasks.jl`, the `julia_task`
 # imports of `js/julia_task.mjs`): `tasks_program.jl` compiled and run on Node through
 # `tasks.mjs`. `main`'s stdout is compared with native Julia's; the Wasm-only exports check
-# waits on the host's handles and the host's lifecycle. (Outside the session of patches of
-# `runtests.jl`: the task patches make a session of their own.)
+# waits on the host's handles, deadlocks and the host's lifecycle. (Outside the session of
+# patches of `runtests.jl`: the task patches make a session of their own.)
 
 module TasksTests
 
@@ -17,12 +17,15 @@ const P = TasksProgram
 @testset "tasks on JSPI stacks" begin
     # the native output, with Base's scheduler, in a process of its own (one thread)
     prog = joinpath(@__DIR__, "tasks_program.jl")
-    native = read(addenv(`$(Base.julia_cmd()) --startup-file=no --threads=1 --project=$(Base.active_project())
-                          -e "include($(repr(prog))); TasksProgram.main()"`, "JULIA_NUM_THREADS" => "1"), String)
+    native_out = IOBuffer(); native_err = IOBuffer()
+    run(pipeline(addenv(`$(Base.julia_cmd()) --startup-file=no --threads=1 --color=no --project=$(Base.active_project())
+                         -e "include($(repr(prog))); TasksProgram.main()"`, "JULIA_NUM_THREADS" => "1");
+                 stdout=native_out, stderr=native_err))
+    native = String(take!(native_out))
     @test endswith(native, "\ndone\n")
     fns = [P.main_safe => (), P.pingpong => (Int32,), P.pingpong_busy => (Int32,),
            P.pingpong_channel => (Int32,), P.shared_handle => (), P.early_return => (),
-           P.deadlock_child => (), P.deadlock_root => (), P.child_trap => (Int32,),
+           P.deadlock_child => (), P.deadlock_root => (), P.deadlock_exit => (), P.child_trap => (Int32,),
            P.root_trap => (Int32,), P.stress => (Int32, Int32), P.task_stats => (),
            P.discarded => (Int32,)]
     c = WasmCodegen.compile([Entry(f, T; name=string(nameof(f))) for (f, T) in fns];
@@ -36,7 +39,7 @@ const P = TasksProgram
              Dict("fn" => "pingpong_busy", "args" => [10000], "jsTimer" => true),
              Dict("fn" => "pingpong_channel", "args" => [10000]),
              Dict("fn" => "shared_handle"), Dict("fn" => "early_return"), Dict("fn" => "task_stats", "fresh" => false),
-             Dict("fn" => "deadlock_child"), Dict("fn" => "deadlock_root"),
+             Dict("fn" => "deadlock_child"), Dict("fn" => "deadlock_root"), Dict("fn" => "deadlock_exit"),
              Dict("fn" => "stress", "args" => [10, 100]), Dict("fn" => "task_stats", "fresh" => false),
              Dict("fn" => "stress", "args" => [1, 1000]),
              Dict("fn" => "child_trap", "args" => [10_000_000], "expectTrap" => true),
@@ -57,13 +60,19 @@ const P = TasksProgram
     @test length(rs) == length(calls)
     res(i) = (r = rs[i]; haskey(r, "trap") ? error("$(r["fn"]) trapped: $(r["trap"])") : r["result"])
     num(i) = (v = res(i); v isa AbstractString ? parse(Int64, v) : Int64(v))
-    # `main`: the same stdout as natively; errormonitor's first line on stderr
+    # `main`: the same stdout as natively; on stderr, the errors of `errormonitor` and of a
+    # Timer's callback, as natively but for the backtraces (natively, `stderr` and
+    # `Core.stderr` are not in order: the lines are compared)
     @test res(1) == 0
     @test stdout_wasm[1:something(findfirst("\ndone\n", stdout_wasm), 0:-1)[end]] == native
-    @test any(==("UNHANDLED TASK ERROR: monitored"), lines)
+    error_lines(ls) = sort!([l for l in ls if !isempty(l) && l != "Stacktrace:" && !startswith(l, ' ') && !startswith(l, "@@ ")])
+    @test error_lines(lines) == error_lines(split(String(take!(native_err)), '\n')) ==
+          ["Error in Timer:", "UNHANDLED TASK ERROR: monitored", "in a callback"]
+    # (the callback's error as natively without the backtrace: no line break after the text)
+    @test occursin("Error in Timer:\nin a callback\n@@ ", errs)
     @test rs[1]["host"]["parked"] == 0 && rs[1]["open"] == 0
     # switches are microtasks without host work (a JavaScript timer does not run meanwhile);
-    # macrotasks while a timer is open (the JavaScript timer runs)
+    # with a timer open, the host's event loop turns at each wait (the JavaScript timer runs)
     @test num(2) > 0 && rs[2]["host"]["handoffs"] == 0
     @test num(3) > 0 && rs[3]["host"]["handoffs"] >= 20000 && rs[3]["jsTimerFired"] === true
     @test num(4) > 0
@@ -73,19 +82,21 @@ const P = TasksProgram
     @test res(6) == 0 && rs[6]["host"]["parked"] == 1
     @test num(7) & 0xffffffff == 1
     @test downs[6] == Dict("parked" => 1, "live" => 1)
-    # deadlocks are thrown (natively: a hang)
-    @test num(8) == 1 && num(9) == 1
+    # deadlocks: the root call does not return, as the native program hangs (a task waits
+    # forever; the root task; after the last task that could run ended)
+    @test [get(rs[i], "deadlock", false) for i in 8:10] == [true, true, true]
+    @test rs[8]["host"]["parked"] == 2 && rs[9]["host"]["parked"] == 1 && rs[10]["host"]["live"] == 0
     # task ids are reused; 1000 tasks alive at once
-    @test num(10) == 10 * 5050 && num(11) & 0xffffffff == 0
-    @test num(12) == 500500 && rs[12]["host"]["maxLive"] == 1000
+    @test num(11) == 10 * 5050 && num(12) & 0xffffffff == 0
+    @test num(13) == 500500 && rs[13]["host"]["maxLive"] == 1000
     # a trap in a task or in the root fails the root call; the instance is then unusable
-    @test occursin("call stack", rs[13]["trap"]) && rs[13]["terminal"]
-    @test occursin("terminal", rs[14]["trap"])
-    @test occursin("call stack", rs[15]["trap"]) && rs[15]["terminal"]
+    @test occursin("call stack", rs[14]["trap"]) && rs[14]["terminal"]
+    @test occursin("terminal", rs[15]["trap"])
+    @test occursin("call stack", rs[16]["trap"]) && rs[16]["terminal"]
     # 70000 Tasks created and never run: they hold no task id
-    @test num(16) == 7 << 32
+    @test num(17) == 7 << 32
     # the host shut down during a root call: the call fails
-    @test occursin("shut down", rs[17]["trap"]) && rs[17]["terminal"]
+    @test occursin("shut down", rs[18]["trap"]) && rs[18]["terminal"]
 end
 
 @testset "Config(tasks)" begin

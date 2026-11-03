@@ -350,6 +350,122 @@ function id_reuse()
     println(Core.stdout, "id reuse ok")
 end
 
+## as natively: the scheduler's order, its waits and the task's fields
+
+spin(ms) = (t0 = time_ns(); while time_ns() - t0 < ms * 1_000_000 end)
+
+# `sleep(0)` lets a runnable task run (natively it waits for a `Timer` of 0)
+function sleep_zero()
+    flag = Ref(false)
+    t = @async (flag[] = true; nothing)
+    n = 0
+    while !flag[] && n < 1000
+        sleep(0)
+        n += 1
+    end
+    wait(t)
+    println(Core.stdout, "sleep(0) ", flag[], " ", n)
+end
+
+# the host's events before the next task (Julia 1.13: a timer due fires first) or after (1.12)
+function events_order()
+    tm0 = Timer(0)
+    t0 = @async isopen(tm0)
+    println(Core.stdout, "timer of 0 open in a task ", fetch(t0)::Bool)
+    close(tm0)
+    tm = Timer(0.005)
+    spin(20)
+    t = @async isopen(tm)
+    println(Core.stdout, "timer due open in a task ", fetch(t)::Bool)
+    close(tm)
+end
+
+# `close(::Timer)` waits for the close to complete: other tasks run meanwhile
+function close_waits()
+    tm = Timer(100)
+    t = @async print(Core.stdout, "A")
+    close(tm)
+    print(Core.stdout, "B")
+    wait(t)
+    println(Core.stdout, " ", isopen(tm))
+end
+
+# a sticky task scheduled from a task not stuck to the thread sticks it; the thread of a task
+# not scheduled yet
+function sticky()
+    t = Threads.@spawn begin
+        c = Task(() -> nothing)
+        schedule(c)
+        wait(c)
+        current_task().sticky
+    end
+    u = Task(() -> nothing)
+    print(Core.stdout, "sticky ", fetch(t)::Bool, " ", t.sticky)
+    println(Core.stdout, ", threads ", Threads.threadid(u), " ", Threads.threadid(t), " ", Threads.threadid(current_task()))
+end
+
+# what `@sync` waits for: tasks, and other objects (a Timer, an Event, a Channel), and what it
+# cannot wait for (natively a `MethodError`)
+function sync_objects()
+    c = Channel{Any}(8)
+    put!(c, Timer(0.001))
+    ev = Base.Event()
+    notify(ev)
+    put!(c, ev)
+    ch = Channel{Any}(1)
+    put!(ch, 1)
+    put!(c, ch)
+    put!(c, 42)
+    r = try
+        Base.sync_end(c)
+        "no error"
+    catch e
+        e isa CompositeException ? string(length(e.exceptions), " ", first(e.exceptions) isa MethodError) : "other"
+    end
+    println(Core.stdout, "sync objects ", r)
+end
+
+# the fields of tasks: priority, body, started
+function task_fields()
+    t = @async (yield(); 1)
+    p0 = t.priority
+    wait(t)
+    u = Task(() -> 2)
+    print(Core.stdout, "fields ", p0, " ", t.priority, " ", u.priority)
+    println(Core.stdout, " ", t.code isa Function, " ", istaskstarted(u), " ", istaskstarted(t))
+end
+
+# a repeating timer late (the program busy): the next time is an interval after it fired
+function interval_late()
+    tm = Timer(0.05; interval=0.05)
+    t0 = time_ns()
+    spin(130)
+    wait(tm)
+    t1 = (time_ns() - t0) / 1e6
+    wait(tm)
+    t2 = (time_ns() - t0) / 1e6
+    close(tm)
+    println(Core.stdout, "interval late ", t1 >= 125, " ", t2 - t1 >= 40)
+end
+
+# timers fire in the order of their deadlines, then of their start
+function timers_order()
+    out = Int[]
+    tms = [Timer(0.02), Timer(0.01), Timer(0.01)]
+    ts = Task[@async((wait(tms[i]); push!(out, i))) for i in 1:3]
+    foreach(wait, ts)
+    println(Core.stdout, "timers order ", join(out, ","))
+end
+
+# an error in a Timer's callback: on stderr (compared with native's but its backtrace)
+function timer_error()
+    tm = Timer(_ -> error("in a callback"), 0.001)
+    sleep(0.05)
+    println(Core.stderr)
+    println(Core.stdout, "timer error, open ", isopen(tm))
+    close(tm)
+end
+
 function main()::Int32
     root_state()
     producer_consumer()
@@ -368,6 +484,15 @@ function main()::Int32
     scoped()
     started()
     id_reuse()
+    sleep_zero()
+    events_order()
+    close_waits()
+    sticky()
+    sync_objects()
+    task_fields()
+    interval_late()
+    timers_order()
+    timer_error()
     println(Core.stdout, "done")
     return Int32(0)
 end
@@ -455,27 +580,19 @@ function early_return()::Int32
     return Int32(0)
 end
 
-# a deadlock in a task: thrown there (natively: a hang)
+# deadlocks: the program waits forever, as natively (the root call does not return): in a
+# task, in the root task, and after the end of the last task that could run
 function deadlock_child()::Int32
     c = Condition()
     t = @async wait(c)
-    try
-        wait(t)
-        return Int32(0)
-    catch e
-        ok = e isa TaskFailedException && e.task.result isa ConcurrencyViolationError
-        return ok ? Int32(1) : Int32(2)
-    end
+    wait(t)
+    return Int32(0)
 end
-
-# a deadlock of the root task: thrown there
-function deadlock_root()::Int32
-    try
-        wait(Condition())
-        return Int32(0)
-    catch e
-        return e isa ConcurrencyViolationError ? Int32(1) : Int32(2)
-    end
+deadlock_root()::Int32 = (wait(Condition()); Int32(0))
+function deadlock_exit()::Int32
+    @async nothing
+    wait(Condition())
+    return Int32(0)
 end
 
 # traps (a stack overflow) in a task and in the root: the root call fails

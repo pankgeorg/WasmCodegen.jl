@@ -154,6 +154,22 @@ end
 # the longest wait of one timer, in milliseconds (`typemax(Int64)` nanoseconds)
 const TIMER_MAX_MS = UInt64(typemax(Int64) ÷ 1_000_000)
 
+"""
+    sleep_ms(ms)
+
+Wait `ms` milliseconds on host timers (a wait longer than a timer's, on consecutive ones). With
+tasks (`Config(tasks = :jspi)`), the wait of a `Timer` of `ms` milliseconds (`Runtime.Tasks`), as
+Base's `sleep` waits.
+"""
+function sleep_ms(ms::UInt64)
+    while ms > TIMER_MAX_MS
+        sleep_ns(Int64(TIMER_MAX_MS) * 1_000_000)
+        ms -= TIMER_MAX_MS
+    end
+    sleep_ns(Int64(ms) * 1_000_000)
+    return nothing
+end
+
 # Base's `sleep`, in the module (natively, Base's own: a libuv `Timer` the scheduler waits for):
 # its check, and the milliseconds of `Timer(sec)` (rounded up, and one more unless zero, as
 # libuv's timers may fire a millisecond early: an `InexactError` for `Inf` or beyond
@@ -161,13 +177,7 @@ const TIMER_MAX_MS = UInt64(typemax(Int64) ÷ 1_000_000)
 # runs meanwhile, also for `sleep(0)`, as libuv's does.
 @wasm_method function Base.sleep(sec::Real)
     sec ≥ 0 || throw(ArgumentError("cannot sleep for $sec seconds"))
-    ms = ceil(UInt64, sec * 1000) + !iszero(sec)
-    # (a wait longer than a timer's, on consecutive timers)
-    while ms > TIMER_MAX_MS
-        sleep_ns(Int64(TIMER_MAX_MS) * 1_000_000)
-        ms -= TIMER_MAX_MS
-    end
-    sleep_ns(Int64(ms) * 1_000_000)
+    sleep_ms(ceil(UInt64, sec * 1000) + !iszero(sec))
     nothing
 end
 

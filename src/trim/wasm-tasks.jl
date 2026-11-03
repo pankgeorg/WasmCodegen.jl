@@ -4,9 +4,9 @@
 # after juliac's trim patches, in place of the code generator's stubs for a program of one task.
 #
 # Each patch calls a runtime function (`Runtime.Tasks`): natively Base's original method, in
-# Wasm a method of `WASM_METHODS`, the runtime's. The patches are defined in the latest world, which is also where libuv's
-# callbacks run in the compiler's process (a process exit schedules its waiter): those must
-# keep Base's scheduler.
+# Wasm a method of `WASM_METHODS`, the runtime's. The patches are defined in the latest world,
+# which is also where libuv's callbacks run in the compiler's process (a process exit schedules
+# its waiter): those must keep Base's scheduler.
 
 let T = WasmCodegen.Runtime.Tasks
     # `jl_new_task`, specialized on the closure (its body is called without dispatch)
@@ -26,6 +26,7 @@ let T = WasmCodegen.Runtime.Tasks
     # (untyped: a dynamic `display_error`; a dynamic `wait` of what `@sync` collected)
     @eval Base errormonitor(t::Task) = $(T.errormonitor)(t)
     @eval Base sync_end(c::Channel{Any}) = $(T.sync_end)(c)
-    # the runtime's host waits (`sleep`) as tasks' waits
+    # the runtime's host waits as tasks' waits; `sleep` on a `Timer`, as Base's
     @eval WasmCodegen.Runtime.Host await_handle(h::Int32) = $(T.await)(h)
+    @eval WasmCodegen.Runtime.Host sleep_ms(ms::UInt64) = $(T.sleep_ms)(ms)
 end

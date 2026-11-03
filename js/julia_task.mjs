@@ -8,15 +8,18 @@
 //   import `switch(from i32, to i32)`  Suspending. Parks task `from` (its stack waits on a
 //       promise) and resumes `to` (resolves its promise) or, on its first run, starts it:
 //       `jl_task_entry(to)` on a new stack (`WebAssembly.promising`). `switch(id, id)` parks
-//       and resumes the same task: the module lets the host's event loop run while it waits
-//       for the host and no other task can run. Never rejects.
+//       and resumes the same task after a turn of the host's event loop: the module processes
+//       the host's events, as native Julia runs libuv's loop. `switch(id, -1)`: no task can
+//       run and nothing can wake one (a deadlock): `id` stays parked, and the program waits
+//       forever, as it does natively. Never rejects.
 //   import `exit(from i32, to i32)`  Synchronous. Task `from` ends (its `jl_task_entry`
-//       returns right after): resumes or starts `to` without parking `from`.
+//       returns right after): resumes or starts `to` without parking `from`; `to = -1`, a
+//       deadlock.
 //   export `jl_task_entry(id i32) -> i32`  The first run of task `id`, on a new stack; it
 //       calls `exit(id, _)` before it returns 0.
 //
 //   const events = makeJuliaIOEvents();                                     // js/julia_io.mjs
-//   const jt = makeJuliaTask({ busy: () => events.stats().open > 0 });
+//   const jt = makeJuliaTask({ onDeadlock: () => jt.shutdown() });
 //   const instance = await WebAssembly.instantiate(mod, {
 //     wasi_snapshot_preview1: wasi.wasiImport, julia_io: events.imports, ...jt.imports });
 //   events.bindMemory(instance.exports.memory); wasi.initialize(instance);
@@ -30,12 +33,15 @@
 //
 // The resumption or start of `to` is deferred until the calling stack has suspended
 // (`switch`) or returned (`exit`): exactly one Wasm stack runs at a time, and there is never a
-// JS frame between a `promising` call and a suspension. It is a macrotask (`setImmediate`)
-// while the host has outstanding work (`busy()`: open `julia_io` handles, i.e. timers), so
-// that Node's timers and I/O run between task switches as native Julia's
-// `wait()` runs libuv's events; otherwise a microtask, which costs no event-loop turn. (So a
-// task that keeps yielding without waiting for the host starves JavaScript's own timers, as
-// it would starve the other tasks' natively without preemption.)
+// JS frame between a `promising` call and a suspension. It is a microtask, which costs no
+// event-loop turn, but for `switch(id, id)`: a macrotask (`setImmediate`), after which Node's
+// timers and I/O have run. (The module asks for one while it has handles of the host, as
+// native Julia's `wait()` runs libuv's loop; so tasks that keep yielding without them starve
+// JavaScript's own timers, as they would starve the other tasks natively without preemption.)
+//
+// A deadlock leaves the root call in flight unfinished, as the native program hangs: the host
+// records it (`deadlocked()`), calls `onDeadlock()` (after the call), and keeps Node's event
+// loop alive until `shutdown()` (unless `keepAlive: false`).
 //
 // Root calls: one at a time; a task's stack only runs while one is in flight. When a root call
 // returns, tasks still parked stay parked, and a later root call may resume them. A trap or a
@@ -55,13 +61,16 @@ export class JuliaTaskError extends Error {}
 export const importsJuliaTask = (mod) => WebAssembly.Module.imports(mod).some((i) => i.module === 'julia_task');
 
 export function makeJuliaTask(opts = {}) {
-  const busy = opts.busy || (() => false);
+  const onDeadlock = opts.onDeadlock || (() => {});
+  const keepAlive = opts.keepAlive !== false;
   let entry = null;          // promising(jl_task_entry)
   const parked = new Map();  // task id -> resolve of its parked stack's promise
   const live = new Map();    // id >= 1 with a stack (started, not exited) -> its activation
   let current = -1;          // the id whose stack runs or is about to (-1: none)
   let root = null;           // the root call in flight: { reject }
   let terminal = null;       // why the instance is terminal (an Error), or null
+  let deadlocked = false;    // no task can run any more (the root call stays in flight)
+  let keeper = null;         // the interval that keeps Node alive after a deadlock
   const st = { roots: 0, switches: 0, starts: 0, exits: 0, handoffs: 0, maxParked: 0, maxLive: 0 };
 
   // A failure: the root call in flight fails with it; the instance becomes terminal.
@@ -78,29 +87,38 @@ export function makeJuliaTask(opts = {}) {
     parked.clear();
     live.clear();
     current = -1;
+    if (keeper) { clearInterval(keeper); keeper = null; }
   }
   // The deferred resumption or start: at most one at a time (exactly one stack runs, or is
   // about to), in one slot, run by one function (no allocation per switch)
   let pending = null;
   const runPending = () => { const f = pending; pending = null; if (f) f(); };
-  function defer(fn) {
+  function defer(fn, turn) {
     if (pending) { fail(new JuliaTaskError('julia_task: two transfers pending (internal error)')); return; }
     pending = fn;
-    if (busy()) { st.handoffs++; setImmediate(runPending); } else queueMicrotask(runPending);
+    if (turn) { st.handoffs++; setImmediate(runPending); } else queueMicrotask(runPending);
   }
   const invalid = (msg) => new JuliaTaskError(`julia_task: invalid transfer: ${msg}`);
   // Pass the thread from `from` (which suspends or ends) to `to`; false after a failure.
   function transfer(from, to, what) {
     if (terminal) return false;
     if (from !== current) { fail(invalid(`${what}(${from}, ${to}) from a task that is not running (${current} is)`)); return false; }
-    if (!Number.isInteger(to) || to < 0 || to > MAX_TASK_ID) { fail(invalid(`${what}(${from}, ${to}): task id out of range`)); return false; }
+    if (!Number.isInteger(to) || to < -1 || to > MAX_TASK_ID) { fail(invalid(`${what}(${from}, ${to}): task id out of range`)); return false; }
     // (switch(id, id): the task yields to the host and resumes itself, below; exit(id, id) is invalid)
     if (to === from && what !== 'switch') { fail(invalid(`${what}(${from}, ${to}): to itself`)); return false; }
+    if (to === -1) {
+      // (a deadlock: no stack runs any more; `from`, if parked, stays so)
+      current = -1;
+      deadlocked = true;
+      if (keepAlive && !keeper) keeper = setInterval(() => {}, 1 << 30);
+      setImmediate(() => { if (!terminal) onDeadlock(); });
+      return true;
+    }
     const r = parked.get(to);
     current = to;
     if (r) {
       parked.delete(to);
-      defer(r);
+      defer(r, to === from);
       return true;
     }
     if (to === 0) { fail(invalid(`${what}(${from}, 0): the root task is not parked`)); return false; }
@@ -114,7 +132,7 @@ export function makeJuliaTask(opts = {}) {
     defer(() => entry(to).then(() => {
       // (a stack ends only after its exit)
       if (!act.exited) fail(new JuliaTaskError(`julia_task: jl_task_entry(${to}) returned without exit`));
-    }, fail));
+    }, fail), false);
     return true;
   }
 
@@ -177,6 +195,7 @@ export function makeJuliaTask(opts = {}) {
       return abandoned;
     },
     terminal: () => terminal,
+    deadlocked: () => deadlocked,
     stats: () => ({ ...st, parked: parked.size, live: live.size }),
   };
 }
