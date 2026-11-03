@@ -12,6 +12,11 @@ const R = WasmCodegen.Runtime
 wcfg = WasmCodegen.Config(host=:wasi)
 wcomp(f, at) = WasmCodegen.compile(f, at; config=wcfg)
 
+# libuv's name and message of each of its codes (Base's table of them), hashed
+const UV_CODES = Int32[v for (_, v) in Base.uv_err_vals]
+uv_texts(name, message) = foldl((h, c) -> hash(name(c), hash(message(c), h)), UV_CODES; init=UInt(0))
+st_uv_texts() = uv_texts(R.Errno.uv_name, R.Errno.uv_message)
+
 # loads and stores of each width, little-endian, and the bounds check (an ArgumentError, catchable)
 function st_roundtrip(x::UInt64)
     off = S.SCRATCH_OUT
@@ -212,6 +217,10 @@ scratch_only() = R.WASI.clock_time_get(R.WASI.CLOCK_REALTIME, UInt64(1000), S.SC
         @test st_synthetic_uv(Int32(code)) == expected
         @test wasm_run(c, "st_synthetic_uv", Int32(code); rettype=Int32) == expected
     end
+    # the name and message of all of libuv's codes (`UV_EOF`, `UV_UNKNOWN`, the `UV_EAI_*`) in
+    # Wasm, against libuv's own natively (the methods before the patches)
+    native = uv_texts(c -> R.original(Base.uverrorname, c), c -> R.original(Base.struverror, c))
+    @test wasm_run(WasmCodegen.compile(st_uv_texts, ()), "st_uv_texts"; rettype=UInt) == native
 
 end
 

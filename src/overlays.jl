@@ -35,13 +35,14 @@ itself (a host call), or `nothing` for other calls.
 function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nospecialize(typ))
     m = mi.def
     m isa Method || return nothing
-    if m.module === Runtime.Staging && haskey(STAGING_OPS, m.name)
+    staging = staging_op(m)
+    if staging !== nothing
         # a load or store of the linear memory (for WASI: see `staging.jl`), checked first as
         # natively (a Julia error, not a trap)
         fc.cgm.config.host === :wasi ||
             unsupported("the linear memory (`Runtime.Staging`) in a module for JavaScript (`Config(host = :wasi)`)")
         staging_memory!(fc.cgm)
-        op, T = STAGING_OPS[m.name]
+        op, T = staging
         args = CGVal[operand(fc, a) for a in ex.args[3:end]]
         off = convert_repr(fc, args[1], UInt32)
         call_runtime!(fc, Runtime.Staging.check, CGVal[off, const_value(fc, sizeof(T))])
@@ -115,3 +116,14 @@ const STAGING_OPS = Dict{Symbol,Tuple{Symbol,Any}}(
     :load32 => (:i32_load, UInt32), :load64 => (:i64_load, UInt64),
     :store8 => (:i32_store8, UInt8), :store16 => (:i32_store16, UInt16),
     :store32 => (:i32_store, UInt32), :store64 => (:i64_store, UInt64))
+
+# the instruction and type of a load or store of `Runtime.Staging` (`m`, by its name and its
+# signature: `load8(off::UInt32)`, `store8(off::UInt32, v::UInt8)`, ...), or nothing
+function staging_op(m::Method)
+    m.module === Runtime.Staging || return nothing
+    op = get(STAGING_OPS, m.name, nothing)
+    op === nothing && return nothing
+    F = typeof(getglobal(Runtime.Staging, m.name))
+    sig = startswith(String(m.name), "load") ? Tuple{F,UInt32} : Tuple{F,UInt32,op[2]}
+    return m.sig == sig ? op : nothing
+end

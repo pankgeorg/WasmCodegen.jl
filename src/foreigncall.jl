@@ -23,8 +23,9 @@ function foreigncall_library(@nospecialize(x))
     x isa QuoteNode && (x = x.value)
     x isa Tuple && return length(x) == 2 && x[2] isa String ? x[2] : nothing
     x isa GlobalRef && isconst(x.mod, x.name) && return foreigncall_library(getglobal(x.mod, x.name))
-    lib = if x isa Expr && x.head === :call && length(x.args) == 3 && x.args[1] === Core.tuple
-        # `Core.tuple(name, library)` (Julia 1.12)
+    lib = if x isa Expr && x.head === :call && length(x.args) == 3 &&
+             (x.args[1] === Core.tuple || x.args[1] == GlobalRef(Core, :tuple))
+        # `Core.tuple(name, library)` (Julia 1.12; the callee is a `GlobalRef` in its IR)
         x.args[3]
     elseif x isa Expr && x.head === :tuple && length(x.args) == 2
         # (name, library) (Julia 1.13)
