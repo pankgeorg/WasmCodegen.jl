@@ -7,26 +7,28 @@
 
 """
 The owner of the CodeInstances inferred for Wasm in Julia's code cache, for the overlay method
-tables of the host's extensions `extensions` and `Runtime.WASM_METHODS` as they are: how many
-methods were defined in them, and how many are in force. Code inferred for other extensions, or
-before a method was defined or deleted, is not reused, since that does not invalidate it (a
-caller that found the native method has no backedge to an overlay method table).
+tables of a module (`Runtime.overlay_tables`: of its host's extensions, and
+`Runtime.WASM_METHODS`) as they are: the tables themselves (by identity), how many methods were
+defined in them, and how many are in force. Code inferred with other tables, or before a method
+was defined or deleted, is not reused, since that does not invalidate it (a caller that found
+the native method has no backedge to an overlay method table).
 """
 struct WasmCacheOwner
-    extensions::Tuple{Vararg{Symbol}}
+    tables::Tuple{Vararg{Core.MethodTable}}
     defined::Int
     in_force::Int
 end
 
 function WasmCacheOwner(extensions=())
+    tables = Runtime.overlay_tables(extensions)
     defined = in_force = 0
-    for mt in Runtime.overlay_tables(extensions)
+    for mt in tables
         Base.visit(mt) do m
             defined += 1
             m.dispatch_status == 0 || (in_force += 1)
         end
     end
-    return WasmCacheOwner(Tuple(Runtime.table_extensions(extensions)), defined, in_force)
+    return WasmCacheOwner(Tuple(tables), defined, in_force)
 end
 
 """

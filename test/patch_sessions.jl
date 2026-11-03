@@ -150,3 +150,31 @@ end
         end
     end
 end
+
+# the code cache is keyed on the overlay tables themselves: an extension's table replaced by
+# another with as many methods is not taken for it
+module TableIdentity
+cache_g(x::Int) = x
+Base.Experimental.@MethodTable(A)
+Base.Experimental.@MethodTable(B)
+Base.Experimental.@overlay A cache_g(x::Int) = x + 1
+Base.Experimental.@overlay B cache_g(x::Int) = x + 2
+cache_h(x::Int) = cache_g(x)
+end
+
+@testset "the code cache and the extensions' tables" begin
+    R, T = WasmCodegen.Runtime, TableIdentity
+    cfg = WasmCodegen.Config(host_extensions=[:test_tables])
+    try
+        WasmCodegen.with_trim_patches() do _, _
+            R.EXTENSION_METHODS[:test_tables] = T.A
+            c = WasmCodegen.compile(T.cache_h, (Int,); config=cfg)
+            @test wasm_run(c, "cache_h", 10; rettype=Int) == 11
+            R.EXTENSION_METHODS[:test_tables] = T.B
+            c = WasmCodegen.compile(T.cache_h, (Int,); config=cfg)
+            @test wasm_run(c, "cache_h", 10; rettype=Int) == 12
+        end
+    finally
+        delete!(R.EXTENSION_METHODS, :test_tables)
+    end
+end

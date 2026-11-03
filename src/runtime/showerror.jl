@@ -80,19 +80,18 @@ function show_scalar(io::Base.IO, @nospecialize(x))
     end
 end
 
-# `show(io, s::Symbol)`: an identifier as `:s` (Base's rule, `Base.isidentifier`); a symbol
-# of operator characters (no letter, digit, space, quote or bracket) as `:s`, as Base shows an
-# operator (not exactly: Base asks the parser, `jl_is_operator`, which the runtime has not;
-# `:(=>)`-style forms and non-operators like `Symbol("!!!")` differ); others as `Symbol("s")`
+# `show(io, s::Symbol)`, as Base's (`show_unquoted_quote_expr`): the symbols Base quotes
+# (`quoted_syms`) as `:(s)`, an identifier or an operator (the parser's, `Base._isoperator`)
+# as `:s`, another as `Symbol("s")`
+const QUOTED_SYMS = Tuple(Base.quoted_syms)
 function show_symbol(io::Base.IO, s::Symbol)
-    str = string(s)
-    if Base.isidentifier(str)
-        print(io, ':', str)
-    elseif !isempty(str) && all(c -> !(isletter(c) || isdigit(c) || isspace(c) || c in "\"'`()[]{},;"), str)
-        print(io, ':', str)
+    if any(q -> q === s, QUOTED_SYMS)
+        print(io, ":(", s, ")")
+    elseif Base.isidentifier(s) || (Base._isoperator(s) && s !== Symbol("'"))
+        print(io, ':', s)
     else
         print(io, "Symbol(")
-        show(io, str)
+        show(io, String(s))
         print(io, ")")
     end
 end

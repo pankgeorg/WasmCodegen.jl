@@ -144,7 +144,10 @@ const ERRORS = Any[SystemError("opening file /tmp/missing", 2), ErrorException("
                    ConcurrencyViolationError("lock"), KeyError(:k), KeyError(Symbol("a b")), KeyError(:+),
                    KeyError("k"), KeyError(3), KeyError('c'), KeyError(1.5), KeyError(nothing), EOFError(),
                    UndefRefError(), Base.IOError("read: connection reset by peer (ECONNRESET)", -104),
-                   DivideError(), H.HostCallError(Int32(14), "refused")]
+                   DivideError(), H.HostCallError(Int32(14), "refused"),
+                   # (symbols as Base shows them: quoted, operators, identifiers, others)
+                   [KeyError(s) for s in (Symbol("=>"), :(::), :(=), :(:), :(==), :(===), :(:=), :.+, :<:,
+                                          :!, Symbol("'"), :end, Symbol(""), Symbol("@m"), :x!, Symbol("!!!"))]...]
 function error_texts()::Int32
     for e in ERRORS
         println(Core.stdout, H.error_text(e))
@@ -195,8 +198,10 @@ function raw_names(io, dir::String, fs=BASE_FS)
 end
 
 # `chmod` through links that do not resolve, and of paths whose lookup fails (made natively
-# in `dir`): the lookup's errors
-const LOOKUPS = ("dangling", "dangling-abs", "loop", "f/x", "missing/x")
+# in `dir`): the lookup's errors (a link to a file with a separator after it, `.` and `..` in
+# a directory without search permission); of a file not readable and of a directory
+const LOOKUPS = ("dangling", "dangling-abs", "loop", "f/x", "missing/x", "slash", "slash-abs", "dot", "dotdot",
+                 "wonly", "dir")
 function lookups(io, dir::String, fs=BASE_FS)
     for name in LOOKUPS
         e = try
@@ -306,6 +311,15 @@ end
         symlink(joinpath(outside, "g"), joinpath(d, "out"))
         symlink(joinpath(outside, "missing"), joinpath(d, "out-missing"))
         symlink(joinpath("..", "..", basename(outside), "g"), joinpath(d, "out-up"))
+        symlink("f/", joinpath(d, "slash"))
+        symlink(joinpath(d, "f") * "/", joinpath(d, "slash-abs"))
+        mkdir(joinpath(d, "secret"))
+        chmod(joinpath(d, "secret"), 0o600)
+        symlink("secret/.", joinpath(d, "dot"))
+        symlink("secret/../f", joinpath(d, "dotdot"))
+        write(joinpath(d, "wonly"), "x")
+        chmod(joinpath(d, "wonly"), 0o200)
+        mkdir(joinpath(d, "dir"))
         return d
     end
     run_print(f, cfg, k) = wasm_run(WasmCodegen.compile(f, (Int,); config=cfg), string(nameof(f)), k;
@@ -319,9 +333,15 @@ end
     native_raw = sprint(io -> EV.raw_names(io, d1, nfs))
     @test native_raw == "mode 640;chmod 604;link true true;"
     native_lookups = sprint(io -> EV.lookups(io, d1, nfs))
+    # (as a user without the right to search every directory)
+    root = ccall(:getuid, Cuint, ()) == 0
     @test native_lookups == string("dangling IOError ", Base.UV_ENOENT, ";dangling-abs IOError ", Base.UV_ENOENT,
                                    ";loop IOError ", Base.UV_ELOOP, ";f/x IOError ", Base.UV_ENOTDIR,
-                                   ";missing/x IOError ", Base.UV_ENOENT, ";")
+                                   ";missing/x IOError ", Base.UV_ENOENT, ";slash IOError ", Base.UV_ENOTDIR,
+                                   ";slash-abs IOError ", Base.UV_ENOTDIR,
+                                   root ? ";dot ok;dotdot ok;" : string(";dot IOError ", Base.UV_EACCES,
+                                                                        ";dotdot IOError ", Base.UV_EACCES, ";"),
+                                   "wonly ok;dir ok;")
     # the seams: the methods of the extension's table with it, the defaults without it
     F = WasmCodegen.Runtime.FS
     sig = (UInt32, UInt32, Int32)

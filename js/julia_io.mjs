@@ -57,8 +57,14 @@
 // (`ENOENT`, `ENOTDIR`, `ELOOP` after 40 links, `EACCES`, ...); a path, a link or a `..` that
 // leaves the preopens is `-ENOTCAPABLE` (76), before anything outside them is examined; a
 // path that is not absolute, or has a NUL byte, `-EINVAL`. The operation then acts on the
-// resolved path. This checks paths: it cannot exclude another process replacing a checked
-// directory with a link before its use.
+// resolved path, by its name (Node has no `openat`): what remains racy is another process
+// replacing a checked directory of it with a link before the operation, which follows it.
+// The final component is not followed: `path_mode` is an `lstat` of it, `path_symlink` makes
+// it (an existing name is `EEXIST`), and `path_chmod` changes the mode of a descriptor opened
+// without following a link (`O_NOFOLLOW`), checked to be the file resolved; but for a file it
+// cannot open for reading (not readable, or not a file nor a directory), which it changes by
+// its name after an `lstat` that it is no link (racy: a link put in its place in between is
+// followed).
 //
 // **Readiness** is level-triggered: a timer is ready from when it fires (or is cancelled)
 // until it is closed. Callers close every handle (in `finally` blocks).
@@ -154,18 +160,22 @@ export function makeResolve(preopens) {
     const deny = (why) => { throw new GuestError(E.NOTCAPABLE, `path not permitted (${why}): ${shown(p)}`); };
     if (p.includes('\0')) throw new GuestError(E.INVAL, `${lookup}: a NUL byte`);
     if (!p.startsWith('/')) throw new GuestError(E.INVAL, `${lookup}: not absolute`);
-    const dir = p.length > 1 && p.endsWith('/');
+    let dir = p.length > 1 && p.endsWith('/');
     const start = rootOf(components(p));
     if (!start) deny('outside every preopen');
     let { done, todo } = start;
     let links = 0;
     while (todo.length) {
       const c = todo.shift();
-      if (c === '.') continue;
-      if (c === '..') {
-        // (of a resolved directory: its parent, lexically)
-        done.pop();
-        if (!inside(done)) deny('`..` leaves the preopens');
+      if (c === '.' || c === '..') {
+        // (looked up in a resolved directory, which needs search permission, as the kernel's
+        // lookup does; `..`: its parent, lexically)
+        try { fs.lstatSync(bytesOf('/' + [...done, c].join('/'))); }
+        catch (e) { throw new GuestError(errnoOf(e), `${lookup}: ${describe(e)}`); }
+        if (c === '..') {
+          done.pop();
+          if (!inside(done)) deny('`..` leaves the preopens');
+        }
         continue;
       }
       const next = [...done, c];
@@ -184,6 +194,8 @@ export function makeResolve(preopens) {
         try { target = latin1(fs.readlinkSync(file, { encoding: 'buffer' })); }
         catch (e) { throw new GuestError(errnoOf(e), `${lookup}: ${describe(e)}`); }
         if (target === '') throw new GuestError(E.NOENT, `${lookup}: a link to nothing`);
+        // (a target ending with a separator names a directory, followed, as a path does)
+        if (todo.length === 0 && target.endsWith('/')) dir = true;
         if (target.startsWith('/')) {
           const t = rootOf(components(target));
           if (!t) deny(`a link to ${shown(target)} leaves the preopens`);
@@ -256,10 +268,32 @@ export function makeJuliaIOPaths(opts = {}) {
     const p = resolve(readPath(path_off, path_len), follow !== 0);
     return act('path_mode', p, (b) => fs.lstatSync(b).mode);
   }
-  // chmod(2) of the path (following links, as chmod does)
+  // chmod(2) of the path (following links, as chmod does): of the resolved file, opened without
+  // following a link put in its place since (`O_NOFOLLOW`), and the same file (its device and
+  // inode) as resolved: its descriptor's (`fchmod`); a file that cannot be opened so (not
+  // readable, not a file or a directory), by its path after an `lstat` that it is no link
   function path_chmod(path_off, path_len, mode) {
     const p = resolve(readPath(path_off, path_len), true);
-    return act('path_chmod', p, (b) => (fs.chmodSync(b, mode & 0o7777), 0));
+    return act('path_chmod', p, (b) => {
+      const st = fs.lstatSync(b);
+      if (st.isSymbolicLink()) throw new GuestError(E.LOOP, `path_chmod ${shown(p)}: replaced by a symbolic link`);
+      if (st.isFile() || st.isDirectory()) {
+        const C = fs.constants;
+        let fd = -1;
+        try { fd = fs.openSync(b, C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK | (st.isDirectory() ? C.O_DIRECTORY : 0)); }
+        catch (e) { if (e.code !== 'EACCES') throw e; }
+        if (fd >= 0) {
+          try {
+            const fst = fs.fstatSync(fd);
+            if (fst.dev !== st.dev || fst.ino !== st.ino) throw new GuestError(E.AGAIN, `path_chmod ${shown(p)}: replaced meanwhile`);
+            fs.fchmodSync(fd, mode & 0o7777);
+          } finally { fs.closeSync(fd); }
+          return 0;
+        }
+      }
+      fs.chmodSync(b, mode & 0o7777);
+      return 0;
+    });
   }
   // symlink(2): the link `link` (its last component not followed) to `target`, raw bytes
   // neither checked nor resolved (any bytes, as natively)
@@ -400,8 +434,16 @@ export function makeJuliaIOEvents(opts = {}) {
     inPoll = true;
     let timer = null, timedOut = false;
     try {
-      if (timeout_ns > 0n)
-        timer = setTimeout(() => { timedOut = true; notify(); }, Math.min(Math.ceil(Number(timeout_ns) / 1e6), 0x7fffffff));
+      if (timeout_ns > 0n) {
+        // (armed again until the deadline: a timeout is at most 2^31 - 1 ms, 24.8 days)
+        const deadline = performance.now() + Number(timeout_ns) / 1e6;
+        const arm = () => {
+          const ms = deadline - performance.now();
+          if (ms <= 0) { timer = null; timedOut = true; notify(); return; }
+          timer = setTimeout(arm, Math.min(Math.ceil(ms), 0x7fffffff));
+        };
+        arm();
+      }
       for (;;) {
         await new Promise((r) => { waker = r; });
         waker = null;
