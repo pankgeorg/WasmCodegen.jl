@@ -399,6 +399,14 @@ function fs_edges(k::Int, out::IO)
     attempt(() -> (rm(p("link", ".")); 0), "rm link/.")
     attempt(() -> cd(() -> read("../x", String), p("link")), "cd link, read ../x")
     rec("link ", islink(p("link")), " ", isdir(p("a", "b")))
+    # (past 40 links, ELOOP: never a lexical `..`, which here names `<dir>/victim`)
+    mkpath(p("q", "d", "a", "b"))
+    symlink("a/b", p("q", "d", "link"))
+    write(p("q", "victim"), "")
+    write(p("q", "d", "victim"), "")
+    attempt(() -> (rm(p("q", "d") * "/" * "link/../../"^41 * "victim"); 0), "rm past the links")
+    attempt(() -> length(read(p("q", "d") * "/" * "link/../../"^40 * "victim")), "read within the links")
+    rec("victims ", isfile(p("q", "victim")), " ", isfile(p("q", "d", "victim")))
     # (NULs: the error of their conversion to a C string, before any call)
     attempt(() -> readdir("a\0b"), "nul readdir")
     attempt(() -> readlink("a\0b"), "nul readlink")
@@ -462,35 +470,83 @@ function before_epoch(k::Int)
     return r
 end
 
-# the modes of new files and directories, asked of a host with modes: natively those they
-# get; in Wasm those a host gets through the chmod seam (`FS.path_chmod`), which then tells
-# them (`FS.path_mode`; no mode of other paths)
+# a host with modes, through the seams: `path_chmod` sets modes (in `SET_MODES`; it fails,
+# EACCES, while `FAIL_CHMOD`), which `path_mode` tells, else the mode the host created a file
+# or a directory with (0o666 or 0o777, less `FAKE_UMASK`)
 const SET_MODES = Dict{String,Int32}()
+const FAKE_UMASK = Ref(Int32(0o022))
+const FAIL_CHMOD = Ref(false)
 function rec_chmod(path::UInt32, len::UInt32, mode::Int32)
+    FAIL_CHMOD[] && return Int32(2)
     SET_MODES[WasmCodegen.Runtime.FS.get_raw(path, len)] = mode
     return Int32(0)
 end
 function rec_mode(path::UInt32, len::UInt32, follow::Int32)
     F = WasmCodegen.Runtime.FS
-    m = get(SET_MODES, F.get_raw(path, len), Int32(-1))
-    ft = F.filetype(F.get_raw(path, len), follow != 0)
-    (m < 0 || ft isa Int32) && return -F.NO_MODES
-    return Int32(F.type_bits(ft)) | m
+    p = F.get_raw(path, len)
+    ft = F.filetype(p, follow != 0)
+    ft isa Int32 && return -Int32(44)   # (WASI's ENOENT)
+    created = ft == F.FT_FILE ? Int32(0o666) & ~FAKE_UMASK[] : Int32(0o777) & ~FAKE_UMASK[]
+    return Int32(F.type_bits(ft)) | get(SET_MODES, p, created)
 end
+# the modes of new files and directories under the umask `k` (the host's, in Wasm)
 function created_modes(k::Int)
+    FAKE_UMASK[] = Int32(k)
     dir = joinpath(ROOT, string("c", k))
     mkpath(dir)
     mode(f) = string(filemode(f) & 0o777; base=8)
     tp, tio = mktemp(dir)
     close(tio)
     td = mktempdir(dir)
+    J = Base.Filesystem
     mkdir(joinpath(dir, "m"); mode=0o751)
-    close(Base.Filesystem.open(joinpath(dir, "o"), Base.Filesystem.JL_O_CREAT | Base.Filesystem.JL_O_WRONLY, 0o640))
-    r = string(mode(tp), " ", mode(td), " ", mode(joinpath(dir, "m")), " ", mode(joinpath(dir, "o")))
+    close(J.open(joinpath(dir, "o"), J.JL_O_CREAT | J.JL_O_WRONLY, 0o640))
+    mkdir(joinpath(dir, "m2"); mode=0o777)
+    close(J.open(joinpath(dir, "o2"), J.JL_O_CREAT | J.JL_O_WRONLY, 0o666))
+    r = join([mode(tp), mode(td), mode(joinpath(dir, "m")), mode(joinpath(dir, "o")),
+              mode(joinpath(dir, "m2")), mode(joinpath(dir, "o2"))], " ")
     rm(dir; recursive=true)
     return r
 end
-modes_print(k::Int) = (print(Core.stdout, created_modes(k)); Int32(0))
+# a new file whose mode cannot be given, through a dangling link: the error, the target the
+# open created removed, the link kept (8 + 4 + 2 + 1)
+function failed_create(k::Int)
+    dir = joinpath(ROOT, string("f", k))
+    mkpath(dir)
+    link, target = joinpath(dir, "link"), joinpath(dir, "target")
+    symlink("target", link)
+    # (a host creating files 0o644: 0o600 is to be set; a native run of `created_modes` left
+    # another umask in the image)
+    FAKE_UMASK[] = Int32(0o022)
+    FAIL_CHMOD[] = true
+    J = Base.Filesystem
+    e = try
+        close(J.open(link, J.JL_O_CREAT | J.JL_O_WRONLY, 0o600))
+        Int32(0)
+    catch err
+        err isa Base.IOError ? err.code : Int32(1)
+    end
+    FAIL_CHMOD[] = false
+    r = Int32(8 + 4 * (e == Base.UV_EACCES) + 2 * islink(link) + !ispath(target))
+    rm(dir; recursive=true)
+    return r
+end
+# (k: a umask, the modes printed; -1: `failed_create`)
+modes_print(k::Int) = k < 0 ? failed_create(k) : (print(Core.stdout, created_modes(k)); Int32(0))
+# a host that sets modes but does not tell them (no `path_mode`): it is asked none, its umask
+# unknown (the number of modes set)
+function unknown_umask(k::Int)
+    dir = joinpath(ROOT, string("u", k))
+    mkpath(dir)
+    J = Base.Filesystem
+    mkdir(joinpath(dir, "m"); mode=0o777)
+    close(J.open(joinpath(dir, "o"), J.JL_O_CREAT | J.JL_O_WRONLY, 0o666))
+    _, tio = mktemp(dir)
+    close(tio)
+    mktempdir(dir)
+    rm(dir; recursive=true)
+    return Int32(length(SET_MODES))
+end
 
 # a host without file modes: files 0o644, directories 0o755, chmod is ENOTSUP
 function fs_modes(k::Int)
@@ -714,7 +770,7 @@ function preopen_retry(k::Int)
     ps = WasmCodegen.Runtime.FS.preopens()
     return Int32(code == Base.UV_EIO && unpublished && length(ps) == 2 &&
         WasmCodegen.Runtime.FS.resolve(ROOT)[1] != WasmCodegen.Runtime.FS.resolve(ROOT * "/nested")[1] &&
-        WasmCodegen.Runtime.FS.resolve(ROOT * "-near-miss")[1] == -1)
+        WasmCodegen.Runtime.FS.resolve(ROOT * "-near-miss")[1] == Base.UV_ENOENT)
 end
 
 function realpath_root(k::Int)
@@ -985,18 +1041,26 @@ end
     # (a time before 1970: EINVAL, where natively it is set)
     @test run_fs(before_epoch, 1) == Base.UV_EINVAL
     @test LAST_OUTPUT[] == "futime: invalid argument (EINVAL)"
-    # the modes asked of a host with modes (seams, for this test only), as natively given
-    expected = created_modes(1)
+    # the modes asked of a host with modes (seams, for this test only): as natively given,
+    # under umasks 0o022 and 0o077 (natively the process's, set for the call)
+    with_umask(f, m) = (old = ccall(:umask, Cuint, (Cuint,), m); try f() finally ccall(:umask, Cuint, (Cuint,), old) end)
+    expected = [with_umask(() -> created_modes(Int(m)), m) for m in (0o022, 0o077)]
     F = WasmCodegen.Runtime.FS
     methods_of(mt) = (ms = Method[]; Base.visit(m -> push!(ms, m), mt); ms)
     before = methods_of(WasmCodegen.Runtime.WASM_METHODS)
-    @eval WasmCodegen.Runtime.@wasm_method $F.path_mode(path::UInt32, len::UInt32, follow::Int32) =
-        $rec_mode(path, len, follow)
     @eval WasmCodegen.Runtime.@wasm_method $F.path_chmod(path::UInt32, len::UInt32, mode::Int32) =
         $rec_chmod(path, len, mode)
     try
-        @test run_fs(modes_print, 2) == 0
-        @test LAST_OUTPUT[] == expected
+        # (without `path_mode`, no mode is set)
+        @test run_fs(unknown_umask, 1) == 0
+        @eval WasmCodegen.Runtime.@wasm_method $F.path_mode(path::UInt32, len::UInt32, follow::Int32) =
+            $rec_mode(path, len, follow)
+        c = WasmCodegen.compile(modes_print, (Int,); config=cfg)
+        for (m, e) in zip((0o022, 0o077), expected)
+            @test wasm_run(c, "modes_print", Int(m); rettype=Int32, preopens=Dict(ROOT => ROOT)) == 0
+            @test LAST_OUTPUT[] == e
+        end
+        @test wasm_run(c, "modes_print", -1; rettype=Int32, preopens=Dict(ROOT => ROOT)) == 15
     finally
         foreach(Base.delete_method, setdiff(methods_of(WasmCodegen.Runtime.WASM_METHODS), before))
     end

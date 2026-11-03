@@ -174,7 +174,7 @@ function preopens()
         if Staging.load8(Staging.SCRATCH_OUT) == 0x00
             name = prestat_name(fd, Staging.load32(Staging.SCRATCH_OUT + UInt32(4)))
             startswith(name, '/') || throw(Base.IOError("preopen name must be absolute", Int32(Base.UV_EINVAL)))
-            push!(found, (fd, normalize(name)))
+            push!(found, (fd, normalize_path(name; links=false)))
         end
         fd += Int32(1)
     end
@@ -203,15 +203,18 @@ function cwd()
 end
 
 """
-    normalize(path) -> String
+    normalize_path(path) -> String, or UV_ELOOP
 
 The absolute path of `path` (relative to the working directory), without `.`, `..`, repeated
 separators or a trailing separator (which `check_path` checks). `.` and `..` apply to the
 directory their prefix names, as the kernel resolves them: after a symbolic link, to its
 target (`link/..` is the parent of the target, not the link's directory). Elsewhere they are
-removed lexically, which names the same file (the host follows the links of the rest).
+removed lexically, which names the same file (the host follows the links of the rest). Past
+`MAXSYMLINKS` links replaced, ELOOP, as the kernel's lookup (never a lexical `..`, which
+would name another file). Without `links`, lexically (the preopens' own names, which are
+looked up in none).
 """
-function normalize(path::String)
+function normalize_path(path::String; links::Bool=true)
     p = String(path)
     startswith(p, '/') || (p = string(cwd(), "/", p))
     # (the components to go, the next last)
@@ -222,10 +225,11 @@ function normalize(path::String)
     while !isempty(todo)
         c = pop!(todo)
         if c == "." || c == ".."
-            t = isempty(parts) || hops >= MAXSYMLINKS ? nothing : link_target("/" * join(parts, "/"))
+            t = isempty(parts) || !links ? nothing : link_target("/" * join(parts, "/"))
             if t isa String
                 # (the link replaced by its target, then `c` again)
                 hops += 1
+                hops > MAXSYMLINKS && return UV_ELOOP
                 pop!(parts)
                 startswith(t, '/') && empty!(parts)
                 push!(todo, c)
@@ -242,9 +246,16 @@ function normalize(path::String)
     return "/" * join(parts, "/")
 end
 
-# the links followed in a path before ELOOP (Linux's `MAXSYMLINKS`): past them, `.` and `..`
-# are lexical, and the lookup of the prefix fails with ELOOP (`check_path`)
+# the links followed in a path before ELOOP (Linux's `MAXSYMLINKS`)
 const MAXSYMLINKS = 40
+const UV_ELOOP = Int32(-40)
+
+"`normalize_path(path)`, of a path known to resolve (`check_path`): ELOOP is thrown."
+function normalize(path::String)
+    p = normalize_path(path)
+    p isa String && return p
+    throw(Base._UVError(repr(path), p))
+end
 
 # the target of the symbolic link at the absolute path `path` (without `.` or `..`), or nothing
 function link_target(path::String)
@@ -291,14 +302,16 @@ function last_component(path::String)
 end
 
 """
-    resolve(path) -> (fd, relative path), or (-1, "") outside every preopen
+    resolve(path) -> (fd, relative path), or (a libuv error code, "")
 
 The preopened directory `path` is in (the longest prefix, on component boundaries) and the
-path relative to it (`.` for the directory itself).
+path relative to it (`.` for the directory itself); ENOENT outside every preopen, ELOOP past
+the links `normalize_path` follows.
 """
 function resolve(path::String)
-    p = normalize(path)
-    best, rel, len = Int32(-1), "", -1
+    p = normalize_path(path)
+    p isa Int32 && return (p, "")
+    best, rel, len = UV_ENOENT, "", -1
     for (fd, dir) in preopens()
         n = ncodeunits(dir)
         inside = dir == "/" ? true :
@@ -324,7 +337,7 @@ not exist (ENOENT).
 function check_path(path::String)
     isempty(path) && return UV_ENOENT
     fd, rel = resolve(path)
-    fd < 0 && return UV_ENOENT
+    fd < 0 && return fd
     # (`.` and `..` need what precedes them to be a directory, as a lookup of each component
     # checks natively: `file/.` is ENOTDIR, `missing/../file` ENOENT)
     if occursin("/.", path) || startswith(path, '.')
@@ -364,7 +377,7 @@ trailing_sep(path::String) = ncodeunits(path) > 1 && codeunit(path, ncodeunits(p
 # (`UV_ENOENT`: it does not exist; ELOOP, ENOTDIR, ...)
 function filetype(path::String, follow::Bool)
     fd, rel = resolve(path)
-    fd < 0 && return UV_ENOENT
+    fd < 0 && return fd
     r = Staging.with_scope() do
         off, len = Staging.raw_path(rel)
         path_filestat_get(fd, follow ? SYMLINK_FOLLOW : UInt32(0), off, len, Staging.SCRATCH_OUT)
@@ -585,20 +598,18 @@ end
 """
     creation_mode!(path, mode; dir) -> 0, or a libuv error code
 
-Give what the host just created at `path` the mode `mode` asked of mkdir(2) or open(2):
-through the seams, by `apply_mode!` when the host tells its modes (`path_mode`), else the
-mode less the default umask (0o022) when it can only set them (`path_chmod`). A host without
-modes (WASI's default) keeps its own: files 0o666 and directories 0o777 less its umask
-(0o644 and 0o755 with Node's), not `mktemp`'s 0o600 or `mktempdir`'s 0o700.
+Give what the host just created at `path` the mode `mode` asked of mkdir(2) or open(2), as
+the host masked it: the mode it created (0o777 or 0o666, less its umask) tells what it
+allows, never widened (`apply_mode!`). A host that does not tell its modes (`path_mode`;
+WASI's default) keeps its own, whatever was asked: 0o644 and 0o755 with Node's (umask
+0o022), not `mktemp`'s 0o600 or `mktempdir`'s 0o700. (Its umask unknown, a chmod could
+only guess, and a guess may widen a mode.)
 """
 function creation_mode!(path::String, mode::Integer; dir::Bool)
     now = perm_bits(path)
     # (a failed query of the mode: its error)
     now isa Int32 && return now
-    now === nothing || return apply_mode!(path, mode, now; dir)
-    want = Int32(mode) & Int32(0o7777) & ~Int32(0o022)
-    r = with_abspath((off, len) -> path_chmod(off, len, want), path)
-    return r === nothing ? UV_ENOENT : r == 0 || r == NO_MODES ? Int32(0) : uv(r)
+    return now === nothing ? Int32(0) : apply_mode!(path, mode, now; dir)
 end
 
 """
@@ -702,7 +713,7 @@ function jl_fs_symlink(target::Cstring, link::Cstring, flags::Cint)
     end
     if r == NO_MODES
         fd, rel = resolve(l)
-        fd < 0 && return UV_ENOENT
+        fd < 0 && return fd
         r = Staging.with_scope() do
             o, ol = Staging.raw_path(t)
             n, nl = Staging.raw_path(rel)
@@ -897,10 +908,12 @@ function open_path(path::String, flags::Int32, mode::Int32)
     if creating
         e = creation_mode!(path, mode; dir=false)
         # (the mode could not be given: the error, the file neither left open nor left with
-        # another mode)
+        # another mode; the file created, which through a dangling link is its target, not
+        # the link)
         if e != 0
+            created = Runtime.BaseFS.realpath_wasm_or_nothing(path)
             fd_close(r)
-            with_path((fd, off, len) -> path_unlink_file(fd, off, len), path)
+            created === nothing || with_path((fd, off, len) -> path_unlink_file(fd, off, len), created)
             return e
         end
     end
@@ -1091,8 +1104,10 @@ end
     read_n(fd, dst, i, n; eagain) -> the bytes read, or a libuv code
 
 One `read(2)` of up to `n` bytes of `fd` into `dst` from `i` (0-based): a staging chunk at a
-time, the next while they come back full, as one `read(2)` of a file reads all it can. An
-error after some bytes leaves those (it comes with the next read).
+time; of a regular file, the next while they come back full, as one `read(2)` of a file
+reads all it can. Of another descriptor (a pipe, a terminal) one chunk, which may wait for
+input, as one `read(2)` does, but never for more after it. An error after some bytes leaves
+those (it comes with the next read).
 """
 function read_n(fd::Int32, dst, i::Int, n::Int; eagain::Bool)
     got = 0
@@ -1102,6 +1117,7 @@ function read_n(fd::Int32, dst, i::Int, n::Int; eagain::Bool)
         r < 0 && return got > 0 ? got : r
         got += r
         r < k && break
+        got < n && !regular_file(fd) && break
     end
     return got
 end
@@ -1249,6 +1265,14 @@ function _os_read(fd::Int, dst, i::Int, n::Int)
     e = libc_from_uv(r)
     set_errno(e)
     return (e, 0)
+end
+
+# whether `fd` is a regular file (or a block device): one `read(2)` of it returns all asked
+# that is there, without waiting
+function regular_file(fd::Int32)
+    fd_fdstat_get(fd, Staging.SCRATCH_OUT) == 0 || return false
+    ft = Staging.load8(Staging.SCRATCH_OUT)
+    return ft == FT_FILE || ft == FT_BLOCK
 end
 
 # `_os_read_all`: reads until `n` bytes, the end of the input or an error
@@ -1893,7 +1917,7 @@ function realpath_wasm(path::String)
     hops = 0
     while true
         fd, rel = FS.resolve(p)
-        fd < 0 && err(Int32(Base.UV_ENOENT))
+        fd < 0 && err(fd)
         root = "/"
         for (f, dir) in FS.preopens()
             f == fd && (root = dir)
@@ -1909,7 +1933,9 @@ function realpath_wasm(path::String)
                 hops > 40 && err(Int32(Base.UV_ELOOP))
                 rest = join(parts[k+1:end], "/")
                 base = startswith(t, '/') ? t : (done == "/" ? "/" * t : done * "/" * t)
-                p = FS.normalize(isempty(rest) ? base : base * "/" * rest)
+                q = FS.normalize_path(isempty(rest) ? base : base * "/" * rest)
+                q isa Int32 && err(q)
+                p = q
                 changed = true
                 break
             elseif t != Int32(Base.UV_EINVAL)   # EINVAL: not a link
