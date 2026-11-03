@@ -356,6 +356,135 @@ end
 ios_ops(k::Int) = (out = IOBuffer(); ios_ops(k, out); String(take!(out)))
 ios_print(k::Int) = (ios_ops(k, Core.stdout); Int32(0))
 
+# `err_text`, with an `ArgumentError`'s message (the NULs')
+function msg_text(e, dir::String)
+    if e isa ArgumentError
+        msg = e.msg
+        msg isa String && return replace(msg, dir => "<dir>")
+    end
+    return err_text(e, dir)
+end
+
+# what lexical normalization would change (`.` and `..` after a symbolic link; `.` and `..`
+# last, which are removed or renamed by no call), NULs in paths, `readdir`'s order, and
+# descriptors: the results and errors of their writes and reads, their times
+function fs_edges(k::Int, out::IO)
+    dir = joinpath(ROOT, string("e", k))
+    mkpath(dir)
+    rec(xs...) = (print(out, xs...); println(out))
+    attempt(f, what) = try
+        rec(what, " => ", f())
+    catch e
+        rec(what, " !! ", msg_text(e, dir))
+    end
+    p(xs...) = joinpath(dir, xs...)
+    foreach(mkdir, (p("e"), p("e2"), p("e4"), p("a"), p("a", "b")))
+    write(p("a", "x"), "ax")
+    write(p("x"), "top")
+    symlink("a/b", p("link"))
+    symlink("a", p("la"))
+    attempt(() -> (rm(p("e", ".")); 0), "rm e/.")
+    attempt(() -> (rm(p("e", "..")); 0), "rm e/..")
+    attempt(() -> (rm(p("e", ".") * "/"); 0), "rm e/./")
+    attempt(() -> cd(() -> (rm("."); 0), p("e4")), "rm . in e4")
+    attempt(() -> ccall(:jl_fs_unlink, Int32, (Cstring,), p("e", ".")), "unlink e/.")
+    attempt(() -> ccall(:jl_fs_unlink, Int32, (Cstring,), p("e", "..")), "unlink e/..")
+    attempt(() -> ccall(:jl_fs_rename, Int32, (Cstring, Cstring), p("e2", "."), p("e3")), "rename e2/.")
+    attempt(() -> ccall(:jl_fs_rename, Int32, (Cstring, Cstring), p("x"), p("e2", "..")), "rename to e2/..")
+    rec("still ", isdir(p("e")), " ", isdir(p("e2")), " ", isdir(p("e4")), " ", isfile(p("x")))
+    attempt(() -> read(p("link", "..", "x"), String), "read link/../x")
+    attempt(() -> read(p("la", "..", "x"), String), "read la/../x")
+    attempt(() -> islink(p("link", ".")), "islink link/.")
+    attempt(() -> join(readdir(p("link", "..")), ","), "readdir link/..")
+    attempt(() -> (rm(p("link", ".")); 0), "rm link/.")
+    attempt(() -> cd(() -> read("../x", String), p("link")), "cd link, read ../x")
+    rec("link ", islink(p("link")), " ", isdir(p("a", "b")))
+    # (NULs: the error of their conversion to a C string, before any call)
+    attempt(() -> readdir("a\0b"), "nul readdir")
+    attempt(() -> readlink("a\0b"), "nul readlink")
+    attempt(() -> realpath("a\0b"), "nul realpath")
+    attempt(() -> (cd("a\0b"); 0), "nul cd")
+    attempt(() -> cd(() -> 0, "a\0b"), "nul cd(f)")
+    attempt(() -> mktempdir("a\0b"), "nul mktempdir")
+    attempt(() -> (mktemp("a\0b"); 0), "nul mktemp")
+    attempt(() -> mktempdir(dir; prefix="p\0"), "nul mktempdir prefix")
+    # (in libuv's order, `strcmp`'s, unsorted by Base)
+    mkdir(p("o"))
+    for n in ("z", "a", "B", "_x", "Z1", "aa", "é", "0")
+        write(p("o", n), "")
+    end
+    rec("readdir ", join(readdir(p("o"); sort=false), ","))
+    # descriptors: what `jl_fs_write` returns; errors of a closed one
+    w = p("w")
+    f = Base.Filesystem.open(w, Base.Filesystem.JL_O_RDWR | Base.Filesystem.JL_O_CREAT, 0o644)
+    b = Vector{UInt8}("abcdef")
+    n1 = GC.@preserve b ccall(:jl_fs_write, Int32, (Base.OS_HANDLE, Ptr{UInt8}, Csize_t, Int64),
+                              f.handle, pointer(b), 3, -1)
+    n2 = GC.@preserve b ccall(:jl_fs_write, Int32, (Base.OS_HANDLE, Ptr{UInt8}, Csize_t, Int64),
+                              f.handle, pointer(b), 2, 10)
+    rec("jl_fs_write ", n1, " ", n2, " ", position(f), " ", repr(read(w, String)))
+    # (whole seconds: Node's WASI sets no fraction)
+    attempt(() -> (Base.Filesystem.futime(f, 100.0, 200.0); mtime(w)), "futime")
+    attempt(() -> (Base.Filesystem.futime(f, NaN, NaN); mtime(w)), "futime NaN")
+    attempt(() -> (Base.Filesystem.futime(f, Inf, 1.0); mtime(w)), "futime Inf")
+    close(f)
+    g = Base.Filesystem.open(w, Base.Filesystem.JL_O_RDONLY)
+    ccall(:jl_fs_close, Int32, (Base.OS_HANDLE,), g.handle)
+    attempt(() -> read(g, UInt8), "read closed fd")
+    attempt(() -> write(g, 0x01), "write closed fd")
+    attempt(() -> (close(g); 0), "close closed fd")
+    rm(dir; recursive=true)
+    return nothing
+end
+fs_edges(k::Int) = (out = IOBuffer(); fs_edges(k, out); String(take!(out)))
+edges_print(k::Int) = (fs_edges(k, Core.stdout); Int32(0))
+
+# a time before 1970: natively set, over WASI (unsigned times) EINVAL
+function before_epoch(k::Int)
+    f = joinpath(ROOT, string("t", k))
+    write(f, "")
+    h = Base.Filesystem.open(f, Base.Filesystem.JL_O_RDWR)
+    r = try
+        Base.Filesystem.futime(h, -1.5, -1.5)
+        Int32(0)
+    catch e
+        e isa Base.IOError ? (print(Core.stdout, e.msg); e.code) : Int32(1)
+    end
+    close(h)
+    rm(f)
+    return r
+end
+
+# the modes of new files and directories, asked of a host with modes: natively those they
+# get; in Wasm those a host gets through the chmod seam (`FS.path_chmod`), which then tells
+# them (`FS.path_mode`; no mode of other paths)
+const SET_MODES = Dict{String,Int32}()
+function rec_chmod(path::UInt32, len::UInt32, mode::Int32)
+    SET_MODES[WasmCodegen.Runtime.FS.get_raw(path, len)] = mode
+    return Int32(0)
+end
+function rec_mode(path::UInt32, len::UInt32, follow::Int32)
+    F = WasmCodegen.Runtime.FS
+    m = get(SET_MODES, F.get_raw(path, len), Int32(-1))
+    ft = F.filetype(F.get_raw(path, len), follow != 0)
+    (m < 0 || ft isa Int32) && return -F.NO_MODES
+    return Int32(F.type_bits(ft)) | m
+end
+function created_modes(k::Int)
+    dir = joinpath(ROOT, string("c", k))
+    mkpath(dir)
+    mode(f) = string(filemode(f) & 0o777; base=8)
+    tp, tio = mktemp(dir)
+    close(tio)
+    td = mktempdir(dir)
+    mkdir(joinpath(dir, "m"); mode=0o751)
+    close(Base.Filesystem.open(joinpath(dir, "o"), Base.Filesystem.JL_O_CREAT | Base.Filesystem.JL_O_WRONLY, 0o640))
+    r = string(mode(tp), " ", mode(td), " ", mode(joinpath(dir, "m")), " ", mode(joinpath(dir, "o")))
+    rm(dir; recursive=true)
+    return r
+end
+modes_print(k::Int) = (print(Core.stdout, created_modes(k)); Int32(0))
+
 # a host without file modes: files 0o644, directories 0o755, chmod is ENOTSUP
 function fs_modes(k::Int)
     dir = joinpath(ROOT, string("m", k))
@@ -481,9 +610,10 @@ function positional_fault(k::Int)
     b = UInt8[0x58, 0x59, 0x5a]
     got = GC.@preserve b ccall(:jl_fs_write, Int32,
         (RawFD, Ptr{UInt8}, Csize_t, Int64), f.handle, b, 3, 1)
-    ok = position(f) == 5 && got == (k == 1 ? 2 : Base.UV_EIO)
+    # (a short write continued, as libuv's `uv__fs_write_all`; an error before any, the error)
+    ok = position(f) == 5 && got == (k == 1 ? 3 : Base.UV_EIO)
     close(f)
-    ok &= read(p, String) == (k == 1 ? "aXYdefgh" : "abcdefgh")
+    ok &= read(p, String) == (k == 1 ? "aXYZefgh" : "abcdefgh")
     rm(p)
     return Int32(ok)
 end
@@ -538,6 +668,9 @@ end
 @noinline query_error(path::UInt32, len::UInt32, follow::Int32) = Int32(-29) # WASI EIO
 function mode_query_fault(k::Int)
     p = joinpath(ROOT, string("mode-query", k))
+    # (an existing file, made without a query of its mode)
+    probe = p * "-probe"
+    close(open(probe, "w"))
     code = try
         if k == 1
             mkdir(p; mode=0o700)
@@ -549,17 +682,18 @@ function mode_query_fault(k::Int)
     catch e
         e isa Base.IOError ? e.code : Int32(1)
     end
-    # The created object remains; use readdir to avoid the failing mode provider.
-    exists = basename(p) in readdir(ROOT)
-    # A leaked file descriptor would occupy the next slot. Opening this existing file
-    # gets the same slot as a normal closed File open (fd 4 with one preopen).
+    # The created object is removed (not left with another mode); use readdir to avoid the
+    # failing mode provider.
+    removed = !(basename(p) in readdir(ROOT))
+    # A leaked file descriptor would occupy the next slot. Opening an existing file gets the
+    # same slot as a normal closed File open (fd 4 with one preopen).
     fdok = true
     if k == 2
-        f = Base.Filesystem.open(p, Base.Filesystem.JL_O_RDONLY)
+        f = Base.Filesystem.open(probe, Base.Filesystem.JL_O_RDONLY)
         fdok = reinterpret(Int32, f.handle) == 4
         close(f)
     end
-    return Int32(code == Base.UV_EIO && exists && fdok)
+    return Int32(code == Base.UV_EIO && removed && fdok)
 end
 
 function preopen_retry(k::Int)
@@ -610,7 +744,8 @@ function link_error(k::Int)
 end
 function directory_batch(k::Int)
     es = readdir(ROOT; sort=false)
-    return Int32(length(es) == 2 && ncodeunits(es[1]) == k && ncodeunits(es[2]) == 20)
+    # (in `strcmp`'s order, as libuv's `uv_fs_scandir` gives them: the shorter name first)
+    return Int32(length(es) == 2 && ncodeunits(es[1]) == 20 && ncodeunits(es[2]) == k)
 end
 preopen_empty(k::Int) = Int32(isempty(WasmCodegen.Runtime.FS.preopens()))
 function preopen_relative(k::Int)
@@ -830,6 +965,33 @@ end
     # (the records that differ)
     for (n, w) in zip(split(expected, '\n'), split(LAST_OUTPUT[], '\n'))
         n == w || println(Core.stdout, "IOStream: native ", repr(n), "\n wasm ", repr(w))
+    end
+end
+
+@testset "paths and descriptors over WASI, as natively" begin
+    expected = fs_edges(1)
+    @test run_fs(edges_print, 2) == 0
+    @test LAST_OUTPUT[] == expected
+    for (n, w) in zip(split(expected, '\n'), split(LAST_OUTPUT[], '\n'))
+        n == w || println(Core.stdout, "paths: native ", repr(n), "\n wasm ", repr(w))
+    end
+    # (a time before 1970: EINVAL, where natively it is set)
+    @test run_fs(before_epoch, 1) == Base.UV_EINVAL
+    @test LAST_OUTPUT[] == "futime: invalid argument (EINVAL)"
+    # the modes asked of a host with modes (seams, for this test only), as natively given
+    expected = created_modes(1)
+    F = WasmCodegen.Runtime.FS
+    methods_of(mt) = (ms = Method[]; Base.visit(m -> push!(ms, m), mt); ms)
+    before = methods_of(WasmCodegen.Runtime.WASM_METHODS)
+    @eval WasmCodegen.Runtime.@wasm_method $F.path_mode(path::UInt32, len::UInt32, follow::Int32) =
+        $rec_mode(path, len, follow)
+    @eval WasmCodegen.Runtime.@wasm_method $F.path_chmod(path::UInt32, len::UInt32, mode::Int32) =
+        $rec_chmod(path, len, mode)
+    try
+        @test run_fs(modes_print, 2) == 0
+        @test LAST_OUTPUT[] == expected
+    finally
+        foreach(Base.delete_method, setdiff(methods_of(WasmCodegen.Runtime.WASM_METHODS), before))
     end
 end
 

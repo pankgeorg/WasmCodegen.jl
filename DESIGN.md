@@ -452,6 +452,16 @@ shared (10% smaller modules for the parser).
     function: a WASI host can serve calls only once the instance (its memory) exists.
     `js/julia.mjs` implements these three functions too, for JavaScript without WASI.
 
+    The filesystem (`runtime/fs.jl`) is the C functions Base calls, over the host's
+    preopened directories: libuv's and ios.c's (an `IOStream` buffers as natively), with
+    native errors. What WASI preview 1 cannot tell or do differs from native, and is
+    documented where it is done: `stat`'s uid and gid (0), rdev (0), blksize and blocks
+    (from the size); file modes, which come from seams a host with modes replaces (without
+    them, files are 0o644 and directories 0o755, `chmod` is ENOTSUP, and new files, even
+    `mktemp`'s, get the host's modes); the permissions of an fd's `stat` (0o644, 0o755);
+    times before 1970, which cannot be set (EINVAL); and `cd(f, dir)`, which returns to the
+    previous directory by its path, not an fd.
+
   The test runner (`test/runner.mjs`) runs `:js` modules with `js/julia.mjs` and `:wasi`
   ones with Node's `node:wasi`; `WASMCODEGEN_TEST_HOST=wasi` runs the suite for WASI.
 

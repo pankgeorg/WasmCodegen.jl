@@ -205,28 +205,89 @@ end
 """
     normalize(path) -> String
 
-The absolute path of `path` (relative to the working directory), with `.`, `..` and repeated
-separators removed lexically (as WASI resolves them), without a trailing separator (which
-`check_path` checks).
-
-This differs from native resolution after a symbolic link: natively `link/..` is the parent
-of the link's target, here (and in WASI hosts) the directory of the link: a documented
-divergence (Pkg and Tar do not form such paths).
+The absolute path of `path` (relative to the working directory), without `.`, `..`, repeated
+separators or a trailing separator (which `check_path` checks). `.` and `..` apply to the
+directory their prefix names, as the kernel resolves them: after a symbolic link, to its
+target (`link/..` is the parent of the target, not the link's directory). Elsewhere they are
+removed lexically, which names the same file (the host follows the links of the rest).
 """
 function normalize(path::String)
     p = String(path)
     startswith(p, '/') || (p = string(cwd(), "/", p))
+    # (the components to go, the next last)
+    todo = String[String(c) for c in split(p, '/'; keepempty=false)]
+    reverse!(todo)
     parts = String[]
-    for c in eachsplit(p, '/')
-        if isempty(c) || c == "."
-            continue
-        elseif c == ".."
-            isempty(parts) || pop!(parts)
+    hops = 0
+    while !isempty(todo)
+        c = pop!(todo)
+        if c == "." || c == ".."
+            t = isempty(parts) || hops >= MAXSYMLINKS ? nothing : link_target("/" * join(parts, "/"))
+            if t isa String
+                # (the link replaced by its target, then `c` again)
+                hops += 1
+                pop!(parts)
+                startswith(t, '/') && empty!(parts)
+                push!(todo, c)
+                for x in Iterators.reverse(split(t, '/'; keepempty=false))
+                    push!(todo, String(x))
+                end
+            elseif c == ".." && !isempty(parts)
+                pop!(parts)
+            end
         else
-            push!(parts, String(c))
+            push!(parts, c)
         end
     end
     return "/" * join(parts, "/")
+end
+
+# the links followed in a path before ELOOP (Linux's `MAXSYMLINKS`): past them, `.` and `..`
+# are lexical, and the lookup of the prefix fails with ELOOP (`check_path`)
+const MAXSYMLINKS = 40
+
+# the target of the symbolic link at the absolute path `path` (without `.` or `..`), or nothing
+function link_target(path::String)
+    fd, rel = resolve(path)
+    fd < 0 && return nothing
+    t = read_link(fd, rel)
+    return t isa String ? t : nothing
+end
+
+# the target of the link `rel` of the preopen `fd`, or a libuv error code
+function read_link(fd::Int32, rel::String)
+    cap = UInt32(4096)
+    while true
+        result = readlink_result(fd, rel, cap)
+        result === nothing || return result
+        # A full buffer is ambiguous even for an exactly-capacity target.
+        cap == Staging.CHUNK && return uv(Int32(37)) # ENAMETOOLONG
+        cap *= UInt32(2)
+    end
+end
+
+# A separate call keeps each attempt's capacity concrete while the caller grows it.
+readlink_result(fd::Int32, rel::String, cap::UInt32) = Staging.with_scope() do
+    o, ol = Staging.raw_path(rel)
+    buf = Staging.alloc_data(cap; align=1)
+    r = path_readlink(fd, o, ol, buf, cap, Staging.SCRATCH_OUT)
+    r == 0 || return uv(r)
+    n = Staging.load32(Staging.SCRATCH_OUT)
+    n < cap ? get_raw(buf, n) : nothing
+end
+
+"""
+    last_component(path) -> String
+
+The last component of `path`, its trailing separators aside (`/` for the root). A `.`, `..`
+or `/` names no entry of a directory: the kernel removes or renames nothing by it, where
+`normalize` would make it name a directory.
+"""
+function last_component(path::String)
+    s = rstrip(path, '/')
+    isempty(s) && return isempty(path) ? "" : "/"
+    i = findlast('/', s)
+    return i === nothing ? String(s) : String(SubString(s, i + 1))
 end
 
 """
@@ -372,9 +433,12 @@ end
 const SIZEOF_STAT = Int32(80)
 
 # what WASI's filestat (64 bytes: dev, ino, filetype u8, nlink, size, atim, mtim, ctim) has
-# not: synthesized. uid, gid: 0; rdev: 0; blksize: 4096; blocks: the size in 512-byte blocks
-# (rounded up). mode: from `path_mode` for paths (see the seams); for an fd (`jl_fstat`), the type
-# from WASI and permissions 0o644 (files) or 0o755 (directories), never those of a path.
+# not, WASI cannot tell: these fields are synthesized, and differ from native. uid and gid:
+# 0 (not the owner's: a file of uid 1000 reads as root's); rdev: 0; blksize: 4096; blocks:
+# the size in 512-byte blocks, rounded up (not what is allocated: a sparse file reads as
+# full, one with blocks past its end as smaller). mode: from `path_mode` for paths (see the
+# seams); for an fd (`jl_fstat`), see there. (An error instead would fail every `stat`, of
+# which Base and programs read mostly the type, size and times.)
 const SYNTH_BLKSIZE = UInt64(4096)
 
 "The permissions of a file of the WASI type `ft` on a host without modes."
@@ -439,7 +503,12 @@ end
 jl_stat(path::Cstring, buf::Ptr{UInt8}) = stat_path(unsafe_string(path), buf, true)
 "`jl_lstat(path, buf)`."
 jl_lstat(path::Cstring, buf::Ptr{UInt8}) = stat_path(unsafe_string(path), buf, false)
-"`jl_fstat(fd, buf)`: the type from WASI, synthesized permissions (see above)."
+"""
+`jl_fstat(fd, buf)`: the type from WASI and synthesized permissions, 0o644 for a file and
+0o755 for a directory, whatever the host's: WASI has no modes, and the seams' (`path_mode`)
+take a path, which an fd has not (`filemode` of a `Base.Filesystem.File` or an `IOStream`
+differs from native; `sendfile`, patched, copies the mode of the source's path).
+"""
 function jl_fstat(fd::RawFD, buf::Ptr{UInt8})
     fs = Staging.SCRATCH_OUT
     r = fd_filestat_get(reinterpret(Int32, fd), fs)
@@ -514,6 +583,25 @@ function apply_mode!(path::String, mode::Integer, now::UInt32; dir::Bool)
 end
 
 """
+    creation_mode!(path, mode; dir) -> 0, or a libuv error code
+
+Give what the host just created at `path` the mode `mode` asked of mkdir(2) or open(2):
+through the seams, by `apply_mode!` when the host tells its modes (`path_mode`), else the
+mode less the default umask (0o022) when it can only set them (`path_chmod`). A host without
+modes (WASI's default) keeps its own: files 0o666 and directories 0o777 less its umask
+(0o644 and 0o755 with Node's), not `mktemp`'s 0o600 or `mktempdir`'s 0o700.
+"""
+function creation_mode!(path::String, mode::Integer; dir::Bool)
+    now = perm_bits(path)
+    # (a failed query of the mode: its error)
+    now isa Int32 && return now
+    now === nothing || return apply_mode!(path, mode, now; dir)
+    want = Int32(mode) & Int32(0o7777) & ~Int32(0o022)
+    r = with_abspath((off, len) -> path_chmod(off, len, want), path)
+    return r === nothing ? UV_ENOENT : r == 0 || r == NO_MODES ? Int32(0) : uv(r)
+end
+
+"""
 The permission bits the host allows in the directory `dir` (0o777 less its umask, or as an
 ACL of `dir` decides): of a directory created in it (with a new random name, retried on a
 collision) and removed; `nothing` if that fails.
@@ -538,24 +626,27 @@ function mkdir_path(path::String, mode::Integer)
         path_create_directory(fd, off, len)
     end
     r == 0 || return r < 0 ? r : uv(r)
-    # A mode failure leaves the created directory at its host mode.
-    now = perm_bits(path)
-    now === nothing && return Int32(0)
-    now isa Int32 && return now
-    return apply_mode!(path, mode, now; dir=true)
+    e = creation_mode!(path, mode; dir=true)
+    # (the mode could not be given: the error, the directory not left with another)
+    e == 0 || with_path((fd, off, len) -> path_remove_directory(fd, off, len), path)
+    return e
 end
 uv_fs_rmdir(loop::Ptr{Cvoid}, req::Ptr{Cvoid}, path::Cstring, cb::Ptr{Cvoid}) =
     simple(path_remove_directory, unsafe_string(path))
 jl_fs_unlink(path::Cstring) = simple(path_unlink_file, unsafe_string(path))
 
-# A final dot is meaningful to destructive operations, even though lookup normalizes it.
-terminal_dot(path::String) = (c = basename(rstrip(path, '/')); c == "." || c == "..")
+# A final dot is meaningful to destructive operations, even though lookup normalizes it (and
+# the root: `/` names no entry either; see `last_component`).
+terminal_dot(path::String) = (l = last_component(path); l == "." || l == ".." || l == "/")
 
 function simple(f::F, path::String) where {F}
     c = check_path(path)
     c == 0 || return c
     if terminal_dot(path)
-        return f === path_remove_directory ? (basename(rstrip(path, '/')) == "." ? Int32(Base.UV_EINVAL) : Int32(Base.UV_ENOTEMPTY)) : Int32(Base.UV_EISDIR)
+        # (as rmdir(2): `d/.` is EINVAL, `d/..` ENOTEMPTY, `/` EBUSY; as unlink(2), EISDIR)
+        f === path_remove_directory || return Int32(Base.UV_EISDIR)
+        l = last_component(path)
+        return Int32(l == "." ? Base.UV_EINVAL : l == ".." ? Base.UV_ENOTEMPTY : Base.UV_EBUSY)
     end
     r = with_path((fd, off, len) -> f(fd, off, len), path)
     return r <= 0 ? r : uv(r)
@@ -679,31 +770,14 @@ function readlink_path(path::String)
         return ft isa Int32 ? ft : Int32(Base.UV_EINVAL)
     end
     fd, rel = resolve(path)
-    cap = UInt32(4096)
-    while true
-        result = readlink_result(fd, rel, cap)
-        result === nothing || return result
-        # A full buffer is ambiguous even for an exactly-capacity target.
-        cap == Staging.CHUNK && return uv(Int32(37)) # ENAMETOOLONG
-        cap *= UInt32(2)
-    end
-end
-
-# A separate call keeps each attempt's capacity concrete while the caller grows it.
-readlink_result(fd::Int32, rel::String, cap::UInt32) = Staging.with_scope() do
-    o, ol = Staging.raw_path(rel)
-    buf = Staging.alloc_data(cap; align=1)
-    r = path_readlink(fd, o, ol, buf, cap, Staging.SCRATCH_OUT)
-    r == 0 || return uv(r)
-    n = Staging.load32(Staging.SCRATCH_OUT)
-    n < cap ? get_raw(buf, n) : nothing
+    return read_link(fd, rel)
 end
 
 """
     readdir_entries(dir) -> Vector{Tuple{String,UInt8}}, or an error code
 
-The entries of the directory `dir` (but `.` and `..`), with their WASI filetypes, in the
-order of the host.
+The entries of the directory `dir` (but `.` and `..`), with their WASI filetypes, sorted by
+name as libuv's `uv_fs_scandir` sorts them (`strcmp`), whatever the host's order.
 """
 function readdir_entries(dir::String)
     c = check_path(dir)
@@ -711,7 +785,9 @@ function readdir_entries(dir::String)
     fd, rel = resolve(dir)
     entries = Tuple{String,UInt8}[]
     r = read_dir!(entries, fd, rel)
-    return r == 0 ? entries : uv(r)
+    r == 0 || return uv(r)
+    # (`isless` of strings compares their bytes, as `strcmp` does names, which have no NUL)
+    return sort!(entries; by=first)
 end
 
 read_dir!(entries::Vector{Tuple{String,UInt8}}, fd::Int32, rel::String) = Staging.with_scope() do
@@ -819,13 +895,14 @@ function open_path(path::String, flags::Int32, mode::Int32)
                 nofollow ? UInt32(0) : SYMLINK_FOLLOW)
     r < 0 && return r
     if creating
-        now = perm_bits(path)
-        e = now === nothing ? Int32(0) : now isa Int32 ? now : apply_mode!(path, mode, now; dir=false)
-        # Creation and mode adjustment are not atomic. On failure the created file
-        # remains at its host mode, but the new descriptor is closed. A path-based
-        # provider must handle replacement races; atomic create-with-mode needs a
-        # stronger host interface.
-        e == 0 || (fd_close(r); return e)
+        e = creation_mode!(path, mode; dir=false)
+        # (the mode could not be given: the error, the file neither left open nor left with
+        # another mode)
+        if e != 0
+            fd_close(r)
+            with_path((fd, off, len) -> path_unlink_file(fd, off, len), path)
+            return e
+        end
     end
     return r
 end
@@ -837,29 +914,24 @@ end
 
 jl_fs_close(fd::RawFD) = (r = fd_close(reinterpret(Int32, fd)); r == 0 ? Int32(0) : uv(r))
 
-# Raw descriptor calls return a count or a negative libuv error, and allow short IO.
-# Bound each request to one staging chunk (also safely representable by Int32).
-# A negative offset selects sequential writes, as in libuv.
+"""
+`jl_fs_write(fd, buf, n, offset)` (`uv_fs_write`): the bytes written, all `n` as libuv's
+`uv__fs_write_all` writes them but at an error or no progress after some, or the error's
+code: at the current offset, which it advances, or at `offset` if not negative (`fd_pwrite`:
+the current offset unchanged). Each write is tried again after EINTR (EAGAIN is an error).
+"""
 function jl_fs_write(fd::RawFD, buf::Ptr{UInt8}, n::Csize_t, offset::Int64)
-    k = Int(min(n, Csize_t(Staging.CHUNK)))
-    return Staging.with_scope() do
-        off = Staging.alloc_data(k)
-        Staging.copy_ptr_to_linear!(off, buf, k)
-        write_once(reinterpret(Int32, fd), off, UInt32(k), offset)
-    end
+    e, nw = write_n(reinterpret(Int32, fd), buf, 0, Int(n), offset; ios=false)
+    return e == 0 || nw > 0 ? nw % Int32 : e
 end
 
+"""
+`jl_fs_read(fd, buf, n)` (`uv_fs_read`): the bytes of one read (all `n` but at the end of a
+file), or the error's code, which Base reports (`read: bad file descriptor (EBADF)`). It is
+tried again after EINTR (EAGAIN is an error).
+"""
 function jl_fs_read(fd::RawFD, buf::Ptr{Cvoid}, n::Csize_t)
-    k = Int(min(n, Csize_t(Staging.CHUNK)))
-    return Staging.with_scope() do
-        off = Staging.alloc_data(k)
-        got = read_once(reinterpret(Int32, fd), off, UInt32(k))
-        got < 0 && return got
-        for j in 1:Int(got)
-            unsafe_store!(Ptr{UInt8}(buf), Staging.load8(off + UInt32(j - 1)), j)
-        end
-        got
-    end
+    return read_n(reinterpret(Int32, fd), Ptr{UInt8}(buf), 0, Int(n); eagain=false) % Int32
 end
 
 # The source position is never changed, including on short writes and errors. Reusing the
@@ -888,9 +960,16 @@ function uv_fs_ftruncate(loop::Ptr{Cvoid}, req::Ptr{Cvoid}, fd::RawFD, n::Int64,
     r = fd_filestat_set_size(reinterpret(Int32, fd), UInt64(n))
     return r == 0 ? Int32(0) : uv(r)
 end
-"`uv_fs_futime(loop, req, fd, atime, mtime, cb)`: times in seconds."
+"""
+`uv_fs_futime(loop, req, fd, atime, mtime, cb)`: times in seconds since the epoch. WASI's are
+unsigned nanoseconds: a time before 1970 (or after 2554) cannot be set, and is EINVAL, as
+libuv's invalid arguments are (natively it is set); NaN and infinite times are EINVAL, as
+natively.
+"""
 function uv_fs_futime(loop::Ptr{Cvoid}, req::Ptr{Cvoid}, fd::RawFD, atime::Float64, mtime::Float64, cb::Ptr{Cvoid})
-    ns(t) = round(UInt64, max(t, 0.0) * 1e9)
+    settable(t) = 0.0 <= t < 0x1p64 / 1e9
+    (settable(atime) && settable(mtime)) || return Int32(Base.UV_EINVAL)
+    ns(t) = round(UInt64, t * 1e9)
     r = fd_filestat_set_times(reinterpret(Int32, fd), ns(atime), ns(mtime), UInt32(1 | 4))
     return r == 0 ? Int32(0) : uv(r)
 end
@@ -906,7 +985,8 @@ end
 "`getpid()`: the process of the host is not the program's: 1."
 getpid() = Int32(1)
 
-## reads and writes of a file descriptor, a staging chunk at a time
+## reads and writes of a file descriptor, a staging chunk at a time (see `_os_read` and
+## `_os_write_all`, below)
 
 # copy `n` bytes of the linear memory at `off` to `dst` (a `Vector{UInt8}` or a pointer)
 # from `i` (0-based), and of `src` from `i` to the linear memory at `off`
@@ -922,86 +1002,115 @@ copy_in!(off::UInt32, src::Vector{UInt8}, i::Int, n::Int) =
 copy_in!(off::UInt32, src::Ptr{UInt8}, i::Int, n::Int) =
     Staging.copy_ptr_to_linear!(off, src + i, n)
 
-# `_enonfatal`: WASI's EINTR or EAGAIN, after which a read or a write is tried again (as by
-# ios.c; a host interrupting it endlessly is an error, never the end of the input)
+# `_enonfatal`: WASI's EINTR or EAGAIN, after which ios.c tries a read or a write again
+# (libuv only after EINTR; a host interrupting it endlessly is an error, never the end of the
+# input)
 enonfatal(r::Int32) = r == Int32(27) || r == Int32(6)
 const MAX_TRIES = 1_000_000
 
-# read up to `k` bytes (at most a chunk) of `fd` into `dst` from `i` (0-based), again while
-# interrupted or not ready: the bytes read (0 at EOF), or a libuv code
-function read_chunk(fd::Int32, dst, i::Int, k::Int)
-    return Staging.with_scope() do
-        off = Staging.alloc_data(k)
-        Staging.store32(Staging.SCRATCH_IOVEC, off)
-        Staging.store32(Staging.SCRATCH_IOVEC + UInt32(4), UInt32(k))
-        r = fd_read(fd, Staging.SCRATCH_IOVEC, UInt32(1), Staging.SCRATCH_OUT)
-        tries = 0
-        while enonfatal(r)
-            tries += 1
-            tries > MAX_TRIES && throw(Base.IOError("read: " * Errno.uv_message(uv(r)), uv(r)))
-            r = fd_read(fd, Staging.SCRATCH_IOVEC, UInt32(1), Staging.SCRATCH_OUT)
+# Synchronous hosts can retry EINTR, but cannot wait for readiness on EAGAIN: libuv reports
+# it; ios.c's `_os_read` and `_os_write` try again (`eagain`).
+"""
+    write_once(fd, off, n, offset=-1; eagain=false) -> the bytes written, or a libuv code
+
+One write of the `n` bytes at `off` of the linear memory to `fd`: at its offset, or at
+`offset` if not negative (`fd_pwrite`, its offset unchanged), again after EINTR at the same
+remaining offset.
+"""
+function write_once(fd::Int32, off::UInt32, n::UInt32, offset::Int64=Int64(-1); eagain::Bool=false)
+    Staging.store32(Staging.SCRATCH_IOVEC, off)
+    Staging.store32(Staging.SCRATCH_IOVEC + UInt32(4), n)
+    tries = 0
+    while true
+        r = offset < 0 ? fd_write(fd, Staging.SCRATCH_IOVEC, UInt32(1), Staging.SCRATCH_OUT) :
+            fd_pwrite(fd, Staging.SCRATCH_IOVEC, UInt32(1), UInt64(offset), Staging.SCRATCH_OUT)
+        if r == Int32(27) || (eagain && r == Int32(6))
+            (tries += 1) > MAX_TRIES && throw(Base._UVError("write", uv(r)))
+            continue
         end
-        r == 0 || return Int(uv(r))
-        got = Int(Staging.load32(Staging.SCRATCH_OUT))
-        copy_out!(dst, i, off, got)
-        got
+        r == 0 || return uv(r)
+        return reinterpret(Int32, Staging.load32(Staging.SCRATCH_OUT))
     end
 end
 
-# write the `k` bytes (at most a chunk) of `src` (a `Vector{UInt8}` or a pointer) from `i`
-# (0-based) to `fd`, each write again while interrupted or not ready: (the guest's errno or
-# 0, the bytes written)
-write_chunk(fd::Int32, src, i::Int, k::Int) = Staging.with_scope() do
+"`read_once(fd, off, n, offset=-1; eagain=false)`: as `write_once`, a read: the bytes read."
+function read_once(fd::Int32, off::UInt32, n::UInt32, offset::Int64=Int64(-1); eagain::Bool=false)
+    Staging.store32(Staging.SCRATCH_IOVEC, off)
+    Staging.store32(Staging.SCRATCH_IOVEC + UInt32(4), n)
+    tries = 0
+    while true
+        r = offset < 0 ? fd_read(fd, Staging.SCRATCH_IOVEC, UInt32(1), Staging.SCRATCH_OUT) :
+            fd_pread(fd, Staging.SCRATCH_IOVEC, UInt32(1), UInt64(offset), Staging.SCRATCH_OUT)
+        if r == Int32(27) || (eagain && r == Int32(6))
+            (tries += 1) > MAX_TRIES && throw(Base._UVError("read", uv(r)))
+            continue
+        end
+        r == 0 || return uv(r)
+        return reinterpret(Int32, Staging.load32(Staging.SCRATCH_OUT))
+    end
+end
+
+# one read of up to `k` bytes (at most a chunk) of `fd` into `dst` (a `Vector{UInt8}` or a
+# pointer) from `i` (0-based): the bytes read (0 at EOF), or a libuv code
+read_chunk(fd::Int32, dst, i::Int, k::Int; eagain::Bool) = Staging.with_scope() do
+    off = Staging.alloc_data(k)
+    r = read_once(fd, off, UInt32(k); eagain)
+    r > 0 && copy_out!(dst, i, off, Int(r))
+    Int(r)
+end
+
+# the `k` bytes (at most a chunk) of `src` (a `Vector{UInt8}` or a pointer) from `i` (0-based)
+# written to `fd` (at `offset`, if not negative), write after write: (a libuv code or 0, the
+# bytes written). After a write of nothing, ios.c's `_os_write_all` (`ios`) writes again, as it
+# loops; libuv's `uv__fs_write_all` stops.
+write_chunk(fd::Int32, src, i::Int, k::Int, offset::Int64; ios::Bool) = Staging.with_scope() do
     off = Staging.alloc_data(k)
     copy_in!(off, src, i, k)
     w = 0
     tries = 0
     while w < k
-        Staging.store32(Staging.SCRATCH_IOVEC, off + UInt32(w))
-        Staging.store32(Staging.SCRATCH_IOVEC + UInt32(4), UInt32(k - w))
-        r = WASI.fd_write(fd, Staging.SCRATCH_IOVEC, UInt32(1), Staging.SCRATCH_OUT)
-        if enonfatal(r)
-            tries += 1
-            tries > MAX_TRIES && throw(Base.IOError("write: " * Errno.uv_message(uv(r)), uv(r)))
+        r = write_once(fd, off + UInt32(w), UInt32(k - w), offset < 0 ? offset : offset + w; eagain=ios)
+        r < 0 && return (r, w)
+        if r == 0
+            ios || return (Int32(0), w)
+            (tries += 1) > MAX_TRIES && throw(Base._UVError("write", Int32(Base.UV_EIO)))
             continue
         end
-        r == 0 || return (libc_errno(r), w)
-        n = Int(Staging.load32(Staging.SCRATCH_OUT))
-        if n == 0
-            # (no progress: again, as ios.c's `_os_write_all` loops)
-            tries += 1
-            tries > MAX_TRIES && throw(Base.IOError("write: no progress", Int32(Base.UV_EIO)))
-            continue
-        end
-        w += n
+        w += Int(r)
     end
     return (Int32(0), w)
 end
 
-# Synchronous hosts can retry EINTR, but cannot wait for readiness on EAGAIN.
-# Report EAGAIN promptly; callers must not retry an entire partially completed write.
-function write_once(fd::Int32, off::UInt32, n::UInt32, offset::Int64=Int64(-1))
-    Staging.store32(Staging.SCRATCH_IOVEC, off)
-    Staging.store32(Staging.SCRATCH_IOVEC + UInt32(4), n)
-    while true
-        r = offset < 0 ? fd_write(fd, Staging.SCRATCH_IOVEC, UInt32(1), Staging.SCRATCH_OUT) :
-            fd_pwrite(fd, Staging.SCRATCH_IOVEC, UInt32(1), UInt64(offset), Staging.SCRATCH_OUT)
-        r == 27 && continue # EINTR, at the same remaining offset
-        r == 0 || return uv(r)
-        return reinterpret(Int32, Staging.load32(Staging.SCRATCH_OUT))
+"""
+    read_n(fd, dst, i, n; eagain) -> the bytes read, or a libuv code
+
+One `read(2)` of up to `n` bytes of `fd` into `dst` from `i` (0-based): a staging chunk at a
+time, the next while they come back full, as one `read(2)` of a file reads all it can. An
+error after some bytes leaves those (it comes with the next read).
+"""
+function read_n(fd::Int32, dst, i::Int, n::Int; eagain::Bool)
+    got = 0
+    while got < n
+        k = min(n - got, Int(Staging.CHUNK))
+        r = read_chunk(fd, dst, i + got, k; eagain)
+        r < 0 && return got > 0 ? got : r
+        got += r
+        r < k && break
     end
+    return got
 end
 
-function read_once(fd::Int32, off::UInt32, n::UInt32, offset::Int64=Int64(-1))
-    Staging.store32(Staging.SCRATCH_IOVEC, off)
-    Staging.store32(Staging.SCRATCH_IOVEC + UInt32(4), n)
-    while true
-        r = offset == -1 ? fd_read(fd, Staging.SCRATCH_IOVEC, UInt32(1), Staging.SCRATCH_OUT) :
-            fd_pread(fd, Staging.SCRATCH_IOVEC, UInt32(1), UInt64(offset), Staging.SCRATCH_OUT)
-        r == 27 && continue
-        r == 0 || return uv(r)
-        return reinterpret(Int32, Staging.load32(Staging.SCRATCH_OUT))
+# the `n` bytes of `src` from `i` (0-based) written to `fd` (at `offset`, if not negative),
+# chunk after chunk: (a libuv code or 0, the bytes written)
+function write_n(fd::Int32, src, i::Int, n::Int, offset::Int64; ios::Bool)
+    total = 0
+    while total < n
+        k = min(n - total, Int(Staging.CHUNK))
+        e, w = write_chunk(fd, src, i + total, k, offset < 0 ? offset : offset + total; ios)
+        total += w
+        (e != 0 || w < k) && return (e, total)
     end
+    return (Int32(0), total)
 end
 
 ## the IO streams of files (`IOStream`): `ios_*`, ported from src/support/ios.c
@@ -1123,28 +1232,17 @@ wasi_fd(fd::Int) = 0 <= fd <= typemax(Int32) ? Int32(fd) : Int32(-1)
 
 """
 `_os_read(fd, buf, n, &nread)`: one read of up to `n` bytes of `fd` into `dst` (a
-`Vector{UInt8}` or a pointer) from `i` (0-based): (errno or 0, the bytes read). A staging
-chunk is read at a time, and the next while they come back full: one `read(2)` of a file
-reads all it can.
+`Vector{UInt8}` or a pointer) from `i` (0-based), again after EINTR or EAGAIN: (errno or 0,
+the bytes read), as `read_n` reads.
 """
 function _os_read(fd::Int, dst, i::Int, n::Int)
     wfd = wasi_fd(fd)
     wfd < 0 && (set_errno(EBADF); return (EBADF, 0))
-    got = 0
-    while got < n
-        k = min(n - got, Int(Staging.CHUNK))
-        r = read_chunk(wfd, dst, i + got, k)
-        if r < 0
-            # (after some bytes, those: the error comes with the next read)
-            got > 0 && break
-            e = libc_from_uv(r)
-            set_errno(e)
-            return (e, 0)
-        end
-        got += r
-        r < k && break
-    end
-    return (Int32(0), got)
+    r = read_n(wfd, dst, i, n; eagain=true)
+    r >= 0 && return (Int32(0), r)
+    e = libc_from_uv(r)
+    set_errno(e)
+    return (e, 0)
 end
 
 # `_os_read_all`: reads until `n` bytes, the end of the input or an error
@@ -1161,18 +1259,17 @@ end
 
 """
 `_os_write_all(fd, buf, n, &nwritten)`: the `n` bytes of `src` (a `Vector{UInt8}` or a
-pointer) from `i` (0-based) to `fd`: (errno or 0, the bytes written).
+pointer) from `i` (0-based) to `fd`, again after EINTR, EAGAIN or no progress: (errno or 0,
+the bytes written).
 """
 function _os_write_all(fd::Int, src, i::Int, n::Int)
     wfd = wasi_fd(fd)
     wfd < 0 && (set_errno(EBADF); return (EBADF, 0))
-    nwritten = 0
-    while nwritten < n
-        err, wrote = write_chunk(wfd, src, i + nwritten, min(n - nwritten, Int(Staging.CHUNK)))
-        nwritten += wrote
-        err == 0 || (set_errno(err); return (err, nwritten))
-    end
-    return (Int32(0), nwritten)
+    e, nw = write_n(wfd, src, i, n, Int64(-1); ios=true)
+    e == 0 && return (Int32(0), nw)
+    g = libc_from_uv(e)
+    set_errno(g)
+    return (g, nw)
 end
 
 "`lseek(fd, offset, whence)`: the new position, or -1 (errno set)."
@@ -1750,12 +1847,17 @@ end
 throw_uv(prefix::String, code::Integer) = throw(Base.IOError(string(prefix, ": ", Errno.uv_message(code), " (",
                                                                     Errno.uv_name(code), ")"), Int32(code)))
 
+# a path's conversion to a `Cstring`, which these functions skip (they take a `String`):
+# natively it throws for an embedded NUL, before any call
+check_cstring(path::String) = (GC.@preserve path Base.unsafe_convert(Cstring, path); nothing)
+
 "The entries of `dir`: (name, libuv's dirent type), unsorted."
 @noinline function dir_entries(dir::String)
     es = original(Base.Filesystem._readdirx, dir; sort=false)::Vector{Base.Filesystem.DirEntry}
     return Tuple{String,Cint}[(e.name, e.rawtype) for e in es]
 end
 function dir_entries_wasm(dir::String)
+    check_cstring(dir)
     r = FS.readdir_entries(dir)
     r isa Int32 && throw_uv(string("readdir(", repr(dir), ")"), r)
     entries = r::Vector{Tuple{String,UInt8}}
@@ -1764,6 +1866,7 @@ end
 
 @noinline readlink(path::String) = original(Base.Filesystem.readlink, path)::String
 function readlink_wasm(path::String)
+    check_cstring(path)
     r = FS.readlink_path(path)
     r isa Int32 && throw_uv(string("readlink(", repr(path), ")"), r)
     return r::String
@@ -1776,6 +1879,7 @@ preopened directory it is in (whose own path is taken as it is: its ancestors ma
 reach).
 """
 function realpath_wasm(path::String)
+    check_cstring(path)
     err(code) = throw_uv(string("realpath(", repr(path), ")"), code)
     c = FS.check_path(path)
     c == 0 || err(c)
@@ -1829,6 +1933,7 @@ pwd_wasm() = FS.cwd()
 
 @noinline cd(dir::String) = (original(Base.Filesystem.cd, dir); nothing)
 function cd_wasm(dir::String)
+    check_cstring(dir)
     c = FS.check_path(dir)
     c == 0 || throw_uv(string("cd(", repr(dir), ")"), c)
     p = FS.normalize(dir)
@@ -1843,7 +1948,11 @@ end
 
 """
 The working directory to return to after `cd(f, dir)`: natively an fd of it (Base's way:
-`open(".")`, then `fchdir`), in Wasm its path (there is no fd of it).
+`open(".")`, then `fchdir`), in Wasm its path (WASI has no `fchdir`, and the working
+directory is the module's). So where `f` renames or removes that directory, natively
+`cd(f, dir)` returns into it (renamed, or deleted), and in Wasm it fails to (`cd`'s
+IOError, ENOENT), the working directory left at `dir`; a directory created at the old path
+is returned to instead of the original.
 """
 struct SavedCwd
     fd::Int32
@@ -1893,11 +2002,15 @@ rand_name(n::Int) = String(UInt8[NAME_CHARS[entropy() % length(NAME_CHARS) + 1] 
 @noinline rand_filename(len::Int) = original(Base.Filesystem._rand_filename, len)::String
 rand_filename_wasm(len::Int) = rand_name(len)
 
-"`mkdtemp(template)`: the directory made of `template` with its trailing `XXXXXX` random."
+"""
+`mkdtemp(template)`: the directory made of `template` with its trailing `XXXXXX` random, of
+mode 0o700 (a host without modes keeps its own, see `FS.creation_mode!`).
+"""
 @noinline mkdtemp(parent::String, prefix::String) =
     original(Base.Filesystem.mktempdir, parent; prefix=prefix, cleanup=false)::String
 function mkdtemp_wasm(parent::String, prefix::String)
     tpath = isempty(parent) || endswith(parent, '/') ? string(parent, prefix) : string(parent, "/", prefix)
+    check_cstring(tpath * "XXXXXX")
     for _ in 1:100
         p = tpath * rand_name(6)
         r = FS.mkdir_path(p, 0o700)
@@ -1910,9 +2023,11 @@ end
 "`mkstemp`: a new file `parent/jl_XXXXXX` (random), open for reading and writing."
 @noinline mkstemp(parent::String) = original(Base.Filesystem.mktemp, parent; cleanup=false)::Tuple{String,IOStream}
 function mkstemp_wasm(parent::String)
+    check_cstring(joinpath(parent, Base.Filesystem.temp_prefix * "XXXXXX"))
     for _ in 1:100
         p = joinpath(parent, Base.Filesystem.temp_prefix * rand_name(6))
-        # (created exclusively, readable and writable by the owner only, as mkstemp does)
+        # (created exclusively, readable and writable by the owner only, as mkstemp does;
+        # a host without modes keeps its own, see `FS.creation_mode!`)
         fd = FS.open_path(p, Int32(FS.JL_O_RDWR | FS.JL_O_CREAT | FS.JL_O_EXCL | FS.JL_O_NOFOLLOW), Int32(0o600))
         fd == Int32(Base.UV_EEXIST) && continue
         fd < 0 && throw(SystemError("mktemp", Int(FS.libc_from_uv(fd))))

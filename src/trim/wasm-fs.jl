@@ -54,33 +54,6 @@ let T = WasmCodegen.Runtime.BaseFS, E = WasmCodegen.Runtime.Errno
             return (path, io)
         end
 
-        # Complete Julia writes/reads above the raw C calls, which may return short counts.
-        function unsafe_write(f::File, buf::Ptr{UInt8}, len::UInt, offset::Int64=Int64(-1))
-            check_open(f)
-            done = UInt(0)
-            while done < len
-                pos = offset < 0 ? offset : offset + Int64(done)
-                got = ccall(:jl_fs_write, Int32, (OS_HANDLE, Ptr{UInt8}, Csize_t, Int64),
-                            f.handle, buf + done, len - done, pos)
-                uv_error("write", got)
-                got == 0 && throw(Base.IOError("write: no progress", Int32(-5)))
-                done += UInt(got)
-            end
-            return len
-        end
-        function unsafe_read(f::File, p::Ptr{UInt8}, nel::UInt)
-            check_open(f)
-            done = UInt(0)
-            while done < nel
-                got = ccall(:jl_fs_read, Int32, (OS_HANDLE, Ptr{Cvoid}, Csize_t),
-                            f.handle, p + done, nel - done)
-                uv_error("read", got)
-                got == 0 && throw(EOFError())
-                done += UInt(got)
-            end
-            nothing
-        end
-
         # (the mode of the copy from the source's path: the stat of an fd has no permissions
         # in Wasm; natively the same mode)
         function sendfile(src::AbstractString, dst::AbstractString)
