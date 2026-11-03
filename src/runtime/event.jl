@@ -10,8 +10,9 @@
 # ready: they are found again.
 #
 # These functions call host imports: they run in Wasm only (natively, the library
-# "julia_io" does not exist and the calls throw), but for `sleep_ns`, Base's `sleep` natively.
-# Needs `Staging`, `Errno`, `FS` and `showerror_any` before it.
+# "julia_io" does not exist and the calls throw). `Base.sleep` is one of them in the module, a
+# method of `WASM_METHODS` (natively, Base's own). Needs `Staging`, `Errno`, `FS` and
+# `showerror_any` before it.
 
 """
     JuliaIO
@@ -63,9 +64,9 @@ EXTENSION_METHODS[:julia_io] = JuliaIO.METHODS
 """
     Host
 
-The runtime's side of the host's events: [`await_handle`](@ref) and [`sleep_ns`](@ref).
-Failures of the host are thrown as [`HostCallError`](@ref)s; [`error_text`](@ref) is the text
-of an exception of any type.
+The runtime's side of the host's events: [`await_handle`](@ref), [`sleep_ns`](@ref), and
+Base's `sleep` on them. Failures of the host are thrown as [`HostCallError`](@ref)s;
+[`error_text`](@ref) is the text of an exception of any type.
 """
 module Host
 
@@ -73,7 +74,7 @@ import ..Staging
 import ..JuliaIO
 import ..showerror_any
 import ..Errno
-using ..Runtime: @wasm_method, original
+using ..Runtime: @wasm_method
 
 """
     HostCallError(errno, msg)
@@ -137,12 +138,9 @@ end
 """
     sleep_ns(ns)
 
-Wait `ns` nanoseconds on a host timer; the host's event loop runs meanwhile. (Natively, in
-the build process, Base's `sleep`.)
+Wait `ns` nanoseconds on a host timer; the host's event loop runs meanwhile.
 """
-@noinline sleep_ns(ns::Int64) = (original(Base.sleep, ns / 1e9); nothing)
-
-function sleep_ns_wasm(ns::Int64)
+function sleep_ns(ns::Int64)
     h = JuliaIO.timer_start(ns)
     h < 0 && throw_host(-h, Int32(-1))
     try
@@ -153,7 +151,25 @@ function sleep_ns_wasm(ns::Int64)
     return nothing
 end
 
-@wasm_method sleep_ns(ns::Int64) = sleep_ns_wasm(ns)
+# the longest wait of one timer, in milliseconds (`typemax(Int64)` nanoseconds)
+const TIMER_MAX_MS = UInt64(typemax(Int64) ÷ 1_000_000)
+
+# Base's `sleep`, in the module (natively, Base's own: a libuv `Timer` the scheduler waits for):
+# its check, and the milliseconds of `Timer(sec)` (rounded up, and one more unless zero, as
+# libuv's timers may fire a millisecond early: an `InexactError` for `Inf` or beyond
+# `typemax(UInt64)`), on host timers. The program of one task waits; the host's event loop
+# runs meanwhile, also for `sleep(0)`, as libuv's does.
+@wasm_method function Base.sleep(sec::Real)
+    sec ≥ 0 || throw(ArgumentError("cannot sleep for $sec seconds"))
+    ms = ceil(UInt64, sec * 1000) + !iszero(sec)
+    # (a wait longer than a timer's, on consecutive timers)
+    while ms > TIMER_MAX_MS
+        sleep_ns(Int64(TIMER_MAX_MS) * 1_000_000)
+        ms -= TIMER_MAX_MS
+    end
+    sleep_ns(Int64(ms) * 1_000_000)
+    nothing
+end
 
 """
     error_text(e) -> String
@@ -163,7 +179,7 @@ exception is of no known type, and `sprint(showerror, e)` is a dynamic call
 (`showerror_any` shows the runtime's and Base's usual exceptions).
 """
 function error_text(@nospecialize(e))
-    e isa HostCallError && return string(e.msg, " (errno ", e.errno, ")")
+    e isa HostCallError && return sprint(showerror, e::HostCallError)
     e isa SystemError && return system_error_text(e)
     io = IOBuffer()
     showerror_any(io, e)

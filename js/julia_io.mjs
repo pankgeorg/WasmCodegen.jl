@@ -34,27 +34,31 @@
 // calls in flight on one instance) are exceptions (`JuliaIOAssertion`), which trap.
 //
 // **Memory.** Arrays of handles are `i32`s, little-endian, at a 4-byte-aligned offset. Path
-// arguments `(path_off, path_len)` are raw bytes without a length: an absolute path, UTF-8,
-// no NUL. Output buffers with `cap < 4` are `-EINVAL`. Hosts copy every input out of linear
-// memory before returning and recreate views per call.
+// arguments `(path_off, path_len)` are raw bytes without a length: an absolute path, no NUL,
+// in any encoding (a file name need not be UTF-8, natively). Output buffers with `cap < 4`
+// are `-EINVAL`. Hosts copy every input out of linear memory before returning and recreate
+// views per call.
 //
 // | Import | Signature | Semantics |
 // |---|---|---|
-// | `timer_start` | `(ns i64) -> i32 handle` | A timer that becomes ready after `ns` nanoseconds. |
+// | `timer_start` | `(ns i64) -> i32 handle` | A timer that becomes ready after `ns` nanoseconds, from the host's event loop: never before it has turned, even for `0` (as libuv's timers), so that a wait on it lets the host's other events progress. |
 // | `poll` | `(interest_off, n_interest, timeout_ns i64, out_off, cap) -> i32` | `interest`: `n_interest` (1 to 1024) `i32` handles. Writes up to `cap` handles of the interest set that are ready, and returns their count. Ready handles outside the interest set are not reported and stay ready. `timeout_ns`: `-1` waits indefinitely, `0` does not wait; a timeout returns `0`. An unknown or closed handle of the interest set is reported ready (its next call is `-EBADF`). Waiting indefinitely with no handle of the interest set that can become ready is `-EINVAL`. **The only suspending import.** |
 // | `errmsg` | `(h, out_off, cap) -> i32` | The last error message of the handle (UTF-8, truncated to `cap`), and its length. `h = -1`: the last failure without a handle. |
 // | `cancel` | `(h) -> i32` | Cancels the handle: a timer that has not fired becomes ready, cancelled. Idempotent. `0`, or `-EBADF` for an unknown handle. |
 // | `close` | `(h) -> i32` | Releases the handle, cancelling it: `0`. A closed or unknown handle is `-EBADF` (closing twice too). |
 // | `path_mode` | `(path_off, path_len, follow i32) -> i32` | The POSIX `st_mode` (type and permission bits) of the absolute path (of the link itself unless `follow`), or `-errno`. (WASI preview 1 has no permission bits.) |
 // | `path_chmod` | `(path_off, path_len, mode i32) -> i32 status` | `chmod(2)` of the absolute path (following links). |
-// | `path_symlink` | `(target_off, target_len, link_off, link_len) -> i32 status` | `symlink(2)`: a symbolic link at the absolute path `link` to `target`, which is any string (absolute, or out of the preopens), never resolved nor validated, as natively. (WASI's `path_symlink` refuses such targets.) |
+// | `path_symlink` | `(target_off, target_len, link_off, link_len) -> i32 status` | `symlink(2)`: a symbolic link at the absolute path `link` to `target`, which is any bytes (absolute, or out of the preopens), never resolved nor validated, as natively. (WASI's `path_symlink` refuses such targets.) |
 //
-// **Paths.** The path imports (`path_mode`, `path_chmod`, `path_symlink`'s `link`) check
-// every path (`checkPath(path, {follow})`) against the preopens: absolute, without NUL;
-// normalized lexically (`.` and `..`); within a preopen (on component boundaries); and the
-// deepest existing ancestor (the path itself if `follow`), resolved (`realpath`), still
-// within one. Otherwise `-ENOTCAPABLE` (76). This checks paths: it cannot exclude another
-// process replacing a checked directory with a link before its use.
+// **Paths.** The path imports (`path_mode`, `path_chmod`, `path_symlink`'s `link`) resolve
+// a path within the preopens, one component at a time as the kernel does: a symbolic link is
+// followed (the last component only if the import follows it, or the path ends with a
+// separator), its target from the link's directory. The lookup's errors are the kernel's
+// (`ENOENT`, `ENOTDIR`, `ELOOP` after 40 links, `EACCES`, ...); a path, a link or a `..` that
+// leaves the preopens is `-ENOTCAPABLE` (76), before anything outside them is examined; a
+// path that is not absolute, or has a NUL byte, `-EINVAL`. The operation then acts on the
+// resolved path. This checks paths: it cannot exclude another process replacing a checked
+// directory with a link before its use.
 //
 // **Readiness** is level-triggered: a timer is ready from when it fires (or is cancelled)
 // until it is closed. Callers close every handle (in `finally` blocks).
@@ -81,7 +85,6 @@ const CODE_TO_ERRNO = {
 };
 
 const utf8enc = new TextEncoder();
-const utf8dec = new TextDecoder('utf-8', { fatal: true });
 
 // A violation of the interface by the caller (a bug of the module or of the embedder, not an
 // expected failure): not an errno, it escapes as a trap.
@@ -113,41 +116,88 @@ export function errnoOf(e) {
 }
 
 // ---- paths (see "Paths" above), for every path import ----
-// Fails closed: a component that cannot be examined or resolved (other than "does not
-// exist") is a denial.
-const within = (p, d) => p === d || p.startsWith(d === path.sep ? d : d + path.sep);
-const ABSENT = new Set(['ENOENT', 'ENOTDIR']);
+// A path is bytes: a 'latin1' string of them (a character per byte) for the lookup, a Buffer
+// of them for `fs`.
+const latin1 = (b) => Buffer.from(b).toString('latin1');
+const bytesOf = (s) => Buffer.from(s, 'latin1');
+const shown = (s) => bytesOf(s).toString(); // (for messages)
+const components = (s) => s.split('/').filter((c) => c !== '');
+// the links a lookup follows at most (Linux's MAXSYMLINKS), beyond which it is ELOOP
+const MAX_LINKS = 40;
 
-export function makeCheckPath(preopens) {
-  const lexical = preopens.map((p) => {
+export function makeResolve(preopens) {
+  // each preopen by its path and by its real path, as components
+  const roots = preopens.map((p) => {
     if (typeof p !== 'string' || !path.isAbsolute(p)) throw new Error('julia_io: preopen must be an absolute path: ' + p);
-    return path.resolve(p);
-  });
-  const real = lexical.map((p) => {
-    try { return fs.realpathSync.native(p); }
+    let real;
+    try { real = components(latin1(fs.realpathSync.native(p, { encoding: 'buffer' }))); }
     catch (e) { throw new Error(`julia_io: preopen ${p} cannot be resolved: ${e.message}`); }
+    return { names: [components(latin1(Buffer.from(path.resolve(p)))), real], real };
   });
-  // checkPath(p, {follow}) -> the normalized absolute path, or throws GuestError(ENOTCAPABLE)
-  return function checkPath(p, { follow = true } = {}) {
-    const deny = (why) => { throw new GuestError(E.NOTCAPABLE, `path not permitted (${why}): ${p}`); };
-    if (typeof p !== 'string' || p.includes('\0')) deny('NUL byte');
-    if (!path.isAbsolute(p)) deny('not absolute');
-    const r = path.resolve(p); // (`.` and `..`, lexically)
-    if (!lexical.some((d) => within(r, d))) deny('outside every preopen');
-    // the deepest existing ancestor (the path itself when following)
-    let probe = follow ? r : path.dirname(r);
-    for (;;) {
-      try { fs.lstatSync(probe); break; }
-      catch (e) { if (!ABSENT.has(e.code)) deny(`cannot examine ${probe}: ${e.code || e.message}`); }
-      const up = path.dirname(probe);
-      if (up === probe) deny('no existing ancestor');
-      probe = up;
+  const prefix = (names, comps) => names.length <= comps.length && names.every((c, i) => c === comps[i]);
+  // the components of the real path of what the absolute path `comps` names in the deepest
+  // preopen it is in, its preopen's and the rest; or null
+  function rootOf(comps) {
+    let best = null;
+    for (const r of roots) for (const names of r.names) {
+      if (prefix(names, comps) && (!best || names.length > best.n)) best = { real: r.real, n: names.length };
     }
-    let rp;
-    try { rp = fs.realpathSync.native(probe); }
-    catch (e) { deny(`cannot resolve ${probe}: ${e.code || e.message}`); } // (a dangling link, ELOOP)
-    if (!real.some((d) => within(rp, d))) deny('resolves outside every preopen');
-    return r;
+    return best && { done: [...best.real], todo: comps.slice(best.n) };
+  }
+  const inside = (comps) => roots.some((r) => prefix(r.real, comps));
+
+  // resolve(p, follow) -> the real path (latin1) of what the absolute path `p` (latin1) names,
+  // its last component followed if `follow` (see "Paths" above); a missing last component is
+  // left for the operation to report
+  return function resolve(p, follow) {
+    const lookup = `lookup of ${shown(p)}`;
+    const deny = (why) => { throw new GuestError(E.NOTCAPABLE, `path not permitted (${why}): ${shown(p)}`); };
+    if (p.includes('\0')) throw new GuestError(E.INVAL, `${lookup}: a NUL byte`);
+    if (!p.startsWith('/')) throw new GuestError(E.INVAL, `${lookup}: not absolute`);
+    const dir = p.length > 1 && p.endsWith('/');
+    const start = rootOf(components(p));
+    if (!start) deny('outside every preopen');
+    let { done, todo } = start;
+    let links = 0;
+    while (todo.length) {
+      const c = todo.shift();
+      if (c === '.') continue;
+      if (c === '..') {
+        // (of a resolved directory: its parent, lexically)
+        done.pop();
+        if (!inside(done)) deny('`..` leaves the preopens');
+        continue;
+      }
+      const next = [...done, c];
+      const last = todo.length === 0;
+      if (last && !follow && !dir) { done = next; break; }
+      const file = bytesOf('/' + next.join('/'));
+      let st;
+      try { st = fs.lstatSync(file); }
+      catch (e) {
+        if (last && e.code === 'ENOENT') { done = next; break; }
+        throw new GuestError(errnoOf(e), `${lookup}: ${describe(e)}`);
+      }
+      if (st.isSymbolicLink()) {
+        if (++links > MAX_LINKS) throw new GuestError(E.LOOP, `${lookup}: too many levels of symbolic links`);
+        let target;
+        try { target = latin1(fs.readlinkSync(file, { encoding: 'buffer' })); }
+        catch (e) { throw new GuestError(errnoOf(e), `${lookup}: ${describe(e)}`); }
+        if (target === '') throw new GuestError(E.NOENT, `${lookup}: a link to nothing`);
+        if (target.startsWith('/')) {
+          const t = rootOf(components(target));
+          if (!t) deny(`a link to ${shown(target)} leaves the preopens`);
+          done = t.done;
+          todo = [...t.todo, ...todo];
+        } else {
+          todo = [...components(target), ...todo];
+        }
+        continue;
+      }
+      if ((!last || dir) && !st.isDirectory()) throw new GuestError(E.NOTDIR, `${lookup}: not a directory`);
+      done = next;
+    }
+    return '/' + done.join('/');
   };
 }
 
@@ -169,10 +219,8 @@ function makeMemory(initial) {
     [off, len] = checkRange(off, len, align);
     return mem().slice(off, off + len); // (a copy: inputs never alias linear memory)
   }
-  function readPath(off, len) {
-    const b = readBytes(off, len);
-    try { return utf8dec.decode(b); } catch { throw new GuestError(E.ILSEQ, 'path is not valid UTF-8'); }
-  }
+  // a path: its bytes as they are, as a 'latin1' string (see "paths" above)
+  const readPath = (off, len) => latin1(readBytes(off, len));
   function bindMemory(m) {
     if (!(m instanceof WebAssembly.Memory)) throw new Error('julia_io: bindMemory needs the exported WebAssembly.Memory');
     memory = m;
@@ -185,7 +233,7 @@ function makeMemory(initial) {
 // (no JSPI). Options: `preopens` (WASI's), `memory` (or `bindMemory` later).
 export function makeJuliaIOPaths(opts = {}) {
   const { readBytes, readPath, bindMemory } = makeMemory(opts.memory);
-  const checkPath = makeCheckPath(opts.preopens || []);
+  const resolve = makeResolve(opts.preopens || []);
   let lastError = '';
   // an import: an expected failure is its errno (negated for `path_mode`), anything else EIO
   const wrap = (f, negate) => (...args) => {
@@ -196,51 +244,35 @@ export function makeJuliaIOPaths(opts = {}) {
       return negate ? -errnoOf(e) : errnoOf(e);
     }
   };
+  // `f` of the resolved path `p`; its error is the operation's
+  function act(what, p, f) {
+    try { return f(bytesOf(p)); }
+    catch (e) { throw new GuestError(errnoOf(e), `${what} ${shown(p)}: ${describe(e)}`); }
+  }
 
-  // the preopened directories themselves: inspecting one is allowed whether or not the last
-  // component is followed (`checkPath`, not following, looks at its parent, out of reach)
-  const preopenRoots = new Set((opts.preopens || []).map((d) => path.resolve(d)));
   // the POSIX st_mode (type and permission bits) of the path, of the link itself unless
-  // `follow`; a path ending with a separator must be a directory (as stat(2))
+  // `follow` (resolved, the path names no link but that one)
   function path_mode(path_off, path_len, follow) {
-    const raw = readPath(path_off, path_len);
-    const isRoot = path.isAbsolute(raw) && !raw.includes('\0') && preopenRoots.has(path.resolve(raw));
-    const p = isRoot ? path.resolve(raw) : checkPath(raw, { follow: follow !== 0 });
-    let mode;
-    try { mode = (follow !== 0 ? fs.statSync(p) : fs.lstatSync(p)).mode; }
-    catch (e) { throw new GuestError(errnoOf(e), `path_mode ${p}: ${describe(e)}`); }
-    if (raw.length > 1 && raw.endsWith('/') && (mode & 0o170000) !== 0o040000) {
-      // (a link to a directory, with a trailing separator, is followed by stat(2); a path it
-      // may not follow keeps its error: ENOTDIR only for what is not a directory)
-      const q = checkPath(raw, { follow: true });
-      let st;
-      try { st = fs.statSync(q); }
-      catch (e) { throw new GuestError(errnoOf(e), `path_mode ${q}: ${describe(e)}`); }
-      if (!st.isDirectory()) throw new GuestError(E.NOTDIR, `path_mode ${raw}: not a directory`);
-      return st.mode;
-    }
-    return mode;
+    const p = resolve(readPath(path_off, path_len), follow !== 0);
+    return act('path_mode', p, (b) => fs.lstatSync(b).mode);
   }
   // chmod(2) of the path (following links, as chmod does)
   function path_chmod(path_off, path_len, mode) {
-    const p = checkPath(readPath(path_off, path_len), { follow: true });
-    try { fs.chmodSync(p, mode & 0o7777); return 0; }
-    catch (e) { throw new GuestError(errnoOf(e), `path_chmod ${p}: ${describe(e)}`); }
+    const p = resolve(readPath(path_off, path_len), true);
+    return act('path_chmod', p, (b) => (fs.chmodSync(b, mode & 0o7777), 0));
   }
-  // symlink(2): the link `link` (checked, its last component not followed) to `target`, raw
-  // bytes neither checked nor resolved (any string, as natively)
+  // symlink(2): the link `link` (its last component not followed) to `target`, raw bytes
+  // neither checked nor resolved (any bytes, as natively)
   function path_symlink(target_off, target_len, link_off, link_len) {
     const target = Buffer.from(readBytes(target_off, target_len));
     if (target.includes(0)) throw new GuestError(E.INVAL, 'path_symlink: target contains a NUL byte');
-    const link = checkPath(readPath(link_off, link_len), { follow: false });
-    try { fs.symlinkSync(target, link); return 0; }
-    catch (e) { throw new GuestError(errnoOf(e), `path_symlink ${link}: ${describe(e)}`); }
+    const link = resolve(readPath(link_off, link_len), false);
+    return act('path_symlink', link, (b) => (fs.symlinkSync(target, b), 0));
   }
 
   return {
     imports: { path_mode: wrap(path_mode, true), path_chmod: wrap(path_chmod, false),
                path_symlink: wrap(path_symlink, false) },
-    checkPath,
     bindMemory,
     // the message of the last failure (the module reads only the errno)
     lastError: () => lastError,
@@ -304,16 +336,24 @@ export function makeJuliaIOEvents(opts = {}) {
   function timer_start(ns) {
     ns = BigInt.asIntN(64, BigInt(ns));
     if (ns < 0n) throw new GuestError(E.INVAL, `timer_start: negative duration ${ns}`);
-    const x = { kind: 'timer', fired: false, cancelled: false, t: null, errmsg: '', closed: false };
+    const x = { kind: 'timer', fired: false, cancelled: false, t: null, immediate: false, errmsg: '', closed: false };
     const deadline = performance.now() + Number(ns) / 1e6;
     const arm = () => {
+      x.immediate = false;
       const ms = deadline - performance.now();
       if (ms <= 0) { x.t = null; x.fired = true; notify(); return; }
       x.t = setTimeout(arm, Math.min(Math.ceil(ms), 0x7fffffff));
     };
     const h = newHandle(x);
-    arm();
+    // (first in the event loop's next turn, even when due: libuv runs a timer of 0 there, so
+    // that `sleep(0)` lets the host's other events progress)
+    x.t = setImmediate(arm);
+    x.immediate = true;
     return h;
+  }
+  function disarm(x) {
+    if (x.t !== null) (x.immediate ? clearImmediate : clearTimeout)(x.t);
+    x.t = null;
   }
 
   // ---- poll (the only suspending import) ----
@@ -399,7 +439,7 @@ export function makeJuliaIOEvents(opts = {}) {
   function cancel(h) {
     const x = get(h);
     if (!x) return -E.BADF;
-    if (!x.fired) { clearTimeout(x.t); x.t = null; x.fired = true; x.cancelled = true; x.errmsg = 'timer cancelled'; notify(); }
+    if (!x.fired) { disarm(x); x.fired = true; x.cancelled = true; x.errmsg = 'timer cancelled'; notify(); }
     return 0;
   }
 
@@ -407,7 +447,7 @@ export function makeJuliaIOEvents(opts = {}) {
     h |= 0;
     const x = handles.get(h);
     if (!x) return -E.BADF;
-    if (x.t) clearTimeout(x.t);
+    disarm(x);
     x.closed = true;
     handles.delete(h);
     notify();
