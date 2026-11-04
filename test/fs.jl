@@ -1066,4 +1066,262 @@ end
     end
 end
 
+
+# seeks and skips of an `IOStream` relative to its 32 KiB read buffer (inside it, before and
+# after it, at and after the end), with writes between them, and reads into byte arrays,
+# arrays of other types and views; paths not in normal form
+function io_seeks(k::Int, out::IO)
+    dir = joinpath(ROOT, string("io", k))
+    rec(xs...) = (print(out, xs...); println(out))
+    attempt(f, what) = try
+        rec(what, " => ", f())
+    catch e
+        rec(what, " !! ", err_text(e, dir))
+    end
+    mkpath(dir)
+    n = 150_000   # (more than four buffers)
+    f = joinpath(dir, "data.bin")
+    write(f, UInt8[i % 251 for i in 0:n-1])
+    at(io) = (position(io), eof(io))
+    open(f) do io
+        rec("start ", read(io, UInt8), " ", at(io))
+        seek(io, 1000); rec("in fwd ", read(io, UInt8), " ", at(io))
+        seek(io, 10); rec("in back ", read(io, UInt8), " ", at(io))
+        seek(io, 0); rec("buffer start ", read(io, UInt8), " ", at(io))
+        seek(io, 32767); rec("buffer last ", read(io, UInt8), " ", at(io))
+        seek(io, 32768); rec("buffer end ", read(io, UInt8), " ", at(io))
+        seek(io, 140_000); rec("after ", read(io, UInt8), " ", at(io))
+        seek(io, 5); rec("before ", read(io, UInt8), " ", at(io))
+        skip(io, 100); rec("skip in ", read(io, UInt8), " ", at(io))
+        skip(io, -50); rec("skip back ", read(io, UInt8), " ", at(io))
+        skip(io, 100_000); rec("skip after ", read(io, UInt8), " ", at(io))
+        skip(io, -100_000); rec("skip before ", read(io, UInt8), " ", at(io))
+        attempt(() -> skip(io, -10_000), "skip before 0")
+        rec("after failed skip ", at(io))
+        mark(io); skip(io, 30); reset(io); rec("mark/reset ", read(io, UInt8), " ", at(io))
+        # at and after the end
+        seekend(io); rec("seekend ", at(io))
+        seek(io, n - 3); rec("tail ", read(io, 3), " ", at(io))
+        seek(io, n - 2); rec("in after eof ", read(io, UInt8), " ", at(io))
+        seek(io, n); rec("at end ", at(io))
+        attempt(() -> read(io, UInt8), "read at end")
+        seek(io, n + 10); rec("past end ", at(io))
+        attempt(() -> read(io, UInt8), "read past end")
+        seek(io, n - 1); rec("back from past end ", read(io, UInt8), " ", at(io))
+        attempt(() -> seek(io, -1), "seek before 0")
+        # reads into a byte array, a view, an array of other bytes; spanning buffers
+        seek(io, 65_000)
+        b = Vector{UInt8}(undef, 2000); read!(io, b)
+        rec("bytes ", sum(b), " ", b[1], " ", b[end], " ", at(io))
+        skip(io, -1500)
+        v = zeros(UInt8, 300); read!(io, view(v, 101:200))
+        rec("view ", sum(v), " ", v[100], " ", v[101], " ", v[200], " ", v[201], " ", at(io))
+        u = Vector{UInt32}(undef, 40); read!(io, u)
+        rec("uint32 ", sum(u), " ", u[1], " ", at(io))
+        r = Ref{UInt64}(0); unsafe_read(io, r, 8)
+        rec("ref ", r[], " ", at(io))
+        i8 = Vector{Int8}(undef, 30); read!(io, i8)
+        rec("int8 ", sum(i8), " ", i8[1], " ", at(io))
+        # (a pointer of another type into a memory of bytes: the bytes from its offset)
+        c = zeros(UInt8, 20)
+        got = GC.@preserve c ccall(:ios_readall, Csize_t, (Ptr{Cvoid}, Ptr{UInt32}, Csize_t), io.ios,
+                                   Ptr{UInt32}(pointer(c, 5)), 8)
+        rec("cast ", Int(got), " ", c, " ", at(io))
+        rec("readbytes ", readbytes!(io, b, 70_000), " ", length(b), " ", sum(b), " ", at(io))
+        seek(io, n - 100); rec("readbytes at end ", readbytes!(io, b, 500), " ", at(io))
+        # scalars across the end of a full buffer (its compaction), then back by a seek and a skip
+        seek(io, 0); read(io, UInt8); skip(io, 32_765)
+        rec("scalar across ", read(io, UInt64), " ", at(io))
+        seek(io, 32_766); rec("scalar again ", read(io, UInt64), " ", at(io))
+        skip(io, -8); rec("scalar skip back ", read(io, UInt32), " ", at(io))
+        # the rest, with bytes buffered (its compaction)
+        seek(io, 70_000); read(io, UInt8); x = read(io)
+        rec("read rest ", length(x), " ", sum(x), " ", at(io))
+        # into the bytes of a String (not a memory of bytes)
+        seek(io, 7)
+        s = Base._string_n(4)
+        got = GC.@preserve s ccall(:ios_readall, Csize_t, (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), io.ios, pointer(s), 4)
+        rec("string ", Int(got), " ", Vector{UInt8}(codeunits(s)), " ", at(io))
+    end
+    # writes and reads mixed, on a read/write stream
+    open(f, "r+") do io
+        rec("rw read ", read(io, 100) == UInt8[i % 251 for i in 0:99], " ", at(io))
+        seek(io, 50); write(io, "XYZ"); rec("rw write in buffer ", at(io))
+        rec("rw read after write ", read(io, UInt8), " ", at(io))
+        seek(io, 45); rec("rw read back ", String(read(io, 10)), " ", at(io))
+        skip(io, -5); write(io, 0xee); rec("rw skip write ", at(io))
+        seek(io, 40); rec("rw again ", read(io, 20), " ", at(io))
+        seek(io, 70_000); write(io, "far"); seek(io, 69_998); rec("rw far ", read(io, 7), " ", at(io))
+        seekend(io); write(io, "tail"); rec("rw append ", at(io))
+        seek(io, n - 2); rec("rw end ", read(io), " ", at(io))
+        seek(io, n + 4 + 3); write(io, 0x01); rec("rw hole ", at(io), " ", filesize(io))
+        seek(io, n); rec("rw hole read ", read(io), " ", at(io))
+    end
+    rec("file ", filesize(f), " ", sum(read(f)))
+    # another handle changes buffered bytes: a seek reads them again, a skip keeps the buffer
+    open(f) do io
+        read(io, UInt8)
+        open(w -> (seek(w, 1); write(w, 0x5a)), f, "r+")
+        seek(io, 1); rec("seek after change ", read(io, UInt8), " ", at(io))
+        open(w -> (seek(w, 3); write(w, 0x5b)), f, "r+")
+        skip(io, 1); rec("skip after change ", read(io, UInt8), " ", at(io))
+    end
+    # paths not in normal form
+    p = string(dir, "/./sub//x/../")
+    mkpath(joinpath(dir, "sub", "x"))
+    rec("paths ", isdir(p), " ", isfile(string(dir, "//data.bin")), " ", isfile(string(dir, "/sub/../data.bin")),
+        " ", filesize(string(dir, "/.//data.bin")), " ", isdir(string(dir, "/sub/.")), " ", ispath(string(dir, "/sub/x/../../nope")))
+    rm(dir; recursive=true)
+    return nothing
+end
+io_seeks(k::Int) = (out = IOBuffer(); io_seeks(k, out); String(take!(out)))
+io_seeks_print(k::Int) = (io_seeks(k, Core.stdout); Int32(0))
+
+@testset "IOStream seeks and the read buffer" begin
+    expected = io_seeks(1)
+    @test run_fs(io_seeks_print, 2) == 0
+    @test LAST_OUTPUT[] == expected
+    LAST_OUTPUT[] == expected || println(Core.stdout, "seeks: native ", repr(expected), "\n wasm ", repr(LAST_OUTPUT[]))
+end
+
+# `normalize` returns a path in normal form as it is, and normalizes the others as before
+function normalize_lexical(p::String)
+    parts = String[]
+    for c in eachsplit(p, '/')
+        (isempty(c) || c == ".") && continue
+        c == ".." ? (isempty(parts) || pop!(parts)) : push!(parts, String(c))
+    end
+    return "/" * join(parts, "/")
+end
+# (natively, of paths in normal form only: of others, `normalize` asks the host whether a
+# component before a `.` or `..` is a symbolic link; see `fs_edges`)
+@testset "normalize" begin
+    FS = WasmCodegen.Runtime.FS
+    comps = ["", ".", "..", "...", ".a", "..a", "a.", "a..", "a", "bc", "ü", "."^4]
+    bad, n = String[], 0
+    for len in 0:4, _ in 1:2000
+        p = "/" * join(rand(comps, len), "/")
+        rand(Bool) && (p *= "/")
+        q = normalize_lexical(p)
+        (FS.is_normal(p) == (q == p) && (!FS.is_normal(p) || FS.normalize(p) === p)) || push!(bad, p)
+        n += FS.is_normal(p)
+    end
+    @test isempty(bad)
+    @test n > 0
+    @test FS.is_normal("/") && FS.is_normal("/a/b.c/..d") && !FS.is_normal("a") && !FS.is_normal("")
+    @test !FS.is_normal("//") && !FS.is_normal("/a/") && !FS.is_normal("/a/./b") && !FS.is_normal("/..")
+end
+function all_false_once(k::Int)
+    p = joinpath(ROOT, string("all-false", k))
+    write(p, UInt8[i % 251 for i in 0:149_999])
+    io = open(p)
+    b = fill(UInt8(0xa5), 100_000)
+    n = readbytes!(io, b, 100_000; all=false)
+    ok = 0 < n <= 100_000 && position(io) == n &&
+        all(i -> b[i] == UInt8((i - 1) % 251), 1:n) && all(==(0xa5), b[n+1:end])
+    close(io); rm(p)
+    return Int32(ok)
+end
+
+# An all=false read may return a different positive short count on each host.
+# Every returned byte and the logical position must agree with that count.
+function byte_offsets(k::Int)
+    p = joinpath(ROOT, string("byte-offsets", k))
+    write(p, UInt8[i % 251 for i in 0:149_999])
+    io = open(p)
+    b = fill(UInt8(0xa5), 100_020)
+    n = readbytes!(io, b, 100_000; all=false)
+    ok = 0 < n <= 100_000 && position(io) == n
+    ok &= all(i -> b[i] == UInt8((i - 1) % 251), 1:n)
+    ok &= all(==(0xa5), b[n+1:end])
+    seekstart(io)
+    c = fill(UInt8(0xa5), 48)
+    got = GC.@preserve c ccall(:ios_readall, Csize_t,
+        (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), io.ios, Ptr{Cvoid}(pointer(c) + 7), 20)
+    ok &= got == 20 && c[8:27] == UInt8.(0:19)
+    ok &= all(==(0xa5), c[1:7]) && all(==(0xa5), c[28:end])
+    before = copy(c)
+    zero = GC.@preserve c ccall(:ios_read, Csize_t,
+        (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), io.ios, Ptr{Cvoid}(pointer(c) + 11), 0)
+    ok &= zero == 0 && c == before && position(io) == 20
+    # Keep byte-memory provenance through a non-byte pointer cast in this function.
+    got = GC.@preserve c ccall(:ios_read, Csize_t,
+        (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), io.ios, Ptr{UInt32}(pointer(c) + 3), 9)
+    ok &= got == 9 && c[4:12] == UInt8.(20:28)
+    ok &= c[1:3] == before[1:3] && c[13:end] == before[13:end]
+    # popfirst! can shift an Array's storage start within its Memory.
+    shifted = fill(UInt8(0xa5), 80)
+    for _ in 1:17
+        popfirst!(shifted)
+    end
+    ok &= Core.memoryrefoffset(shifted.ref) > 1
+    seekstart(io)
+    got = GC.@preserve shifted ccall(:ios_readall, Csize_t,
+        (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), io.ios, Ptr{Cvoid}(pointer(shifted) + 5), 13)
+    ok &= got == 13 && shifted[6:18] == UInt8.(0:12)
+    ok &= all(==(0xa5), shifted[1:5]) && all(==(0xa5), shifted[19:end])
+    # A byte pointer cast over word storage must retain the pointer fallback.
+    words = fill(UInt32(0xa5a5a5a5), 10)
+    seekstart(io)
+    got = GC.@preserve words ccall(:ios_readall, Csize_t,
+        (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), io.ios, Ptr{UInt8}(pointer(words)) + 5, 7)
+    ok &= got == 7 && words[1] == 0xa5a5a5a5 && words[2] == 0x020100a5 && words[3] == 0x06050403
+    ok &= all(==(0xa5a5a5a5), words[4:end])
+    close(io); rm(p)
+    return Int32(ok)
+end
+
+# Keep the direct call small enough to inspect the selected IO helper in the output.
+function direct_byte_read(k::Int)
+    io = open(joinpath(ROOT, "direct-bytes"))
+    b = fill(UInt8(0xa5), 32)
+    got = GC.@preserve b ccall(:ios_readall, Csize_t,
+        (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), io.ios, Ptr{Cvoid}(pointer(b) + 7), 10)
+    close(io)
+    return Int32(got == 10 && b[8:17] == UInt8.(0:9) &&
+        all(==(0xa5), b[1:7]) && all(==(0xa5), b[18:end]))
+end
+
+@testset "short byte reads and explicit offsets" begin
+    @test all_false_once(1) == 1
+    short = WasmCodegen.compile(all_false_once, (Int,); config=cfg)
+    @test wasm_run(short, "all_false_once", 2; rettype=Int32, preopens=Dict(ROOT => ROOT),
+        wasi_faults=[Dict("call" => "fd_read", "at" => 2, "trap" => "all=false read twice")]) == 1
+    @test any(mi -> mi.def isa Method && mi.def.module === WasmCodegen.Runtime.FS && mi.def.name === :ios_read &&
+        MemoryRef{UInt8} in mi.specTypes.parameters, keys(short.cgm.funcs))
+    @test byte_offsets(1) == 1
+    @test run_fs(byte_offsets, 2) == 1
+    write(joinpath(ROOT, "direct-bytes"), UInt8.(0:31))
+    @test direct_byte_read(1) == 1
+    c = WasmCodegen.compile(direct_byte_read, (Int,); config=cfg)
+    @test wasm_run(c, "direct_byte_read", 2; rettype=Int32, preopens=Dict(ROOT => ROOT)) == 1
+    @test any(mi -> mi.def isa Method && mi.def.module === WasmCodegen.Runtime.FS && mi.def.name === :ios_readall &&
+        MemoryRef{UInt8} in mi.specTypes.parameters, keys(c.cgm.funcs))
+    @test occursin("array.copy", sprint(WasmCodegen.WasmBuilder.print_wat, c.cgm.mod))
+end
+
+const FIXED_NORMALIZE = (("", ROOT), (".", ROOT), ("a/../b", ROOT * "/b"),
+    ("α/.", ROOT * "/α"), (String(UInt8[0x2f, 0xff]), String(UInt8[0x2f, 0xff])),
+    (String(UInt8[0x2f, 0xff, 0x2f, 0x2e]), String(UInt8[0x2f, 0xff])), ("/a\0", "/a\0"))
+# (in Wasm, where `normalize` asks the host whether a component before `.` or `..` is a
+# symbolic link: none here)
+function fixed_normalize(k::Int)
+    F = WasmCodegen.Runtime.FS
+    F.CWD[] = ROOT
+    ok = true
+    for (path, expected) in FIXED_NORMALIZE
+        ok &= F.normalize(path) == expected
+    end
+    return Int32(ok)
+end
+@testset "normalize fixed inputs" begin
+    F = WasmCodegen.Runtime.FS
+    for (path, expected) in FIXED_NORMALIZE
+        @test F.is_normal(path) == (path == expected)
+        # (natively, of paths in normal form only: they ask the host nothing)
+        F.is_normal(path) && @test F.normalize(path) == expected
+    end
+    @test run_fs(fixed_normalize, 1) == 1
+end
+
 end
