@@ -1,5 +1,6 @@
 // Persistent runner: NDJSON requests on stdin, one response per line.
-// {id, wasm (base64) | wasmId, fn, args: [{t, bits}], results: [t...]}
+// {id, wasm (base64) | wasmId, fn, args: [{t, bits}], results: [t...], wasi?: {env, args, preopens}}
+// (a request with `wasi` options runs a new instance of a WASI module, with those options)
 import { createInterface } from 'node:readline';
 import { WASI } from 'node:wasi';
 import fs from 'node:fs';
@@ -16,13 +17,14 @@ const wasiOut = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'wasmcodegen-'))
 const wasiOutFd = fs.openSync(wasiOut, 'a+');
 // a module compiled with `Config(host = :js)` runs with js/julia.mjs; one compiled with
 // `host = :wasi` (it exports its memory) with Node's WASI, as a WASI runtime runs it
-async function instantiate(mod) {
+async function instantiate(mod, opts = {}) {
   const imports = WebAssembly.Module.imports(mod);
   if (WebAssembly.Module.exports(mod).some((e) => e.name === 'memory' && e.kind === 'memory')) {
     for (const imp of imports) {
       if (imp.module !== 'wasi_snapshot_preview1') throw new Error('not a WASI import: ' + imp.module + '.' + imp.name);
     }
-    const wasi = new WASI({ version: 'preview1', stdout: wasiOutFd, stderr: wasiOutFd, returnOnExit: true });
+    const wasi = new WASI({ version: 'preview1', stdout: wasiOutFd, stderr: wasiOutFd, returnOnExit: true,
+                            env: opts.env ?? {}, args: opts.args ?? [], preopens: opts.preopens ?? {} });
     const inst = await WebAssembly.instantiate(mod, wasi.getImportObject());
     wasi.initialize(inst);
     return inst;
@@ -65,12 +67,13 @@ rl.on('line', async (line) => {
   if (!line.trim()) return;
   const req = JSON.parse(line);
   try {
-    let inst = modules.get(req.wasmId);
+    const key = req.wasi ? req.wasmId + JSON.stringify(req.wasi) : req.wasmId;
+    let inst = req.wasi ? undefined : modules.get(key);
     if (!inst) {
       const bytes = Buffer.from(req.wasm, 'base64');
       const mod = await WebAssembly.compile(bytes, { builtins: ['js-string'] });
-      inst = await instantiate(mod);
-      modules.set(req.wasmId, inst);
+      inst = await instantiate(mod, req.wasi);
+      req.wasi || modules.set(key, inst);
     }
     takeOutput();
     const f = inst.exports[req.fn];

@@ -72,7 +72,7 @@ end
 """
     wasm_run(c::Compilation, name, args...; rettype) -> value, or (:trap, msg)
 """
-function wasm_run(c, name::String, args...; rettype)
+function wasm_run(c, name::String, args...; rettype, wasi_env=nothing, wasi_args=nothing, preopens=nothing)
     r = runner()
     id = (REQ_ID[] += 1)
     wasmid = bytes2hex(sha1(c.bytes))
@@ -81,6 +81,12 @@ function wasm_run(c, name::String, args...; rettype)
     results = rl.kind === WasmCodegen.Inline ? [wtype_name(l.type) for l in rl.leaves] : String[]
     req = Dict("id" => id, "wasmId" => wasmid, "wasm" => base64encode(c.bytes), "fn" => name,
                "args" => [Dict("t" => t, "bits" => b) for (t, b) in leaves], "results" => results)
+    # (WASI options: a new instance with them)
+    if wasi_env !== nothing || wasi_args !== nothing || preopens !== nothing
+        req["wasi"] = Dict("env" => something(wasi_env, Dict{String,String}()),
+                           "args" => something(wasi_args, String[]),
+                           "preopens" => something(preopens, Dict{String,String}()))
+    end
     println(r, JSON.json(req))
     resp = JSON.parse(readline(r))
     haskey(resp, "error") && error("runner: ", resp["error"])
