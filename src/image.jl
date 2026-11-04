@@ -75,6 +75,71 @@ end
 
 ## constants in code
 
+## relocatable source locations
+#
+# Code holds the absolute source paths of the build host as constants: the file of each log
+# call. In the image, it names the source root by its package instead
+# (`@Example/src/Example.jl`, as `@stdlib/…` for a standard library), so the module's log
+# messages do not name directories of the build host. Only that metadata position is
+# rewritten, where no program compares the value with others: the file a log call passes to
+# `Base.fixup_stdlib_path` (which names stdlib paths so natively; see `emit_invoke!`). Other
+# strings and Symbols, `@__FILE__` included, keep their values, as natively: a program may
+# compare them with equal values in its data, or look them up.
+
+"""
+The build host's source roots and their relocatable names (longest first), during a
+compilation: a scoped value, so that each compilation (in its task) sees its own.
+"""
+const SOURCE_ROOTS = Base.ScopedValues.ScopedValue(Pair{String,String}[])
+
+"""
+    source_roots(config) -> Vector{Pair{String,String}}
+
+The directories of the loaded packages (`@Name`), of the standard libraries (`@stdlib`) and
+of the files of `config.extra_patches` (`@` and the directory's name), as they are before
+the pre-image hooks sanitize `Sys.STDLIB` and the package origins. `/`, the home directory
+and the directories above it are no roots.
+"""
+function source_roots(config)
+    roots = Pair{String,String}[]
+    home = rstrip(homedir(), '/')
+    add!(d::AbstractString, name::String) =
+        for v in unique!([rstrip(abspath(d), '/'), rstrip(ispath(d) ? realpath(d) : abspath(d), '/')])
+            (length(v) <= 1 || startswith(string(home, '/'), string(v, '/'))) && continue
+            push!(roots, String(v) => name)
+        end
+    stdlib = Sys.STDLIB
+    isempty(stdlib) || add!(stdlib, "@stdlib")
+    for m in Base.loaded_modules_array()
+        parentmodule(m) === m || continue
+        d = pkgdir(m)
+        d === nothing && continue
+        !isempty(stdlib) && startswith(abspath(d), rstrip(abspath(stdlib), '/') * "/") && continue
+        add!(d, string("@", nameof(m)))
+    end
+    for f in config.extra_patches
+        d = dirname(abspath(f))
+        add!(d, string("@", basename(d)))
+    end
+    sort!(roots; by = r -> -length(first(r)))
+    return unique!(first, roots)
+end
+
+# a source file below a root: `<root>/….jl`, without line breaks, and normalized (no `.` or
+# `..` component: `<root>/../x.jl` is not below the root)
+relocate_file(s::String, root::String, name::String) =
+    startswith(s, string(root, '/')) && endswith(s, ".jl") && !occursin('\n', s) && normpath(s) == s ?
+        string(name, SubString(s, ncodeunits(root) + 1)) : nothing
+
+"`s`, if it is a source file below a build-host root, with the root named (see `SOURCE_ROOTS`); else `s`."
+function relocate_source_file(s::String)
+    for (root, name) in SOURCE_ROOTS[]
+        f = relocate_file(s, root, name)
+        f === nothing || return f
+    end
+    return s
+end
+
 """
     const_value(fc, x) -> CGVal
 
