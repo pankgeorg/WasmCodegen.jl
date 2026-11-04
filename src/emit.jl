@@ -112,13 +112,16 @@ function structured_ir(cgm::CGModule, mi::Core.MethodInstance)
     return sci
 end
 
-function structurize_prepared(cgm::CGModule, mi::Core.MethodInstance)
-    ir = prepare_ir(cgm.world, mi, cgm.exceptions)
+structurize_prepared(cgm::CGModule, mi::Core.MethodInstance) =
+    structurize_or_unsupported(prepare_ir(cgm.world, mi, cgm.exceptions))
+
+"`structurize(ir)`, where an error of the structurizer is an unsupported construct."
+function structurize_or_unsupported(ir::CC.IRCode)
     try
         structurize(ir)
     catch err
         err isa Unsupported && rethrow()
-        unsupported("structurizing the IR: ", sprint(showerror, err))
+        unsupported("structurizing the IR: ", limited_sprint(showerror, err))
     end
 end
 
@@ -225,6 +228,17 @@ function const_global(world::UInt, m::Module, s::Symbol)
     return Some(Base.invoke_in_world(world, getglobal, m, s))
 end
 
+"The result `res` of the statement `stmt` in the representation of its type `typ`."
+function convert_result(fc::FnCtx, res::CGVal, @nospecialize(stmt), @nospecialize(typ))
+    try
+        return convert_repr(fc, res, typ)
+    catch err
+        err isa Unsupported || rethrow()
+        push!(err.context, string("the result of ", diagnostic_statement(stmt, typ)))
+        rethrow()
+    end
+end
+
 "Emit the statements of `block` and its terminator."
 function emit_block!(fc::FnCtx, block)
     for inst in IRStructurizer.instructions(block)
@@ -241,13 +255,7 @@ function emit_block!(fc::FnCtx, block)
             res = emit_stmt_or_trap!(fc, stmt, typ, idx)
             if res !== nothing
                 if res isa CGVal && res.kind !== Bottom && typ !== Union{}
-                    res = try
-                        convert_repr(fc, res, typ)
-                    catch err
-                        err isa Unsupported || rethrow()
-                        push!(err.context, string("the result of ", sprint(show, stmt; context=:limit => true), "::", typ))
-                        rethrow()
-                    end
+                    res = convert_result(fc, res, stmt, typ)
                 end
                 fc.ssavals[idx] = res
             end
@@ -351,7 +359,7 @@ function emit_stmt_or_trap!(fc::FnCtx, @nospecialize(stmt), @nospecialize(typ), 
         fc.b.frames = frames
         fc.b.inits = inits
         fc.depth = depth
-        push!(err.context, string("the statement ", sprint(show, stmt; context=:limit => true), "::", typ))
+        push!(err.context, string("the statement ", diagnostic_statement(stmt, typ)))
         push!(err.context, fc.info.mi)
         push!(fc.cgm.diagnostics, fc.info.mi => err)
         unreachable!(fc.b)
@@ -973,7 +981,7 @@ function emit_call!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return bottom()
     else
         unsupported("a dynamic call of ", fv, " with argument types (",
-                    join([a isa CGVal ? string(a.typ) : "?" for a in args], ", "), ")")
+                    join([a isa CGVal ? diagnostic_string(a.typ) : "?" for a in args], ", "), ")")
     end
 end
 
