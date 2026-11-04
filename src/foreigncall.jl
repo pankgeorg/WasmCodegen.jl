@@ -38,7 +38,7 @@ function foreigncall_library(@nospecialize(x))
 end
 
 "The libraries whose functions are the host's: a `ccall` of one is a call of a Wasm import."
-const IMPORT_LIBRARIES = ("wasi_snapshot_preview1", "julia_io")
+const IMPORT_LIBRARIES = ("wasi_snapshot_preview1", "julia_io", "julia_task")
 
 # the types of the arguments and results of host imports
 const IMPORT_SCALARS = (Int32, UInt32, Int64, UInt64)
@@ -56,6 +56,8 @@ function emit_import_ccall!(fc::FnCtx, lib::String, name::Symbol, ex::Expr, args
     lib == "julia_io" && !(fc.cgm.config.host === :wasi && :julia_io in fc.cgm.config.host_extensions) &&
         unsupported("the host's events (`sleep`: the `julia_io` import ", name,
                     ", `js/julia_io.mjs`), for `Config(host = :wasi, host_extensions = [:julia_io])`")
+    lib == "julia_task" && fc.cgm.config.tasks !== :jspi &&
+        unsupported("the task switch `julia_task.", name, "` (`js/julia_task.mjs`), for `Config(tasks = :jspi)`")
     lib == "wasi_snapshot_preview1" && fc.cgm.config.host !== :wasi &&
         unsupported("the WASI function ", name, " in a module for JavaScript (file IO, the environment and ",
                     "the like need `Config(host = :wasi)`)")
@@ -171,7 +173,7 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return convert_repr(fc, emit_new!(fc, constant_value(T), CGVal[]), Any)
     elseif name in (:jl_gc_disable_finalizers_internal, :jl_gc_enable_finalizers_internal,
                     :jl_cpu_suspend, :jl_cpu_pause, :jl_cpu_wake, :jl_gc_safepoint,
-                    :jl_gc_run_pending_finalizers, :jl_threadid, :jl_get_task_tid)
+                    :jl_gc_run_pending_finalizers, :jl_threadid)
         # (one thread: the first; no finalizers run during code)
         return typ === Nothing ? ghost(Nothing, nothing) : const_value(fc, zero(typ))
     elseif name === :jl_clock_now

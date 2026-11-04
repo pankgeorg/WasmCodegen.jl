@@ -36,6 +36,11 @@ for (name, f, kinds) in (
         # the scheduler's random state (`Base.Partr`): one thread's
         (:jl_get_ptls_rng, Runtime.get_ptls_rng, Symbol[]),
         (:jl_set_ptls_rng, Runtime.set_ptls_rng, [:val]),
+        # the scheduler (`runtime/tasks.jl`): the next task to switch to (`Config(tasks = :jspi)`),
+        # a task's thread (the one's once it was scheduled)
+        (:jl_set_next_task, Runtime.Tasks.set_next_task_wasm, [:val]),
+        (:jl_get_task_tid, Runtime.Tasks.task_tid, [:val]),
+        (:jl_set_task_tid, Runtime.Tasks.set_task_tid, [:val, :val]),
         (:jl_gc_new_weakref_th, Runtime.new_weakref, [:val, :val]),
         (:jl_gc_get_total_bytes, Runtime.gc_get_total_bytes, [:val]),
         (:jl_gc_num, Runtime.gc_num, Symbol[]),
@@ -53,6 +58,8 @@ finalizers that run, WasmGC's heap (no statistics), nothing compiled at run time
 const CONST_FOREIGNCALLS = Dict{Symbol,Any}(
     # threads and the scheduler
     :jl_threadpoolid => 1, :jl_get_task_threadpoolid => 1,
+    # (a task's pool, set by `Threads.@spawn`: the default one, the only one with a thread)
+    :jl_set_task_threadpoolid => 1,
     :jl_in_threaded_region => 0, :jl_cpu_threads => 1, :jl_effective_threads => 1,
     :jl_get_ptls_states => C_NULL, 
     :jl_iolock_begin => nothing, :jl_iolock_end => nothing,
@@ -109,7 +116,7 @@ const FOREIGNCALL_HINTS = Pair{Regex,String}[
         "names/getglobal/isdefined(::Module, ::Symbol) with a name known only at run time: bindings by name",
     r"^jl_(type_intersection|type_morespecific|type_unionall|has_concrete_subtype|widen_diagonal|new_datatype|new_typename_in|new_primitivetype|new_typevar|instantiate_type|instantiate_unionall|apply_type|apply_tuple_type|apply_array_type|type_union|subtype|intersect_types|has_empty_intersection|find_free_typevars)" =>
         "typeintersect/typejoin/Type{...} construction/<: of types known only at run time: the type system",
-    r"^jl_(new_task|switch|set_next_task|get_next_task|wakeup_thread|wakeup_threadpool|queue_work|set_task_tid|set_task_threadpoolid|enter_threaded_region|exit_threaded_region|adopt_thread)" =>
+    r"^jl_(new_task|switch|set_next_task|get_next_task|wakeup_thread|wakeup_threadpool|queue_work|enter_threaded_region|exit_threaded_region|adopt_thread)" =>
         "@async/@spawn/schedule/Threads.@threads: the program has one task and one thread",
     r"^(jl_spawn|jl_uv_process_|uv_process_kill|uv_kill)" =>
         "run/pipeline/open of a Cmd: processes do not exist in Wasm",

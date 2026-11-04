@@ -400,7 +400,8 @@ function compile_runtime_cases!(cgm::CGModule)
                         trim_patches=config.trim_patches, optimize=config.optimize)
     try
         while true
-            n = add_reflection_types!(cgm) + add_objectid_cases!(cgm) + add_tuple_cases!(cgm)
+            n = add_reflection_types!(cgm) + add_objectid_cases!(cgm) + add_tuple_cases!(cgm) +
+                add_by_type_cases!(cgm)
             n == 0 && break
             process_worklist!(cgm)
         end
@@ -408,6 +409,88 @@ function compile_runtime_cases!(cgm::CGModule)
         cgm.config = config
         resize!(cgm.diagnostics, ndiag)
     end
+end
+
+## `Runtime.by_type(f, x, y)`: `f(x, y, T)` of the case of `f` for the type `T` of `x`
+
+"""
+The functions `Runtime.by_type` calls by the type of a value, and the types of the module each
+has a case for (of the module's concrete types): `Base.wait` of each type Base has a `wait`
+for (`Runtime.Tasks.wait_as`, for `@sync`), and `showerror` of each exception type whose
+`showerror` the module can compile, as juliac checks code (`Runtime.showerror_as`, for
+`Host.error_text`).
+"""
+const BY_TYPE_CASES = IdDict{Any,Function}(
+    Runtime.Tasks.wait_as => (world, @nospecialize(T)) ->
+        !(T <: Task) && !(T <: Base.UnwrapTaskFailedException) && hasmethod(Base.wait, Tuple{T}; world),
+    Runtime.showerror_as => (world, @nospecialize(T)) -> T <: Exception && trim_safe_showerror(T, world))
+
+# whether `showerror(::IOBuffer, ::T)` is trim-safe in `world` (once per type and world)
+const SHOWERROR_TRIM_SAFE = Dict{Tuple{Any,UInt},Bool}()
+trim_safe_showerror(@nospecialize(T), world::UInt) = get!(SHOWERROR_TRIM_SAFE, (T, world)) do
+    try
+        mi = entry_instance(showerror, (IOBuffer, T); world)
+        isempty(trim_check([mi]; world, onlywarn=true))
+    catch
+        false
+    end
+end
+
+"""
+    by_type_func!(cgm, f) -> Func
+
+`(x::\$JlValue, y::\$JlValue) -> i32`: `f(x, y, T)` of the case of `f` for the type `T` of `x`
+(`true`), else `false` (0). Generated when the module's types are known (`finish_by_type!`).
+"""
+function by_type_func!(cgm::CGModule, @nospecialize(f))
+    fs = get!(() -> Any[], cgm.helpers, :by_type)::Vector{Any}
+    any(g -> g === f, fs) || push!(fs, f)
+    return get!(cgm.helpers, (:by_type, f)) do
+        jl = jlvalue_ref(cgm.types)
+        add_func!(cgm.mod, string("jl_by_type_", nameof(f)), ValType[jl, jl], ValType[I32])
+    end::Func
+end
+
+# the cases of the functions of `by_type`: of each type of the module each is for (the number
+# of cases added)
+function add_by_type_cases!(cgm::CGModule)
+    n = 0
+    world = cgm.world.world
+    for f in get(cgm.helpers, :by_type, Any[])::Vector{Any}
+        cases = get!(() -> Dict{Int,FuncInfo}(), cgm.helpers, (:by_type_cases, f))::Dict{Int,FuncInfo}
+        seen = get!(() -> Set{Int}(), cgm.helpers, (:by_type_seen, f))::Set{Int}
+        applies = BY_TYPE_CASES[f]
+        for (id, T) in enumerate(copy(cgm.types.typelist))
+            id in seen && continue
+            push!(seen, id)
+            (T isa DataType && isconcretetype(T) && applies(world, T)) || continue
+            cases[id] = runtime_function!(cgm, f, (Any, Any, Type{T}))
+            n += 1
+        end
+    end
+    return n
+end
+
+function finish_by_type!(cgm::CGModule)
+    ts = cgm.types
+    for f in get(cgm.helpers, :by_type, Any[])::Vector{Any}
+        func = cgm.helpers[(:by_type, f)]::Func
+        cases = get(cgm.helpers, (:by_type_cases, f), Dict{Int,FuncInfo}())::Dict{Int,FuncInfo}
+        b = Builder(cgm.mod, func)
+        for id in sort!(collect(keys(cases)))
+            emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0)
+            emit!(b, :i32_const, id); emit!(b, :i32_eq)
+            if!(b)
+            # (the case returns `true` if it returns)
+            emit!(b, :local_get, 0); emit!(b, :local_get, 1); call!(b, cases[id].func)
+            foreach(_ -> emit!(b, :drop), cases[id].func.results)
+            emit!(b, :i32_const, 1); return!(b)
+            end!(b)
+        end
+        emit!(b, :i32_const, 0)
+        finish!(b)
+    end
+    return nothing
 end
 
 # the cases of `jl_object_id`: `objectid` of each type whose values may be objects (the

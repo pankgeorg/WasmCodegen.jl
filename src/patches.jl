@@ -23,6 +23,9 @@ const TRIM_PATCHES = [joinpath(@__DIR__, "trim", "juliac-trim-base.jl"),
                       joinpath(@__DIR__, "trim", "wasm-invokelatest.jl"),
                       joinpath(@__DIR__, "trim", "wasm-fs.jl")]
 
+# the C runtime's scheduler on one thread, for `Config(tasks=:jspi)` (after the others)
+const TASK_PATCHES = [joinpath(@__DIR__, "trim", "wasm-tasks.jl")]
+
 # the constants the patches rebind (methods are restored by deleting their replacements)
 const PATCHED_CONSTS = [(Base, :invokelatest)]
 

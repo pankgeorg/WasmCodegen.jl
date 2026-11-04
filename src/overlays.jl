@@ -73,7 +73,17 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
     elseif m.module === Runtime && m.name === :map_type_value
         f = mi.specTypes.parameters[2]
         return emit_map_type!(fc, f.instance, operand(fc, ex.args[4]))
-    elseif m.module === Base && (m.name === :enq_work || (m.name === :wait && length(mi.specTypes.parameters) == 1))
+    elseif m.module === Runtime && m.name === :by_type
+        # (`f(x, y, typeof(x))` of the module's case for the type of `x`, see `BY_TYPE_CASES`)
+        f = mi.specTypes.parameters[2].instance
+        push_val!(fc, convert_repr(fc, operand(fc, ex.args[4]), Any))
+        push_val!(fc, convert_repr(fc, operand(fc, ex.args[5]), Any))
+        call!(fc.b, by_type_func!(fc.cgm, f))
+        return pop_val!(fc, Bool)
+    elseif m.module === Runtime.Tasks && m.name in TASK_PRIMITIVES
+        return emit_task_primitive!(fc, m.name, mi, ex)
+    elseif fc.cgm.config.tasks === :none && m.module === Base &&
+           (m.name === :enq_work || (m.name === :wait && length(mi.specTypes.parameters) == 1))
         # one task: waiting can only wait forever, and there is no other task to schedule (in
         # place of the scheduler: task switches, the C runtime's queues and threads)
         msg = m.name === :wait ? "deadlock: waiting in a program of one task" : "scheduling a task in a program of one task"
@@ -126,4 +136,97 @@ function staging_op(m::Method)
     F = typeof(getglobal(Runtime.Staging, m.name))
     sig = startswith(String(m.name), "load") ? Tuple{F,UInt32} : Tuple{F,UInt32,op[2]}
     return m.sig == sig ? op : nothing
+end
+
+## tasks on JSPI stacks (`Config(tasks=:jspi)`, `Runtime.Tasks`)
+
+const TASK_PRIMITIVES = (:alloc_task, :set_current!, :add_runner!, :call_body, :get_exception,
+                         :set_exception!, :clear_exception!)
+
+# the function `call_body(code, t)` compiles to: the runner (`Runtime.Tasks.run_body`) of the
+# type of the task's body `code`, called on `t`; its body is made with the module
+# (`finish_task_runners!`), when the runners of every type of body a `Task` was made of are known
+task_runner_dispatch!(cgm::CGModule) = get!(cgm.helpers, :task_runner_dispatch) do
+    add_func!(cgm.mod, "jl_task_run_body", ValType[jlvalue_ref(cgm.types); valtypes(cgm, Task)], ValType[])
+end
+
+"""
+    finish_task_runners!(cgm)
+
+The body of the function `call_body` compiles to: by the type id of the task's body, a call of
+its runner. A body of another type traps: a task's body is of a type `Task` was made of, unless
+its `code` was replaced by a function of a type never given to `Task` (natively, `start_task`
+calls whatever `code` holds; here only the types `Task` was made of have a runner).
+"""
+function finish_task_runners!(cgm::CGModule)
+    f = get(cgm.helpers, :task_runner_dispatch, nothing)
+    f === nothing && return
+    ts = cgm.types
+    runners = get(cgm.helpers, :task_runners, IdDict{Any,Func}())::IdDict{Any,Func}
+    b = Builder(cgm.mod, f::Func)
+    for (id, run) in sort!([typeid!(ts, F) => run for (F, run) in runners]; by=first)
+        emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0)
+        emit!(b, :i32_const, id); emit!(b, :i32_eq)
+        if!(b)
+        emit!(b, :local_get, 1); call!(b, run); return!(b)
+        end!(b)
+    end
+    unreachable!(b)
+    finish!(b)
+    return nothing
+end
+
+function emit_task_primitive!(fc::FnCtx, name::Symbol, mi::Core.MethodInstance, ex::Expr)
+    cgm = fc.cgm
+    cgm.config.tasks === :jspi || unsupported("tasks (Runtime.Tasks) without Config(tasks=:jspi)")
+    args = CGVal[operand(fc, a) for a in ex.args[3:end]]
+    if name === :alloc_task
+        # a task, every field zero or null (as the root task's global before its fields are set)
+        ts = cgm.types
+        l = layout(ts, Task)
+        emit!(fc.b, :i32_const, typeid!(ts, Task))
+        emit!(fc.b, :i32_const, 0)
+        for f in (typedef(cgm.mod, l.wtype).comp::StructType).fields[HEADER_FIELDS+1:end]
+            st = f.storage
+            d = default_inst(st isa PackedType ? I32 : st)
+            emit!(fc.b, d.op, d.imm...)
+        end
+        emit!(fc.b, :struct_new, l.wtype)
+        return pop_val!(fc, Task)
+    elseif name === :set_current!
+        push_val!(fc, convert_repr(fc, args[1], Task))
+        emit!(fc.b, :ref_as_non_null)
+        emit!(fc.b, :global_set, current_task_global!(cgm))
+        return ghost(Nothing, nothing)
+    elseif name === :get_exception
+        # (the current exception is a global: a task switch keeps it in the switching frame)
+        if cgm.exceptions === :none
+            emit!(fc.b, :ref_null, cgm.types.jlvalue)
+        else
+            emit!(fc.b, :global_get, current_exception_global!(cgm))
+        end
+        return pop_val!(fc, Any)
+    elseif name === :set_exception! || name === :clear_exception!
+        cgm.exceptions === :none && return ghost(Nothing, nothing)
+        if name === :set_exception!
+            push_val!(fc, convert_repr(fc, args[1], Any))
+        else
+            emit!(fc.b, :ref_null, cgm.types.jlvalue)
+        end
+        emit!(fc.b, :global_set, current_exception_global!(cgm))
+        return ghost(Nothing, nothing)
+    elseif name === :add_runner!
+        # (compiled for every type of body a `Task` is made of: `call_body` calls it by type)
+        F = mi.specTypes.parameters[2].parameters[1]
+        info = runtime_function!(cgm, Runtime.Tasks.run_body, (Task, Type{F}))
+        runners = get!(() -> IdDict{Any,Func}(), cgm.helpers, :task_runners)::IdDict{Any,Func}
+        runners[F] = info.func
+        typeid!(cgm.types, F)
+        return ghost(Nothing, nothing)
+    else # :call_body
+        push_val!(fc, convert_repr(fc, args[1], Any))
+        push_val!(fc, convert_repr(fc, args[2], Task))
+        call!(fc.b, task_runner_dispatch!(cgm))
+        return ghost(Nothing, nothing)
+    end
 end

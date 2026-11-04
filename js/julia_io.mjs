@@ -41,8 +41,8 @@
 //
 // | Import | Signature | Semantics |
 // |---|---|---|
-// | `timer_start` | `(ns i64) -> i32 handle` | A timer that becomes ready after `ns` nanoseconds, from the host's event loop: never before it has turned, even for `0` (as libuv's timers), so that a wait on it lets the host's other events progress. |
-// | `poll` | `(interest_off, n_interest, timeout_ns i64, out_off, cap) -> i32` | `interest`: `n_interest` (1 to 1024) `i32` handles. Writes up to `cap` handles of the interest set that are ready, and returns their count. Ready handles outside the interest set are not reported and stay ready. `timeout_ns`: `-1` waits indefinitely, `0` does not wait; a timeout returns `0`. An unknown or closed handle of the interest set is reported ready (its next call is `-EBADF`). Waiting indefinitely with no handle of the interest set that can become ready is `-EINVAL`. **The only suspending import.** |
+// | `timer_start` | `(ns i64) -> i32 handle` | A timer that becomes ready after `ns` nanoseconds, once the host's event loop has turned (a timer of `0` too, as libuv runs it in its next iteration, so that a wait on it lets the host's other events progress); then a `poll` finds it ready when it is due. |
+// | `poll` | `(interest_off, n_interest, timeout_ns i64, out_off, cap) -> i32` | `interest`: `n_interest` (1 to 1024) `i32` handles. Writes up to `cap` handles of the interest set that are ready, in the order they became ready (timers: by deadline, then start), and returns their count. Ready handles outside the interest set are not reported and stay ready. `timeout_ns`: `-1` waits indefinitely, `0` does not wait; a timeout returns `0`. An unknown or closed handle of the interest set is reported ready (its next call is `-EBADF`). Waiting indefinitely with no handle of the interest set that can become ready is `-EINVAL`. **The only suspending import.** |
 // | `errmsg` | `(h, out_off, cap) -> i32` | The last error message of the handle (UTF-8, truncated to `cap`), and its length. `h = -1`: the last failure without a handle. |
 // | `cancel` | `(h) -> i32` | Cancels the handle: a timer that has not fired becomes ready, cancelled. Idempotent. `0`, or `-EBADF` for an unknown handle. |
 // | `close` | `(h) -> i32` | Releases the handle, cancelling it: `0`. A closed or unknown handle is `-EBADF` (closing twice too). |
@@ -325,10 +325,12 @@ export function makeJuliaIOEvents(opts = {}) {
   let lastError = ''; // errmsg(-1)
   let inPoll = false;
   let waker = null; // resolves the suspended poll
+  let pollTimer = null; // the suspended poll's timeout
+  let stopped = false; // the instance is done (`stop`): nothing resumes it
   const stats = { maxOpen: 0, started: 0 };
 
   // ---- bookkeeping ----
-  function notify() { if (waker) { const w = waker; waker = null; w(); } }
+  function notify() { if (waker && !stopped) { const w = waker; waker = null; w(); } }
   function newHandle(entry) {
     const h = nextHandle++;
     entry.id = h;
@@ -340,6 +342,7 @@ export function makeJuliaIOEvents(opts = {}) {
   function get(h) { return handles.get(h | 0); }
   function guard(name) {
     if (inPoll) throw new JuliaIOAssertion(`${name} called while poll is suspended (two promising calls in flight on one instance)`);
+    if (stopped) throw new JuliaIOAssertion(`${name} called after stop()`);
   }
   // an import: an assertion is rethrown; any other exception is an errno, by `fail`
   function wrap(name, f, fail) {
@@ -362,16 +365,21 @@ export function makeJuliaIOEvents(opts = {}) {
   const neg = (e) => -fault(e);
   const negH = (e, h) => -fault(e, h);
 
-  // ready: fired (or cancelled); pending: may become ready without the module doing anything
-  const isReady = (x) => x.fired;
+  // ready: fired (or cancelled), or due once the event loop has turned since its start (a
+  // poll sees a timer due before its callback ran, as libuv runs the timers due when it
+  // runs); pending: may become ready without the module doing anything
+  function isReady(x) {
+    if (!x.fired && !x.immediate && performance.now() >= x.deadline) { disarm(x); x.fired = true; }
+    return x.fired;
+  }
   const isPending = (x) => !x.fired;
 
   // ---- timers ----
   function timer_start(ns) {
     ns = BigInt.asIntN(64, BigInt(ns));
     if (ns < 0n) throw new GuestError(E.INVAL, `timer_start: negative duration ${ns}`);
-    const x = { kind: 'timer', fired: false, cancelled: false, t: null, immediate: false, errmsg: '', closed: false };
     const deadline = performance.now() + Number(ns) / 1e6;
+    const x = { kind: 'timer', fired: false, cancelled: false, t: null, immediate: false, deadline, errmsg: '', closed: false };
     const arm = () => {
       x.immediate = false;
       const ms = deadline - performance.now();
@@ -391,14 +399,18 @@ export function makeJuliaIOEvents(opts = {}) {
   }
 
   // ---- poll (the only suspending import) ----
+  // the ready handles of the interest set, in the order they became ready (a timer's deadline,
+  // then its start: the order libuv runs timers in)
   function readyOf(interest, cap) {
-    const out = [];
+    const ready = [];
     for (const h of interest) {
-      if (out.length >= cap) break;
       const x = handles.get(h);
-      if (!x || isReady(x)) out.push(h); // (unknown or closed: ready; the next call is EBADF)
+      // (unknown or closed: ready; the next call is EBADF)
+      if (!x) ready.push({ h, at: -Infinity });
+      else if (isReady(x)) ready.push({ h, at: x.deadline });
     }
-    return out;
+    ready.sort((a, b) => a.at - b.at || a.h - b.h);
+    return ready.slice(0, cap).map((r) => r.h);
   }
   const anyPending = (interest) => interest.some((h) => { const x = handles.get(h); return x && isPending(x); });
   function writeReady(list, off) {
@@ -432,15 +444,15 @@ export function makeJuliaIOEvents(opts = {}) {
 
   async function suspend(interest, timeout_ns, out_off, cap) {
     inPoll = true;
-    let timer = null, timedOut = false;
+    let timedOut = false;
     try {
       if (timeout_ns > 0n) {
         // (armed again until the deadline: a timeout is at most 2^31 - 1 ms, 24.8 days)
         const deadline = performance.now() + Number(timeout_ns) / 1e6;
         const arm = () => {
           const ms = deadline - performance.now();
-          if (ms <= 0) { timer = null; timedOut = true; notify(); return; }
-          timer = setTimeout(arm, Math.min(Math.ceil(ms), 0x7fffffff));
+          if (ms <= 0) { pollTimer = null; timedOut = true; notify(); return; }
+          pollTimer = setTimeout(arm, Math.min(Math.ceil(ms), 0x7fffffff));
         };
         arm();
       }
@@ -458,7 +470,7 @@ export function makeJuliaIOEvents(opts = {}) {
       if (e instanceof JuliaIOAssertion) throw e;
       return neg(e);
     } finally {
-      if (timer) clearTimeout(timer);
+      if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
       inPoll = false;
       waker = null;
     }
@@ -481,7 +493,11 @@ export function makeJuliaIOEvents(opts = {}) {
   function cancel(h) {
     const x = get(h);
     if (!x) return -E.BADF;
-    if (!x.fired) { disarm(x); x.fired = true; x.cancelled = true; x.errmsg = 'timer cancelled'; notify(); }
+    if (!x.fired) {
+      disarm(x); x.fired = true; x.cancelled = true; x.errmsg = 'timer cancelled';
+      x.deadline = Math.min(x.deadline, performance.now());
+      notify();
+    }
     return 0;
   }
 
@@ -513,6 +529,15 @@ export function makeJuliaIOEvents(opts = {}) {
       const x = get(h);
       if (!x) return null;
       return { kind: 'timer', fired: x.fired, cancelled: x.cancelled, ready: isReady(x) };
+    },
+    // The instance is done (it trapped, or its embedder shut it down: `julia_task.mjs` calls
+    // this): a suspended `poll` never resumes its stack, the timers are released, and later
+    // calls are errors.
+    stop() {
+      stopped = true;
+      waker = null;
+      if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+      for (const x of handles.values()) disarm(x);
     },
   };
 }
