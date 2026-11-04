@@ -25,7 +25,56 @@ async function instantiate(mod, opts = {}) {
     }
     const wasi = new WASI({ version: 'preview1', stdout: wasiOutFd, stderr: wasiOutFd, returnOnExit: true,
                             env: opts.env ?? {}, args: opts.args ?? [], preopens: opts.preopens ?? {} });
-    const inst = await WebAssembly.instantiate(mod, wasi.getImportObject());
+    const host = wasi.getImportObject();
+    let inst;
+    // Faults are opt-in and scoped to this instance. Normal tests use the host directly.
+    for (const name of new Set((opts.faults ?? []).map((r) => r.call))) {
+      const original = host.wasi_snapshot_preview1[name];
+      let calls = 0;
+      host.wasi_snapshot_preview1[name] = (...args) => {
+        const rules = opts.faults.filter((r) => r.call === name &&
+          (!r.negativeSeek || (args[1] < 0n && args[2] === 1)));
+        if (!rules.length) return original(...args);
+        calls++;
+        if (calls > 32 && rules.some((r) => r.repeat)) throw new Error('fault host: no progress');
+        const rule = rules.find((r) => r.at === calls || (r.repeat && calls >= r.at));
+        if (!rule) return original(...args);
+        if (rule.errno !== undefined) return rule.errno;
+        const memory = new DataView(inst.exports.memory.buffer);
+        if (rule.maxBytes !== undefined) {
+          const old = memory.getUint32(args[1] + 4, true);
+          memory.setUint32(args[1] + 4, Math.min(old, rule.maxBytes), true);
+          try { return original(...args); }
+          finally { memory.setUint32(args[1] + 4, old, true); }
+        }
+        if (rule.linkLength !== undefined) {
+          const count = Math.min(args[4], rule.linkLength);
+          new Uint8Array(inst.exports.memory.buffer, args[3], count).fill(97);
+          memory.setUint32(args[5], count, true);
+          return 0;
+        }
+        if (rule.dirents) {
+          if (rule.cookie !== undefined && args[3] !== BigInt(rule.cookie))
+            throw new Error('unexpected directory cookie: ' + args[3]);
+          const records = [];
+          for (const ent of rule.dirents) {
+            const record = Buffer.alloc(24 + ent.length, 97);
+            record.writeBigUInt64LE(BigInt(ent.next), 0);
+            record.writeBigUInt64LE(1n, 8);
+            record.writeUInt32LE(ent.length, 16);
+            record[20] = 4;
+            records.push(record);
+          }
+          const data = Buffer.concat(records);
+          const used = Math.min(args[2], data.length);
+          new Uint8Array(inst.exports.memory.buffer, args[1], used).set(data.subarray(0, used));
+          memory.setUint32(args[4], used, true);
+          return 0;
+        }
+        throw new Error('unknown fault rule');
+      };
+    }
+    inst = await WebAssembly.instantiate(mod, host);
     wasi.initialize(inst);
     return inst;
   }

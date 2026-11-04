@@ -71,6 +71,32 @@ wasi.initialize(instance);
 instance.exports.f(100n);
 ```
 
+WASI file paths use absolute preopen names and a virtual working directory (`PWD`, or the
+first preopen). Preopens must occupy contiguous descriptors starting at 3; the first EBADF
+ends discovery. Resolution uses the longest component-prefix match. `.` and `..` after a
+symbolic link apply to its target, as the kernel resolves them; `cd(f, dir)` restores the
+old directory by path, so renaming that directory can prevent restoration. Permission bits, uid/gid and block counts are synthesized unless
+a mode provider is installed. Default modes do not enforce access or guarantee 0600/0700
+privacy for temporary files/directories. Access checks approximate owner bits, not ACLs or
+effective credentials. Preview 1 metadata timestamps cannot represent times before 1970.
+
+File IOStreams buffer as Julia's `ios.c` does (32 KiB; writes held until a flush, a seek, a
+read or a close; reads larger than most of the buffer read directly); `flush` does not promise
+durability. Writes out retry EINTR, EAGAIN and no progress from the unwritten suffix, as
+`ios.c`; an error after a partial write leaves that prefix written and is the flush's or the
+close's error. Raw `jl_fs_read`
+and `jl_fs_write` return counts or negative errors as libuv's do: a read is one read (all of
+a file's bytes asked, but at its end), a write writes all but at an error after some; both
+retry EINTR and report EAGAIN. `jl_fs_sendfile` copies at most 1 MiB per call. Positional IO
+uses `fd_pread`/`fd_pwrite` and never moves the source/current file offset.
+
+Creation followed by mode adjustment is not atomic. If a mode query or adjustment fails,
+the created object is removed and a newly opened descriptor is closed.
+Path-based mode adjustment has replacement races. Atomic create-with-mode and
+identity-checked chmod require a stronger host interface and are outside this contract.
+Directory records up to 1 MiB and symbolic-link targets shorter than 1 MiB are supported;
+ambiguous full buffers grow to that bound and then report ENAMETOOLONG.
+
 `compile` throws `UnsupportedConstructs` with the statements it cannot compile and the
 method instances they are in, as juliac's verifier reports what it cannot trim. The module
 it returns is optimized by `wasm-opt -O3` (Binaryen_jll); `Config(optimize=nothing)` gives

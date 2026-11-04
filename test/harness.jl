@@ -72,7 +72,7 @@ end
 """
     wasm_run(c::Compilation, name, args...; rettype) -> value, or (:trap, msg)
 """
-function wasm_run(c, name::String, args...; rettype, wasi_env=nothing, wasi_args=nothing, preopens=nothing)
+function wasm_run(c, name::String, args...; rettype, wasi_env=nothing, wasi_args=nothing, preopens=nothing, wasi_faults=nothing)
     r = runner()
     id = (REQ_ID[] += 1)
     wasmid = bytes2hex(sha1(c.bytes))
@@ -85,7 +85,8 @@ function wasm_run(c, name::String, args...; rettype, wasi_env=nothing, wasi_args
     if wasi_env !== nothing || wasi_args !== nothing || preopens !== nothing
         req["wasi"] = Dict("env" => something(wasi_env, Dict{String,String}()),
                            "args" => something(wasi_args, String[]),
-                           "preopens" => something(preopens, Dict{String,String}()))
+                           "preopens" => something(preopens, Dict{String,String}()),
+                           "faults" => something(wasi_faults, []))
     end
     println(r, JSON.json(req))
     resp = JSON.parse(readline(r))
