@@ -38,6 +38,7 @@ WasmCodegen.with_trim_patches() do _, _
     include("versions.jl")
     include("specialize.jl")
     include("invokelatest.jl")
+    include("staging.jl")
     include("juliac/runtests.jl")
 end
 
