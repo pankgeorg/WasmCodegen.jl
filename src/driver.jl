@@ -137,6 +137,7 @@ function emit_module(w::ClosedWorld, mis::Vector{Core.MethodInstance}, entries::
         EXCEPTION_MODES[m] > EXCEPTION_MODES[mode] || break
         mode = m
     end
+    check_cfunction_calls!(cgm)
     if cgm.config.trim === :safe && !isempty(cgm.diagnostics)
         throw(UnsupportedConstructs(cgm.diagnostics))
     end
@@ -198,6 +199,7 @@ function finish_module!(cgm::CGModule)
     finish_exports!(cgm)
     finish_gensym_counter!(cgm)
     finish_modules!(cgm)
+    finish_cfunctions!(cgm)
     finish_image!(cgm)
     finish_type_maps!(cgm)
     finish_typeof!(cgm)
