@@ -31,6 +31,27 @@ struct UnsetUnionRefs
 end
 unset_unionrefs(n::Int) = unset_probe(UnsetUnionRefs, k -> UnsetUnionRefs(Int32(k + n), "alive"))
 
+# elements boxed natively (one pointer each: tuples with union fields) that Wasm stores as a
+# reference per leaf: the null pointer Base's `_unsetindex!` stores over the element (`pop!`,
+# `resize!`, `deleteat!`, `filter`) nulls all of its leaves, not one leaf of another element
+function unset_union_tuples(::Type{T}, mk, key) where {T}
+    v = T[mk(k) for k in 1:7]
+    pop!(v); resize!(v, 5); deleteat!(v, 2)
+    w = Base.filter(x -> x !== v[3], v)
+    d = 0
+    for x in v, y in w   # (every leaf of every element read: a null one traps)
+        d = 31 * d + key(x) - key(y)
+    end
+    return (length(v), length(w), d, isassigned(v.ref.mem, 6), isassigned(v.ref.mem, 7))
+end
+unset_union_tuple_is(n::Int) =
+    unset_union_tuples(Tuple{Union{Nothing,Int},Union{Nothing,String}}, k -> (k + n, isodd(k) ? string(k) : nothing),
+                       x -> something(x[1], 0) + sizeof(something(x[2], "--")))
+unset_union_tuple_uss(n::Int) =
+    unset_union_tuples(Tuple{Union{Nothing,Base.UUID},Union{Nothing,Vector{Int}},Union{Nothing,Vector{Int}}},
+                       k -> (Base.UUID(UInt128(k + n)), nothing, [k]),
+                       x -> Int(something(x[1]).value % 1000) + sum(something(x[3])) + (x[2] === nothing ? 0 : 7))
+
 # single null stores into an inline element (not an unset): to be rejected, not miscompiled
 function clear_pointer_field(n::Int)
     m = Memory{Tuple{Ptr{Cvoid},Int}}(undef, 1)
@@ -63,6 +84,9 @@ end
     @wtest unset_tuple_si(1)
     @wtest unset_tuple_ss(1)
     @wtest unset_unionrefs(1)
+    @test !Base.allocatedinline(Tuple{Union{Nothing,Int},Union{Nothing,String}})
+    @wtest unset_union_tuple_is(1)
+    @wtest unset_union_tuple_uss(1)
     for f in (clear_pointer_field, clear_numeric_word, clear_union_word)
         @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(f, (Int,))
     end
