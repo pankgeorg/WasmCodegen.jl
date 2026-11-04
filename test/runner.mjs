@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHost } from '../js/julia.mjs';
 import { makeJuliaIOPaths, makeJuliaIOEvents, PATH_IMPORTS, EVENT_IMPORTS } from '../js/julia_io.mjs';
+import { makeJuliaRegex } from '../js/julia_regex.mjs';
 const modules = new Map();
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 let output = '';
@@ -22,10 +23,13 @@ async function instantiate(mod, opts = {}) {
   const imports = WebAssembly.Module.imports(mod);
   if (WebAssembly.Module.exports(mod).some((e) => e.name === 'memory' && e.kind === 'memory')) {
     // (and the host's events, file modes and links, for `host_extensions = [:julia_io]`: the
-    // events only for a module that imports them, whose calls may suspend)
+    // events only for a module that imports them, whose calls may suspend; and the host's
+    // regex engine, for `host_extensions = [:julia_regex]`)
     const io = imports.filter((imp) => imp.module === 'julia_io').map((imp) => imp.name);
+    const regex = makeJuliaRegex();
     for (const imp of imports) {
       if (imp.module === 'julia_io' && (PATH_IMPORTS.includes(imp.name) || EVENT_IMPORTS.includes(imp.name))) continue;
+      if (imp.module === 'julia_regex' && imp.name in regex.imports) continue;
       if (imp.module !== 'wasi_snapshot_preview1') throw new Error('not a WASI import: ' + imp.module + '.' + imp.name);
     }
     // (the adapter's paths are the module's: the preopens at the same path)
@@ -35,6 +39,7 @@ async function instantiate(mod, opts = {}) {
     const wasi = new WASI({ version: 'preview1', stdout: wasiOutFd, stderr: wasiOutFd, returnOnExit: true,
                             env: opts.env ?? {}, args: opts.args ?? [], preopens: opts.preopens ?? {} });
     const host = wasi.getImportObject();
+    host.julia_regex = regex.imports;
     let inst;
     // Faults are opt-in and scoped to this instance. Normal tests use the host directly.
     for (const name of new Set((opts.faults ?? []).map((r) => r.call))) {
@@ -88,6 +93,7 @@ async function instantiate(mod, opts = {}) {
     inst = await WebAssembly.instantiate(mod, host);
     paths?.bindMemory(inst.exports.memory);
     events?.bindMemory(inst.exports.memory);
+    regex.bindMemory(inst.exports.memory);
     wasi.initialize(inst);
     return { inst, suspends: events !== null };
   }

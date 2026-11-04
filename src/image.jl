@@ -117,6 +117,23 @@ function primitive_const(@nospecialize(x), leaves::Vector{Leaf})
 end
 
 """
+The fields whose values are caches of the build process, serialized as another value: the
+compiled pattern of a `Regex` (a pointer to the build process's PCRE2 code) as null, which
+Base compiles again (on the host's engine) when the `Regex` is first used.
+"""
+const IMAGE_RESET_FIELDS = ((Regex, :regex, C_NULL),)
+
+"The value of the `i`th field of `x` as the image has it (see `IMAGE_RESET_FIELDS`)."
+function image_field(@nospecialize(x), i::Int)
+    T = typeof(x)
+    name = fieldname(T, i)
+    for (S, f, v) in IMAGE_RESET_FIELDS
+        T === S && f === name && return v
+    end
+    return getfield(x, i)
+end
+
+"""
     const_leaves(img, x, FT) -> Vector{Inst}
 
 The leaves of the value `x` stored where the declared type is `FT` (a field, an
@@ -146,7 +163,7 @@ function const_leaves(img::Image, @nospecialize(x), @nospecialize(FT); raw_point
             FTi = fieldtype(S, i)
             if isdefined(x, i)
                 raw = (T, fieldname(T, i)) in img.cgm.config.image_pointer_fields
-                append!(leaves, const_leaves(img, getfield(x, i), FTi; raw_pointer=raw))
+                append!(leaves, const_leaves(img, image_field(x, i), FTi; raw_pointer=raw))
             else
                 append!(leaves, Inst[default_inst(l.type) for l in field_leaves(ts, FTi)])
             end
@@ -367,7 +384,7 @@ function struct_global!(img::Image, @nospecialize(x), l::Layout)
             FT = fieldtype(T, i)
             if isdefined(x, i)
                 raw = (T, fieldname(T, i)) in img.cgm.config.image_pointer_fields
-                append!(init, field_init!(img, getfield(x, i), FT, back, first(l.fields[i]) - 1; raw_pointer=raw))
+                append!(init, field_init!(img, image_field(x, i), FT, back, first(l.fields[i]) - 1; raw_pointer=raw))
             else
                 append!(init, Inst[default_inst(leaf.type) for leaf in field_leaves(ts, FT)])
             end
