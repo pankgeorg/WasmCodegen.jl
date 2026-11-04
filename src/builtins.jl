@@ -397,9 +397,119 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
     elseif f === Core.apply_type
         all(a -> a isa CGVal && isconstant(a), args) &&
             return const_value(fc, Core.apply_type(map(constant_value, args)...))
-        unsupported("apply_type of types not known at compile time")
+        return split_apply_type!(fc, args, typ)
     end
     unsupported("the builtin ", f)
+end
+
+## union-split construction
+#
+# A closure capturing a variable inferred as a small `Union` is made by `apply_type` over its
+# type (the type of the variable a parameter) and `new` of the result: inference types them
+# as a `Union` of `Type{T}`s and of `T`s. Each is compiled as a chain over the members,
+# testing the parameters (`===`), so that each branch builds a type known at compile time.
+
+"How many types a union-split `apply_type` or `new` may choose between (inference's default)."
+const MAX_SPLIT = 4
+
+"""The concrete types `T` of `Union{Type{T1}, Type{T2}, …}`, or `nothing` if `typ` is not
+such a union."""
+function split_types(@nospecialize(typ))
+    typ isa Union || return nothing
+    out = Any[]
+    for u in Base.uniontypes(typ)
+        (u isa DataType && u.name === Type.body.name && !(u.parameters[1] isa TypeVar) &&
+         isconcretetype(u.parameters[1])) || return nothing
+        push!(out, u.parameters[1])
+    end
+    return out
+end
+
+"""Emit a chain choosing the value of `typ` in `res` by `case(i)` for the first `i` whose
+`cond(i)` (an `i32` pushed on the stack) holds; no case holding traps."""
+function emit_split_chain!(fc::FnCtx, @nospecialize(typ), n::Int, cond, case)
+    res = new_val!(fc, typ)
+    for i in 1:n
+        cond(i)
+        if!(fc.b)
+        v = case(i)
+        v isa CGVal && v.kind !== Bottom && assign!(fc, res, v)
+        else!(fc.b)
+    end
+    unreachable!(fc.b)
+    for _ in 1:n
+        end!(fc.b)
+    end
+    return res
+end
+
+function push_cond!(fc::FnCtx, conds::Vector{CGVal})
+    if isempty(conds)
+        emit!(fc.b, :i32_const, 1)
+        return
+    end
+    for (k, c) in enumerate(conds)
+        push_val!(fc, convert_repr(fc, c, Bool))
+        k > 1 && emit!(fc.b, :i32_and)
+    end
+end
+
+"""`apply_type(C, ps…)` with parameters not known at compile time, whose result inference
+knows to be one of a few concrete types: the one whose parameters are `ps`."""
+function split_apply_type!(fc::FnCtx, args::Vector, @nospecialize(typ))
+    ts = split_types(typ)
+    all(a -> a isa CGVal, args) && isconstant(args[1]) && ts !== nothing ||
+        unsupported("apply_type of types not known at compile time")
+    length(ts) <= MAX_SPLIT ||
+        unsupported("apply_type of types not known at compile time, one of ", length(ts),
+                    " types (more than ", MAX_SPLIT, ")")
+    C = constant_value(args[1])
+    for T in ts
+        (T.name.wrapper === C && length(T.parameters) == length(args) - 1) ||
+            unsupported("apply_type of types not known at compile time (", T, " from ", C, ")")
+    end
+    cond(i) = push_cond!(fc, CGVal[emit_egal!(fc, args[j], const_value(fc, ts[i].parameters[j - 1]))
+                                   for j in 2:length(args) if !isconstant(args[j])])
+    return emit_split_chain!(fc, typ, length(ts), cond, i -> const_value(fc, ts[i]))
+end
+
+"""`new` of a type not known at compile time that inference knows to be one of a few
+concrete types: the object of the type `T` is. A field value not of the chosen type's field
+type is a `TypeError`, as natively."""
+function split_new!(fc::FnCtx, T::CGVal, args::Vector{CGVal}, @nospecialize(typ))
+    ts = split_types(T.typ)
+    ts === nothing && unsupported("`new` of a type that is not known at compile time")
+    length(ts) <= MAX_SPLIT ||
+        unsupported("`new` of a type not known at compile time, one of ", length(ts),
+                    " types (more than ", MAX_SPLIT, ")")
+    for Ti in ts
+        length(args) <= fieldcount(Ti) || unsupported("`new` of ", Ti, " with ", length(args), " fields")
+    end
+    cond(i) = push_cond!(fc, CGVal[emit_egal!(fc, T, const_value(fc, ts[i]))])
+    function case(i)
+        Ti = ts[i]
+        fs = CGVal[]
+        for (k, a) in enumerate(args)
+            FT = fieldtype(Ti, k)
+            if !(a.typ <: FT)
+                # (a value not of the field's type: natively a TypeError)
+                type_error() = throw_error!(fc, Runtime.throw_new_type_error,
+                                            () -> convert_repr(fc, const_value(fc, FT), Any),
+                                            () -> convert_repr(fc, a, Any))
+                t = emit_isa!(fc, a, FT)
+                isconstant(t) && !constant_value(t) && return type_error()
+                if !isconstant(t)
+                    push_val!(fc, t); emit!(fc.b, :i32_eqz)
+                    if!(fc.b); type_error(); end!(fc.b)
+                end
+            end
+            v = convert_repr(fc, a.typ <: FT ? a : emit_pi!(fc, a, FT), FT)
+            v.kind === Bottom && return v
+            push!(fs, v)
+        end
+        return emit_new!(fc, Ti, fs)
+    end
+    return emit_split_chain!(fc, typ, length(ts), cond, case)
 end
 
 function emit_isdefined!(fc::FnCtx, x::CGVal, i::Int)
