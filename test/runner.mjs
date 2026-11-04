@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHost } from '../js/julia.mjs';
+import { makeJuliaIOPaths, makeJuliaIOEvents, PATH_IMPORTS, EVENT_IMPORTS } from '../js/julia_io.mjs';
 const modules = new Map();
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 let output = '';
@@ -20,9 +21,17 @@ const wasiOutFd = fs.openSync(wasiOut, 'a+');
 async function instantiate(mod, opts = {}) {
   const imports = WebAssembly.Module.imports(mod);
   if (WebAssembly.Module.exports(mod).some((e) => e.name === 'memory' && e.kind === 'memory')) {
+    // (and the host's events, file modes and links, for `host_extensions = [:julia_io]`: the
+    // events only for a module that imports them, whose calls may suspend)
+    const io = imports.filter((imp) => imp.module === 'julia_io').map((imp) => imp.name);
     for (const imp of imports) {
+      if (imp.module === 'julia_io' && (PATH_IMPORTS.includes(imp.name) || EVENT_IMPORTS.includes(imp.name))) continue;
       if (imp.module !== 'wasi_snapshot_preview1') throw new Error('not a WASI import: ' + imp.module + '.' + imp.name);
     }
+    // (the adapter's paths are the module's: the preopens at the same path)
+    const preopens = Object.entries(opts.preopens ?? {}).filter(([g, h]) => g === h).map(([g]) => g);
+    const paths = io.some((n) => PATH_IMPORTS.includes(n)) ? makeJuliaIOPaths({ preopens }) : null;
+    const events = io.some((n) => EVENT_IMPORTS.includes(n)) ? makeJuliaIOEvents() : null;
     const wasi = new WASI({ version: 'preview1', stdout: wasiOutFd, stderr: wasiOutFd, returnOnExit: true,
                             env: opts.env ?? {}, args: opts.args ?? [], preopens: opts.preopens ?? {} });
     const host = wasi.getImportObject();
@@ -75,9 +84,12 @@ async function instantiate(mod, opts = {}) {
         throw new Error('unknown fault rule');
       };
     }
+    host.julia_io = { ...paths?.imports, ...events?.imports };
     inst = await WebAssembly.instantiate(mod, host);
+    paths?.bindMemory(inst.exports.memory);
+    events?.bindMemory(inst.exports.memory);
     wasi.initialize(inst);
-    return inst;
+    return { inst, suspends: events !== null };
   }
   const host = createHost({ write: (fd, b) => { for (const x of b) bytes.push(x); } });
   for (const imp of imports) {
@@ -85,7 +97,7 @@ async function instantiate(mod, opts = {}) {
   }
   const inst = await WebAssembly.instantiate(mod, { julia: host.imports.julia });
   host.attach(inst);
-  return inst;
+  return { inst, suspends: false };
 }
 function takeOutput() {
   output += decoder.decode(new Uint8Array(bytes));
@@ -118,19 +130,20 @@ rl.on('line', async (line) => {
   const req = JSON.parse(line);
   try {
     const key = req.wasi ? req.wasmId + JSON.stringify(req.wasi) : req.wasmId;
-    let inst = req.wasi ? undefined : modules.get(key);
-    if (!inst) {
+    let m = req.wasi ? undefined : modules.get(key);
+    if (!m) {
       const bytes = Buffer.from(req.wasm, 'base64');
       const mod = await WebAssembly.compile(bytes, { builtins: ['js-string'] });
-      inst = await instantiate(mod, req.wasi);
-      req.wasi || modules.set(key, inst);
+      m = await instantiate(mod, req.wasi);
+      req.wasi || modules.set(key, m);
     }
     takeOutput();
-    const f = inst.exports[req.fn];
+    const f = m.inst.exports[req.fn];
     if (!f) throw new Error('no export ' + req.fn);
     let r;
     try {
-      r = f(...req.args.map(decode));
+      // (an export that may suspend, on the host's events, returns a promise)
+      r = m.suspends ? await WebAssembly.promising(f)(...req.args.map(decode)) : f(...req.args.map(decode));
     } catch (e) {
       process.stdout.write(JSON.stringify({ id: req.id, trap: String(e && e.message || e), output: takeOutput() }) + '\n');
       return;

@@ -15,7 +15,7 @@ part of its runtime; it (and what it calls) is added to the closed world.
 """
 function runtime_function!(cgm::CGModule, @nospecialize(f), @nospecialize(argtypes::Tuple))
     w = cgm.world
-    mi = entry_instance(f, argtypes; world=w.world)
+    mi = entry_instance(f, argtypes; world=w.world, extensions=w.extensions)
     haskey(w.sources, mi) || extend_world!(w, Core.MethodInstance[mi])
     return get_function!(cgm, mi)
 end

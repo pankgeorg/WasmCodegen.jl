@@ -7,10 +7,12 @@
     ClosedWorld
 
 The functions to compile: for every method instance, its CodeInstance and its optimized
-source, in the order they were collected, and the entry points.
+source, in the order they were collected, and the entry points; inferred with the method
+tables of the host's extensions `extensions` (see `WasmMethodTable`).
 """
 struct ClosedWorld
     world::UInt
+    extensions::Vector{Symbol}
     entries::Vector{Core.MethodInstance}
     order::Vector{Core.MethodInstance}
     sources::IdDict{Core.MethodInstance,Tuple{Core.CodeInstance,Core.CodeInfo}}
@@ -19,15 +21,16 @@ struct ClosedWorld
 end
 
 """
-    entry_instance(f, argtypes; world) -> MethodInstance
+    entry_instance(f, argtypes; world, extensions=()) -> MethodInstance
 
-The method instance a call of `f` with arguments of types `argtypes` dispatches to in the
-module (a method of `Runtime.WASM_METHODS` where it has one).
+The method instance a call of `f` with arguments of types `argtypes` dispatches to in a
+module whose host has the extensions `extensions` (a method of their tables or of
+`Runtime.WASM_METHODS` where it has one).
 """
 function entry_instance(@nospecialize(f), @nospecialize(argtypes::Tuple);
-                        world::UInt=Base.get_world_counter())
+                        world::UInt=Base.get_world_counter(), extensions=())
     tt = Tuple{Core.Typeof(f),argtypes...}
-    matches = CC.findall(tt, WasmMethodTable(world); limit=1)
+    matches = CC.findall(tt, WasmMethodTable(world, extensions); limit=1)
     (matches === nothing || length(matches) != 1) &&
         error("no unique method for $tt")
     match = CC.getindex(matches, 1)::Core.MethodMatch
@@ -39,19 +42,22 @@ end
 const COMPILE_KWARGS = VERSION >= v"1.13-" ? (; external_linkage=false) : (;)
 
 """
-    collect_world(entries; world, verify=:warn) -> ClosedWorld
+    collect_world(entries; world, verify=:warn, extensions=Symbol[]) -> ClosedWorld
 
-Infer the entry method instances and everything they call, as juliac does. Calls kept
-as `:invoke`s of method instances inference did not keep source for (error paths) are
-inferred too, to a fixpoint. With `verify` (`:error`, `:warn` or `:off`), the result is
-checked with juliac's trim verifier, which reports dynamic dispatch.
+Infer the entry method instances and everything they call, as juliac does, for a module
+whose host has the extensions `extensions`. Calls kept as `:invoke`s of method instances
+inference did not keep source for (error paths) are inferred too, to a fixpoint. With
+`verify` (`:error`, `:warn` or `:off`), the result is checked with juliac's trim verifier,
+which reports dynamic dispatch.
 """
 function collect_world(entries::Vector{Core.MethodInstance};
-                       world::UInt=Base.get_world_counter(), verify::Symbol=:warn)
-    w = ClosedWorld(world, entries, Core.MethodInstance[],
+                       world::UInt=Base.get_world_counter(), verify::Symbol=:warn,
+                       extensions::Vector{Symbol}=Symbol[])
+    w = ClosedWorld(world, extensions, entries, Core.MethodInstance[],
                     IdDict{Core.MethodInstance,Tuple{Core.CodeInstance,Core.CodeInfo}}(),
                     Ref(""))
-    verify === :off || (w.trim_report[] = trim_check(entries; world, onlywarn=verify === :warn))
+    verify === :off ||
+        (w.trim_report[] = trim_check(entries; world, onlywarn=verify === :warn, extensions))
     extend_world!(w, entries)
     return w
 end
@@ -72,7 +78,7 @@ Base.showerror(io::IO, e::TrimFailure) =
 const MAX_INVOKE_ROUNDS = 8
 
 """
-    trim_check(entries; world, onlywarn=false) -> String
+    trim_check(entries; world, onlywarn=false, extensions=()) -> String
 
 Check the entry points as `juliac --trim=safe` does: native inference collects the code
 they run (`Compiler.typeinf_ext_toplevel`), and juliac's verifier checks it. Returns the
@@ -88,13 +94,13 @@ targets of a program whose specializations do not end, as recursive invokes of e
 types, stay unresolved invokes.)
 """
 function trim_check(entries::Vector{Core.MethodInstance}; world::UInt=Base.get_world_counter(),
-                    onlywarn::Bool=false)
+                    onlywarn::Bool=false, extensions=())
     args = VERSION >= v"1.13-" ? (CC.TRIM_UNSAFE, false) : (CC.TRIM_UNSAFE,)
-    replacement = Replacements(world)
+    replacement = Replacements(world, extensions)
     roots = Any[entries...]
     codeinfos = CC.typeinf_ext_toplevel(copy(roots), UInt[world], args...)
     for _ in 1:MAX_INVOKE_ROUNDS
-        # (and the methods of `Runtime.WASM_METHODS` the module compiles in place of the
+        # (and the methods of the overlay method tables the module compiles in place of the
         # native ones called, verified as entries)
         targets = filter(mi -> !(mi in roots),
                          [uncompiled_invoke_targets(codeinfos); replacement_targets(codeinfos, replacement)])
@@ -172,16 +178,19 @@ function link_invoke_targets!(codeinfos::Vector{Any})
 end
 
 """
-    Replacements(world)
+    Replacements(world, extensions=())
 
-The methods of `Runtime.WASM_METHODS` that the module compiles in place of native method
-instances (by `r(mi)`: the instance of the replacement, or `nothing`), looked up once each.
+The methods of the overlay method tables (of the host's extensions `extensions` and
+`Runtime.WASM_METHODS`, as `WasmMethodTable`) that the module compiles in place of native
+method instances (by `r(mi)`: the instance of the replacement, or `nothing`), looked up once
+each.
 """
 struct Replacements
-    world::UInt
+    table::WasmMethodTable
     found::IdDict{Core.MethodInstance,Union{Nothing,Core.MethodInstance}}
 end
-Replacements(world::UInt) = Replacements(world, IdDict{Core.MethodInstance,Union{Nothing,Core.MethodInstance}}())
+Replacements(world::UInt, extensions=()) =
+    Replacements(WasmMethodTable(world, extensions), IdDict{Core.MethodInstance,Union{Nothing,Core.MethodInstance}}())
 
 function (r::Replacements)(mi::Core.MethodInstance)
     get!(r.found, mi) do
@@ -189,11 +198,11 @@ function (r::Replacements)(mi::Core.MethodInstance)
         m isa Method && !isdefined(m, :external_mt) || return nothing
         # (only the method a call of these types dispatches to is replaced: a less specific one
         # reached by `invoke` is compiled as it is)
-        native = CC.findsup(mi.specTypes, CC.InternalMethodTable(r.world))[1]
+        native = CC.findsup(mi.specTypes, CC.InternalMethodTable(r.table.world))[1]
         native isa Core.MethodMatch && native.method === m || return nothing
-        match = CC.findsup(mi.specTypes, WasmMethodTable(r.world))[1]
+        match = CC.findsup(mi.specTypes, r.table)[1]
         match isa Core.MethodMatch && isdefined(match.method, :external_mt) &&
-            match.method.external_mt === Runtime.WASM_METHODS || return nothing
+            any(mt -> mt === match.method.external_mt, r.table.tables) || return nothing
         return CC.specialize_method(match)
     end
 end
@@ -233,12 +242,12 @@ function compile_time_instance(mi::Core.MethodInstance)
 end
 
 # whether `mi` is `Runtime.original` (or its keyword body), which only the native bodies of
-# replaced methods call, or a method of `Runtime.WASM_METHODS`: neither runs in the module
-# unless the module's code reaches it
+# replaced methods call, or a method of an overlay method table (`Runtime.WASM_METHODS`, an
+# extension's): neither runs in the module unless the module's code reaches it
 function only_if_reached(mi::Core.MethodInstance)
     m = mi.def
     m isa Method || return false
-    isdefined(m, :external_mt) && m.external_mt === Runtime.WASM_METHODS && return true
+    Runtime.overlay_method(m) && return true
     return m.module === Runtime && (m.name === :original || startswith(String(m.name), "#original#"))
 end
 
@@ -246,8 +255,8 @@ end
     compiled_instances(codeinfos, entries, replacement) -> (compiled, native_only)
 
 The method instances of `codeinfos` (native inference's) that the module compiles: those the
-entries reach through `:invoke`s, where a call of a native method that a method of
-`Runtime.WASM_METHODS` replaces reaches the replacement instead; and those reached only
+entries reach through `:invoke`s, where a call of a native method that a method of an overlay
+method table replaces (`replacement`) reaches the replacement instead; and those reached only
 through such native methods (`native_only`).
 """
 function compiled_instances(codeinfos::Vector{Any}, entries::Vector{Core.MethodInstance},
@@ -290,7 +299,7 @@ end
     verify_trim(io, codeinfos, entries, replacement, onlywarn)
 
 juliac's verifier (`Compiler.verify_typeinf_trim`) of what the module compiles: the methods
-of `Runtime.WASM_METHODS` in place of the native methods they replace (`trim_check` infers
+of the overlay method tables in place of the native methods they replace (`trim_check` infers
 them as entries), without the errors in those native methods, and in the code only they
 reach. (Natively, such a method may call the method before the patches with
 `Runtime.original`, which the verifier rejects.) A replaced method or `Runtime.original`
@@ -350,7 +359,7 @@ Add the method instances `mis` and everything they call to the closed world `w` 
 code generator asks for the functions of its runtime this way).
 """
 function extend_world!(w::ClosedWorld, mis::Vector{Core.MethodInstance})
-    interp = WasmInterpreter(; world=w.world)
+    interp = WasmInterpreter(; world=w.world, extensions=w.extensions)
     codeinfos = Any[]
     wq = CC.CompilationQueue(; interp)
     ilq = CC.CompilationQueue(; interp)
