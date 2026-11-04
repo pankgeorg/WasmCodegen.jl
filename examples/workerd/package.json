@@ -1,0 +1,11 @@
+{
+  "name": "wasmcodegen-workerd-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node check.mjs"
+  },
+  "devDependencies": {
+    "workerd": "1.20261031.1"
+  }
+}
