@@ -50,6 +50,7 @@ WasmCodegen.with_trim_patches() do _, _
     include("event.jl")
     include("diagnostics.jl")
     include("type_hash.jl")
+    include("foreign_functions.jl")
     include("juliac/runtests.jl")
 end
 
