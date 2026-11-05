@@ -201,7 +201,8 @@ end
 """
 The fields whose values are caches of the build process, serialized as another value: the
 compiled pattern of a `Regex` (a pointer to the build process's PCRE2 code) as null, which
-Base compiles again (on the host's engine) when the `Regex` is first used.
+Base compiles again when the `Regex` is first used (`Config(foreign_functions)` provides
+PCRE2's functions).
 """
 const IMAGE_RESET_FIELDS = ((Regex, :regex, C_NULL),)
 
