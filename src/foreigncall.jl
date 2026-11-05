@@ -37,6 +37,24 @@ function foreigncall_library(@nospecialize(x))
     return lib isa String ? lib : nothing
 end
 
+## libraries of host imports the program declares (`Config(import_libraries)`)
+
+"Whether `lib` is a library WasmCodegen's own imports use (which a program cannot declare)."
+reserved_import_library(lib::AbstractString) =
+    lib == "wasi_snapshot_preview1" || lib == "julia" || startswith(lib, "julia_")
+
+"Check `Config(import_libraries)`: for `host = :wasi`, names that are not WasmCodegen's own."
+function check_import_libraries(config)
+    isempty(config.import_libraries) && return
+    config.host === :wasi ||
+        throw(ArgumentError("Config(import_libraries): the libraries of host imports a program declares are for host = :wasi"))
+    for lib in config.import_libraries
+        isempty(lib) && throw(ArgumentError("Config(import_libraries): an empty library name"))
+        reserved_import_library(lib) &&
+            throw(ArgumentError("Config(import_libraries): \"$lib\" is a name of WasmCodegen's own imports"))
+    end
+end
+
 "The libraries whose functions are the host's: a `ccall` of one is a call of a Wasm import."
 const IMPORT_LIBRARIES = ("wasi_snapshot_preview1", "julia_io", "julia_task")
 
@@ -46,9 +64,10 @@ const IMPORT_SCALARS = (Int32, UInt32, Int64, UInt64)
 """
     emit_import_ccall!(fc, lib, name, ex, args, typ) -> CGVal
 
-`ccall((name, lib), RT, (ArgT...), args...)` of a host library: a call of the Wasm import
-`lib.name`. The types must be 32- and 64-bit integers (or `Cvoid` for no result). WASI's
-functions are imported only by modules for WASI (`Config(host = :wasi)`), which have the
+`ccall((name, lib), RT, (ArgT...), args...)` of a host library, WasmCodegen's own
+(`IMPORT_LIBRARIES`) or one the program declared (`Config(import_libraries)`): a call of the
+Wasm import `lib.name`. The types must be 32- and 64-bit integers (or `Cvoid` for no result).
+WASI's functions are imported only by modules for WASI (`Config(host = :wasi)`), which have the
 linear memory their pointers address.
 """
 function emit_import_ccall!(fc::FnCtx, lib::String, name::Symbol, ex::Expr, args::Vector{Any})
@@ -64,6 +83,13 @@ function emit_import_ccall!(fc::FnCtx, lib::String, name::Symbol, ex::Expr, args
     RT = ex.args[2]
     ATs = ex.args[3]::Core.SimpleVector
     bad = filter(T -> !(T in IMPORT_SCALARS), collect(Any, ATs))
+    if !(lib in IMPORT_LIBRARIES)
+        # (a library the program declared: its own interface, whose misuse is the program's)
+        ex.args[4] == 0 || unsupported("a variadic ccall of the host import ", lib, ".", name)
+        (RT === Cvoid || RT in IMPORT_SCALARS) && isempty(bad) ||
+            unsupported("the host import ", lib, ".", name, " with a type other than Int32, UInt32, Int64, ",
+                        "UInt64 (or Cvoid as its result): ", RT, " (", join(ATs, ", "), ")")
+    end
     (RT === Cvoid || RT in IMPORT_SCALARS) && isempty(bad) ||
         error("WasmCodegen: the host import $lib.$name has a type other than Int32, UInt32, Int64, " *
               "UInt64 (or Cvoid as its result): $RT ($(join(ATs, ", ")))")
@@ -84,7 +110,7 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     nargs = length(ex.args[3]::Core.SimpleVector)
     args = Any[operand(fc, a) for a in ex.args[6:5+nargs]]
     lib = foreigncall_library(ex.args[1])
-    if lib !== nothing && lib in IMPORT_LIBRARIES && name !== nothing
+    if lib !== nothing && name !== nothing && (lib in IMPORT_LIBRARIES || lib in fc.cgm.config.import_libraries)
         return emit_import_ccall!(fc, lib, name, ex, args)
     end
     if name === nothing && is_llvmcall(ex.args[5])
