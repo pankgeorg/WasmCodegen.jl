@@ -903,8 +903,15 @@ function emit_invoke!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     mi isa Core.MethodInstance || unsupported("an invoke of ", target)
     r = emit_intrinsic_call!(fc, mi, ex, typ)
     r === nothing || return r
-    info = get_function!(fc.cgm, mi)
     args = CGVal[operand(fc, a) for a in ex.args[2:end]]
+    m = mi.def
+    if m isa Method && m.module === Base && m.name === :fixup_stdlib_path && length(args) == 2 &&
+       isconstant(args[2]) && constant_value(args[2]) isa String && !isempty(SOURCE_ROOTS[])
+        # the source file of a log call, a constant: the file as the build process names it,
+        # relocatable (see `SOURCE_ROOTS`)
+        return const_value(fc, relocate_source_file(Base.fixup_stdlib_path(constant_value(args[2])::String)))
+    end
+    info = get_function!(fc.cgm, mi)
     return emit_call_info!(fc, info, args)
 end
 
