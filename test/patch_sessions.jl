@@ -109,6 +109,11 @@ through_outer(x::Int) = outer(x) * 2
 invoked(x::Int) = x + 1
 WasmCodegen.Runtime.@wasm_method invoked(x::Int) = x + 1
 through_invoke(x::Int) = invoke(invoked, Tuple{Number}, x)
+# a replaced method native inference inlines into its caller (a keyword method's positional
+# method): the verifier checks the replacement, not the native body that would be inlined
+@inline kwreplaced(x::Int; k::Int = 1)::Int = helper(x) + k
+WasmCodegen.Runtime.@wasm_method kwreplaced(x::Int; k::Int = 1) = x + k
+through_kw(x::Int) = kwreplaced(x) * 2
 end
 
 @testset "methods of WASM_METHODS and the verifier" begin
@@ -120,6 +125,8 @@ end
     c = WasmCodegen.compile(T.through_outer, (Int,); config=WasmCodegen.Config(verify=:error))
     @test wasm_run(c, "through_outer", 20; rettype=Int) == T.through_outer(20) == 42
     @test_throws WasmCodegen.TrimFailure WasmCodegen.compile(T.through_invoke, (Int,); config=WasmCodegen.Config(verify=:error))
+    c = WasmCodegen.compile(T.through_kw, (Int,); config=WasmCodegen.Config(verify=:error))
+    @test wasm_run(c, "through_kw", 20; rettype=Int) == 42
 end
 
 # no method of `WASM_METHODS` is more `:consistent` than the native one it replaces: inference
