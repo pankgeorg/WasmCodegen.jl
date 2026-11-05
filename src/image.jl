@@ -772,7 +772,14 @@ function mutable_global!(img::Image, @nospecialize(x), l::Layout)
         isdefined(x, i) || continue
         FT = fieldtype(T, i)
         isempty(field_leaves(ts, FT)) && continue
-        push!(img.patches, (g, :struct, l.wtype, first(l.fields[i]) - 1, getfield(x, i), FT, img.owner))
+        v = getfield(x, i)
+        if (T, fieldname(T, i)) in img.cgm.config.image_pointer_fields
+            # (an allowlisted pointer keeps its address, as when the object is serialized whole)
+            push!(img.patches, (g, :struct_insts, l.wtype, first(l.fields[i]) - 1,
+                                const_leaves(img, v, FT; raw_pointer=true), FT, img.owner))
+        else
+            push!(img.patches, (g, :struct, l.wtype, first(l.fields[i]) - 1, v, FT, img.owner))
+        end
     end
     return g
 end

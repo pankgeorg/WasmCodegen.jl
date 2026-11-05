@@ -253,3 +253,37 @@ end
     @test !(first in cgm.image.optional)
     @test any(d -> d.first === cyc, cgm.diagnostics)
 end
+
+# a pointer field allowlisted in `Config(image_pointer_fields)` keeps its address with shell-first
+# serialization too, also in an object reached again through a closure it holds
+module ShellFirstPointers
+    mutable struct PtrHolder
+        p::Ptr{UInt8}
+    end
+    const P = PtrHolder(Ptr{UInt8}(UInt(0x2000)))
+    read_ptr() = UInt(P.p)
+    mutable struct Holder
+        p::Ptr{UInt8}
+        back::Any
+    end
+    const H = let h = Holder(Ptr{UInt8}(UInt(0x3000)), nothing)
+        h.back = () -> h.p
+        h
+    end
+    read_holder() = UInt(H.p)
+end
+
+@testset "shell-first serialization and Config(image_pointer_fields)" begin
+    S = ShellFirstPointers
+    for shell in (false, true)
+        cfg = WasmCodegen.Config(shell_first_mutables = shell, image_pointer_fields = [(S.PtrHolder, :p)])
+        @test wasm_run(WasmCodegen.compile(S.read_ptr, (); config = cfg), "read_ptr"; rettype = UInt) == UInt(0x2000)
+        # not allowlisted: a pointer of the build process is an unsupported construct
+        @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(S.read_ptr, ();
+            config = WasmCodegen.Config(shell_first_mutables = shell))
+    end
+    cfg = WasmCodegen.Config(shell_first_mutables = true, image_pointer_fields = [(S.Holder, :p)])
+    @test wasm_run(WasmCodegen.compile(S.read_holder, (); config = cfg), "read_holder"; rettype = UInt) == UInt(0x3000)
+    @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(S.read_holder, ();
+        config = WasmCodegen.Config(shell_first_mutables = true))
+end
