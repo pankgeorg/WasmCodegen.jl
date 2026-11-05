@@ -27,6 +27,12 @@ let Runtime = WasmCodegen.Runtime
         Base.@assume_effects :foldable _type_name(@nospecialize(T::Type)) =
             $(Runtime.map_type_symbol)($(Runtime.simple_type_name), T)
         show(io::IO, T::Type) = print(io, _type_name(T))
+        # the hash of a type (`hash(::Type)`, and so `hash` of the values that hash their type,
+        # as `hash(::Base.SHA1)` does): the C runtime's `jl_type_hash`, from a table of the
+        # module's types computed at compile time (`Runtime.type_hash`), so the hashes are the
+        # native ones (also for the Dicts in the image)
+        Base.@assume_effects :foldable _jl_type_hash(@nospecialize(T::Type)) =
+            ($(Runtime.map_type_value)($(Runtime.type_hash), T)::$(Runtime.TypeHash)).h
         # showing a function or an enum: the bindings that name it, and their visibility from
         # `show`'s default module, at compile time (`Runtime.function_show`/`enum_show`);
         # another module in the `IOContext`'s `:module` is not in Wasm
