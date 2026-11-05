@@ -34,12 +34,29 @@ mutable struct Image
     counter::Int
     "The native `objectid`s of the mutable objects, which their headers' hash refers to."
     native_ids::Vector{UInt64}
+    "The function being emitted, or whose deferred value is being serialized (else `nothing`)."
+    owner::Any
+    "Whether a deferred value failed to serialize: the start function then traps."
+    failed::Bool
+    "Whether the functions being emitted are optional ones (objectid cases), and those functions."
+    optional_mode::Bool
+    optional::IdSet{Any}
+    "The objects an optional function serialized first, and the other functions that reached them."
+    created::IdDict{Any,Any}
+    dependents::IdDict{Any,Vector{Any}}
+    "The optional functions whose deferred values failed."
+    failed_owners::IdSet{Any}
+    "Per optional function: the errors not reported while it is optional, and the optional
+    functions it needed first."
+    suppressed::IdDict{Any,Vector{Any}}
+    optional_children::IdDict{Any,Vector{Any}}
 end
 
 Image(cgm) = Image(cgm, IdDict{Any,Global}(), IdDict{Any,Global}(), IdDict{Any,Global}(),
                    IdSet{Any}(), Inst[], Any[],
                    Dict{Tuple{Module,Symbol},Tuple{Any,Vector{Global},Union{Nothing,Global}}}(), IdDict{Any,Global}(), 0,
-                   UInt64[])
+                   UInt64[], nothing, false, false, IdSet{Any}(), IdDict{Any,Any}(), IdDict{Any,Vector{Any}}(),
+                   IdSet{Any}(), IdDict{Any,Vector{Any}}(), IdDict{Any,Vector{Any}}())
 
 """
     header_hash(img, x) -> Inst
@@ -225,7 +242,10 @@ function const_leaves(img::Image, @nospecialize(x), @nospecialize(FT); raw_point
         # a tuple stored where the declared type is a tuple of unknown length (`VersionNumber`'s
         # `prerelease`) of another storage of its elements: an array object of the declared
         # element type
-        g = get!(() -> tuple_array_global!(img, x, lf; register=false), img.boxes, (x, lf.wtype))
+        key = (x, lf.wtype)
+        haskey(img.boxes, key) && (note_reach!(img, key); return Inst[Inst(:global_get, img.boxes[key])])
+        note_created!(img, key)
+        g = get!(() -> tuple_array_global!(img, x, lf; register=false), img.boxes, key)
         return Inst[Inst(:global_get, g)]
     end
     return Inst[Inst(:global_get, object_global!(img, x))]
@@ -263,6 +283,8 @@ function boxed_object_global!(img::Image, @nospecialize(x); raw_pointer::Bool=fa
     # (a pointer, where it is boxed: checked at each use, as equal pointers share a box)
     is_ptr_type(T) && check_build_pointer(x, raw_pointer)
     # isbits values are boxed once per value; others (Memory, String) per object
+    haskey(img.boxes, x) && (note_reach!(img, x); return img.boxes[x])
+    note_created!(img, x)
     get!(img.boxes, x) do
         box = box_type!(ts, T)
         init = Inst[Inst(:i32_const, typeid!(ts, T)), Inst(:i32_const, 0)]
@@ -306,7 +328,30 @@ to) on first use.
 """
 function object_global!(img::Image, @nospecialize(x))
     g = get(img.globals, x, nothing)
-    g === nothing || return g
+    if g !== nothing
+        note_reach!(img, x)
+        return g
+    end
+    note_created!(img, x)
+    return new_object_global!(img, x)
+end
+
+# `x` (an object, a box's value or a global variable's key) serialized first by an optional function
+note_created!(img::Image, @nospecialize(x)) =
+    img.owner in img.optional && !haskey(img.created, x) && (img.created[x] = img.owner)
+
+# an object, box or global variable serialized before by another function: an optional function's
+# makes the function reaching it depend on that one's deferred values
+function note_reach!(img::Image, @nospecialize(x))
+    c = get(img.created, x, nothing)
+    (c === nothing || c === img.owner) && return
+    c in img.failed_owners &&
+        unsupported("a value whose deferred value could not be serialized (reached first by ", c.mi, ")")
+    push!(get!(() -> Any[], img.dependents, c), img.owner)
+    return
+end
+
+function new_object_global!(img::Image, @nospecialize(x))
     x in img.inprogress && unsupported("serializing a cycle of objects through ", typeof(x))
     # types are objects even where their type is a singleton (`Union{}`)
     x isa Type && return type_object_global!(img, x)
@@ -330,6 +375,11 @@ function object_global!(img::Image, @nospecialize(x))
         return g
     elseif T === Core.SimpleVector
         return tuple_array_global!(img, x, l)
+    elseif any(R -> T === R, OPAQUE_RUNTIME_TYPES)
+        # an object the program holds but does not read (a CodeInstance kept in a build
+        # record): the header only, so that `===` and `typeof` work; a field read of it is
+        # reported by get_field
+        return opaque_object_global!(img, x)
     elseif any(R -> T === R, RUNTIME_TYPES)
         unsupported("serializing the runtime object ", x, " of type ", T)
     elseif T <: Ptr || T === Ptr
@@ -424,6 +474,7 @@ end
 function struct_global!(img::Image, @nospecialize(x), l::Layout)
     ts = types(img)
     T = typeof(x)
+    img.cgm.config.shell_first_mutables && ismutabletype(T) && return mutable_global!(img, x, l)
     push!(img.inprogress, x)
     back = Any[]
     init = Inst[Inst(:i32_const, typeid!(ts, T)), header_hash(img, x)]
@@ -446,7 +497,7 @@ function struct_global!(img::Image, @nospecialize(x), l::Layout)
     if !isempty(back)
         ismutabletype(T) || unsupported("a cycle of objects through the immutable ", T)
         for (wfield, v, FT) in back
-            push!(img.patches, (g, :struct, l.wtype, wfield, v, FT))
+            push!(img.patches, (g, :struct, l.wtype, wfield, v, FT, img.owner))
         end
     end
     return g
@@ -497,7 +548,7 @@ function memory_global!(img::Image, mem)
         end
     end
     for (i, v, FT) in back
-        push!(img.patches, (g, :array, ml.array, i * ml.stride, v, FT))
+        push!(img.patches, (g, :array, ml.array, i * ml.stride, v, FT, img.owner))
     end
     return obj
 end
@@ -663,7 +714,8 @@ function global_var!(img::Image, ref::GlobalRef)
     # (a binding imported into a module, maybe renamed, is the original's: one variable)
     ref = canonical_ref(img.cgm.world.world, ref)
     key = (ref.mod, ref.name)
-    haskey(img.vars, key) && return img.vars[key]
+    haskey(img.vars, key) && (note_reach!(img, key); return img.vars[key])
+    note_created!(img, key)
     T = Base.invoke_in_world(img.cgm.world.world, Core.get_binding_type, ref.mod, ref.name)
     ts = types(img)
     l = layout(ts, T)
@@ -719,28 +771,169 @@ large arrays): for WASI, the exported `_initialize` instead (`host.jl`).
 """
 function finish_image!(cgm::CGModule)
     img = cgm.image
-    for (g, kind, wtype, idx, v, FT) in img.patches
-        if kind === :struct
-            push!(img.init, Inst(:global_get, g))
-            append!(img.init, const_leaves(img, v, FT))
-            push!(img.init, Inst(:struct_set, wtype, idx))
-        else
-            push!(img.init, Inst(:global_get, g), Inst(:i32_const, idx))
-            append!(img.init, const_leaves(img, v, FT))
-            push!(img.init, Inst(:array_set, wtype))
-        end
-    end
-    empty!(img.patches)
-    isempty(img.init) && return
+    ts = types(img)
+    isempty(img.init) && isempty(img.patches) && !img.failed && return
     f = add_func!(cgm.mod, "jl_init_image", ValType[], ValType[])
     b = Builder(cgm.mod, f)
     for inst in img.init
         emit!(b, inst.op, inst.imm...)
     end
+    # field and element values set once every global exists (cycles, shells of mutable objects);
+    # serializing a value may add patches of its own to the end
+    i = 0
+    while i < length(img.patches)
+        i += 1
+        g, kind, wtype, idx, v, FT = img.patches[i]
+        kind === :failed && continue
+        if kind === :struct || kind === :struct_insts
+            leaves = kind === :struct_insts ? v : const_leaves(img, v, FT)
+            lf = layout(ts, FT)
+            if lf.kind === Boxed || length(lf.leaves) == 1
+                emit!(b, :global_get, g)
+                for inst in leaves; emit!(b, inst.op, inst.imm...); end
+                emit!(b, :struct_set, wtype, idx)
+            else
+                # an inline value of several leaves: through locals, one struct.set per leaf
+                locals = [add_local!(f, leaf.type) for leaf in lf.leaves]
+                for inst in leaves; emit!(b, inst.op, inst.imm...); end
+                for k in length(locals):-1:1; emit!(b, :local_set, locals[k]); end
+                for k in 1:length(locals)
+                    emit!(b, :global_get, g)
+                    emit!(b, :local_get, locals[k])
+                    emit!(b, :struct_set, wtype, idx + k - 1)
+                end
+            end
+        else
+            emit!(b, :global_get, g)
+            emit!(b, :i32_const, idx)
+            for inst in (kind === :array_insts ? v : const_leaves(img, v, FT)); emit!(b, inst.op, inst.imm...); end
+            emit!(b, :array_set, wtype)
+        end
+    end
+    empty!(img.patches)
+    img.failed && unreachable!(b)
     finish!(b)
     if cgm.config.host === :wasi
         add_export!(cgm.mod, "_initialize", f)
     else
         cgm.mod.start = f
     end
+end
+
+# With `Config(shell_first_mutables = true)` a mutable object exists before its fields: its global
+# holds a shell (header and default fields), so that any object reached from its fields may refer
+# back to it, and the start function sets its fields.
+function mutable_global!(img::Image, @nospecialize(x), l::Layout)
+    ts = types(img)
+    T = typeof(x)
+    init = Inst[Inst(:i32_const, typeid!(ts, T)), header_hash(img, x)]
+    for i in 1:fieldcount(T)
+        append!(init, Inst[default_inst(leaf.type) for leaf in field_leaves(ts, fieldtype(T, i))])
+    end
+    push!(init, Inst(:struct_new, l.wtype))
+    g = add_global!(img.cgm.mod, global_name(img, x), RefType(l.wtype, false), false, init)
+    img.globals[x] = g
+    for i in 1:fieldcount(T)
+        isdefined(x, i) || continue
+        FT = fieldtype(T, i)
+        isempty(field_leaves(ts, FT)) && continue
+        v = getfield(x, i)
+        if (T, fieldname(T, i)) in img.cgm.config.image_pointer_fields
+            # (an allowlisted pointer keeps its address, as when the object is serialized whole)
+            push!(img.patches, (g, :struct_insts, l.wtype, first(l.fields[i]) - 1,
+                                const_leaves(img, v, FT; raw_pointer=true), FT, img.owner))
+        else
+            push!(img.patches, (g, :struct, l.wtype, first(l.fields[i]) - 1, v, FT, img.owner))
+        end
+    end
+    return g
+end
+
+"""
+    prepare_image_patches!(cgm) -> Bool
+
+Serialize the values of the image's pending field and element patches into instructions now,
+while functions and types can still be added: an object reached only through a patch may need a
+function or a type id (and its objectid case) of its own. Returns whether any patch was prepared.
+Patches the serialization adds are prepared too.
+"""
+# `f()` with `owner` as the function that the values deferred meanwhile are attributed to
+function with_image_owner(f, img::Image, @nospecialize(owner))
+    prev = img.owner
+    img.owner = owner
+    try
+        return f()
+    finally
+        img.owner = prev
+    end
+end
+
+function prepare_image_patches!(cgm::CGModule)
+    img = cgm.image
+    prepared = false
+    i = 0
+    while i < length(img.patches)
+        i += 1
+        p = img.patches[i]
+        g, kind, wtype, idx, v, FT = p
+        (kind === :struct || kind === :array) || continue
+        owner = length(p) >= 7 ? p[7] : nothing
+        leaves = try
+            with_image_owner(() -> const_leaves(img, v, FT), img, owner)
+        catch err
+            err isa Unsupported || rethrow()
+            deferred_value_failed!(cgm, err, owner, FT)
+            nothing
+        end
+        img.patches[i] = leaves === nothing ? (g, :failed, wtype, idx, nothing, FT) :
+                         (g, kind === :struct ? :struct_insts : :array_insts, wtype, idx, leaves, FT)
+        prepared = true
+    end
+    return prepared
+end
+
+# A deferred value that cannot be serialized is an unsupported construct of the function that reached
+# its object, as a statement's is (a diagnostic, and the function traps), and the start function
+# traps: the object may be shared. A failure of an optional function (an objectid case) traps that
+# function only, as its statements' do, and fails the functions that reached its objects.
+function deferred_value_failed!(cgm::CGModule, err::Unsupported, @nospecialize(owner), @nospecialize(FT))
+    push!(err.context, string("the value of a field of declared type ", FT, ", set by the start function"))
+    fail_owner!(cgm, err, owner)
+    return nothing
+end
+
+function fail_owner!(cgm::CGModule, err::Unsupported, @nospecialize(owner))
+    img = cgm.image
+    owner === nothing && throw(err)
+    owner in img.failed_owners && return
+    trap_function!(cgm, owner)
+    push!(img.failed_owners, owner)
+    owner in img.optional && push!(get!(() -> Any[], img.suppressed, owner), owner.mi => err)
+    if !(owner in img.optional)
+        push!(err.context, owner.mi)
+        push!(cgm.diagnostics, owner.mi => err)
+        img.failed = true
+    end
+    for d in get(img.dependents, owner, Any[])
+        fail_owner!(cgm, err, d)
+    end
+end
+
+function trap_function!(cgm::CGModule, info)
+    empty!(info.func.body)
+    empty!(info.func.locals)
+    b = Builder(cgm.mod, info.func)
+    unreachable!(b)
+    finish!(b)
+end
+
+# runtime objects serialized with their header only (modules are named objects, above)
+const OPAQUE_RUNTIME_TYPES = Any[Core.CodeInstance, Core.MethodInstance, Method]
+
+function opaque_object_global!(img::Image, @nospecialize(x))
+    ts = types(img)
+    init = Inst[Inst(:i32_const, typeid!(ts, typeof(x))), header_hash(img, x), Inst(:struct_new, ts.jlvalue)]
+    g = add_global!(img.cgm.mod, global_name(img, x), RefType(ts.jlvalue, false), false, init)
+    img.globals[x] = g
+    return g
 end
