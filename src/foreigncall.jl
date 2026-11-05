@@ -91,6 +91,10 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         iname = llvm_intrinsic_name(ex.args[1])
         iname === nothing || return emit_llvm_intrinsic!(fc, iname, args, typ)
     end
+    if name === nothing && !is_llvmcall(ex.args[5])
+        target = operand(fc, ex.args[1])
+        target isa CGVal && is_ptr_type(target.typ) && return emit_indirect_ccall!(fc, target, ex, args, typ)
+    end
     if name === :jl_alloc_genericmemory
         M = args[1]::CGVal
         isconstant(M) || unsupported("allocating a Memory of a type not known at compile time")

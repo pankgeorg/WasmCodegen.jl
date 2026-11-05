@@ -14,6 +14,8 @@
 @noinline throw_field_error(@nospecialize(T), s::Symbol) = throw(FieldError(T::DataType, s))
 @noinline throw_rethrow_error() = error("rethrow() not allowed outside a catch block")
 @noinline throw_rethrow_other_error() = error("rethrow(exc) not allowed outside a catch block")
+@noinline throw_not_cfunction() = error("a ccall through a pointer that is not a cfunction of the call's signature")
+@noinline throw_not_c_ref() = throw(ArgumentError("a cfunction's Ref argument that is not a pointer to a Ref of its type"))
 @noinline throw_concurrency_error(msg::String) = throw(ConcurrencyViolationError(msg))
 # a Memory of `n` elements: negative, or larger than a Wasm array
 @noinline throw_memory_size_error(n::Int) = n < 0 ?

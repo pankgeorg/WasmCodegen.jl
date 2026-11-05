@@ -360,6 +360,23 @@ A helper's body is the operation's inline emission, run in the helper's own cont
 there is one implementation; Binaryen inlines the helpers where it pays, and keeps others
 shared (10% smaller modules for the parser).
 
+**C function pointers** (`cfunctions.jl`). A closed world knows every `cfunction` it can make,
+so the module has a table of them, as a C program compiled to Wasm has (an array of function
+references: WasmBuilder has no tables, and the task runners are kept the same way). A
+`cfunction`'s pointer has no owner and its address is a slot of the table, so it survives a
+round trip through an integer; `ccall` through a pointer reads the slot, checks the function's
+Wasm type and calls it. Every C pointer (`Ptr`, `Ref`, `Any`, a type stored by reference) has
+one Wasm form in a signature, argument or result, an address and an object, because the two
+sides declare them differently; a result declared `Ref{S}` is the object of its `S`. Unsupported: a `cfunction` of a closure value (`$f`), of a function not known at
+compile time, or of abstract types; `Ref{T}` of an abstract `T`; a function whose result is not
+the declared one; variadic calls; a call through a constant pointer, or of a signature no
+`cfunction` of the module has. They are reported when the module is compiled. A pointer that
+is not a `cfunction` of its call's signature is a run-time error. Natively, two `@cfunction`s
+of one function at different call sites may differ; here they are one pointer. The pointers
+are the module's own (no interoperation with a host's or another module's functions), and the
+image holds none: a `cfunction`'s pointer in a value built at compile time is reported, as other
+pointers of the build process are.
+
 ## 8. The runtime
 
 - **Runtime functions** (`src/runtime/`, module `WasmCodegen.Runtime`): Julia code the

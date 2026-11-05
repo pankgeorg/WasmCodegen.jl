@@ -1,4 +1,5 @@
 [deps]
+FunctionWrappers = "069b7b12-0de2-55c6-9aab-29f3d0a68a2e"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
@@ -12,6 +13,7 @@ WasmBuilder = "c3e9a8f2-6b1d-4f7a-8e25-1a9d3b7c4e60"
 WasmCodegen = "5b0f1d7e-3c2a-4e8b-9a61-7d2f4c8e1a93"
 
 [sources]
+FunctionWrappers = {rev = "d794dfc384a8fcfacbbd20883ea40ddc688e5f6d", url = "https://github.com/pankgeorg/FunctionWrappers.jl"}
 IRStructurizer = {rev = "a6a7b5ba7c5b6ad7af72daba6b7888676fb11b25", url = "https://github.com/maleadt/IRStructurizer.jl"}
 WasmBuilder = {rev = "main", url = "https://github.com/gbaraldi/WasmBuilder.jl"}
 WasmCodegen = {path = ".."}
