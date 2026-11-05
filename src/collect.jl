@@ -321,6 +321,20 @@ function compiled_instances(codeinfos::Vector{Any}, entries::Vector{Core.MethodI
     return compiled, IdSet{Core.MethodInstance}(mi for mi in native if !(mi in compiled))
 end
 
+# whether the error is an "unresolved finalizer registered" whose finalizer the module's
+# inference did compile: the verifier looks finalizers up among native code instances only
+# (`get_verify_typeinf_trim`'s `caches`), and `verify_inference`'s are the module's own
+function finalizer_compiled(d, code::IdDict{Core.MethodInstance,Core.CodeInstance})
+    d.desc == "unresolved finalizer registered" || return false
+    stmt = d.codeinfo.code[d.stmtidx]
+    Meta.isexpr(stmt, :(=)) && (stmt = stmt.args[2])
+    (Meta.isexpr(stmt, :call) && 3 <= length(stmt.args) <= 5) || return false
+    atype = CC.argtypes_to_type(Any[CC.argextype(stmt.args[2], d.codeinfo, d.sptypes),
+                                    CC.argextype(stmt.args[3], d.codeinfo, d.sptypes)])
+    mi = CC.compileable_specialization_for_call(WasmInterpreter(; world=Base.get_world_counter()), atype)
+    return mi !== nothing && haskey(code, mi)
+end
+
 """
     verify_trim(io, codeinfos, entries, replacement, onlywarn)
 
@@ -341,9 +355,11 @@ function verify_trim(io::IO, codeinfos::Vector{Any}, entries::Vector{Core.Method
     TV = CC.TrimVerifier
     errors, parents = TV.get_verify_typeinf_trim(codeinfos)
     compiled, native_only = compiled_instances(codeinfos, entries, replacement)
+    code = linkable_code(codeinfos)
     filter!(errors) do e
         d = e.second
         d isa TV.CallMissing || return true
+        finalizer_compiled(d, code) && return false
         mi = CC.get_ci_mi(d.codeinst)
         return !(mi in native_only ||
                  ((only_if_reached(mi) || compile_time_instance(mi) || replacement(mi) !== nothing) &&
