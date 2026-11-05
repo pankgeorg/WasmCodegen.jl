@@ -88,7 +88,17 @@ function made_symbol_keys(n::Int)
     return (length(d), d[:k3], objectid(Symbol("k", 5)) == objectid(:k5))
 end
 
+# a Dict of pairs of different types (trim/wasm-dicts.jl), as TOML and package metadata are built
+function dict_mixed_pairs(i::Int)
+    d = Dict{String,Any}("a" => i, "b" => "x", "c" => [1.5, 2.5], "d" => nothing, "e" => i => 2i)
+    e = Dict{String,Union{Int,String}}("n" => i, "s" => string(i))
+    return (length(d), d["a"]::Int, hash(d["b"]::String), sum(d["c"]::Vector{Float64}), d["d"] === nothing,
+            (d["e"]::Pair{Int,Int}).second, e["n"]::Int, hash(e["s"]::String), collect(keys(d)) == collect(keys(Dict{String,Any}(
+            "a" => 1, "b" => 2, "c" => 3, "d" => 4, "e" => 5))))
+end
+
 @testset "dictionaries" begin
+    @wtest dict_mixed_pairs(7)
     @wtest dict_int(50)
     @wtest dict_growth(300)
     @wtest dict_string(3)
