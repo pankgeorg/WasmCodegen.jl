@@ -93,7 +93,7 @@ end
 
 "The structured IR of `mi` in the module's exception mode: from the session's cache with `ir_cache`."
 function structured_ir(cgm::CGModule, mi::Core.MethodInstance)
-    cgm.config.ir_cache || return structurize_prepared(cgm, mi)
+    cgm.config.ir_cache || return structurize_timed(cgm, mi)
     key = (first(cgm.world.sources[mi]), cgm.exceptions)
     sci = @lock IR_CACHE_LOCK begin
         sci = get(IR_CACHE, key, nothing)
@@ -103,7 +103,7 @@ function structured_ir(cgm::CGModule, mi::Core.MethodInstance)
     sci === nothing || return sci
     # structurized outside the lock: compilations missing the same function at once each do it
     t = time_ns()
-    sci = structurize_prepared(cgm, mi)
+    sci = structurize_timed(cgm, mi)
     @lock IR_CACHE_LOCK begin
         IR_CACHE_STATS.misses += 1
         IR_CACHE_STATS.miss_ns += time_ns() - t
@@ -122,6 +122,16 @@ function structurize_or_unsupported(ir::CC.IRCode)
     catch err
         err isa Unsupported && rethrow()
         unsupported("structurizing the IR: ", limited_sprint(showerror, err))
+    end
+end
+
+function structurize_timed(cgm::CGModule, mi::Core.MethodInstance)
+    cgm.config.progress || return structurize_prepared(cgm, mi)
+    t = time_ns()
+    try
+        return structurize_prepared(cgm, mi)
+    finally
+        cgm.structurize_ns += time_ns() - t
     end
 end
 

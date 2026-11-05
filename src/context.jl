@@ -54,6 +54,10 @@ Base.@kwdef struct Config
     behind a model-independent interface. Emission only reads the structured IR, so it is reused
     as it is. See `ir_cache_stats`, `empty_ir_cache!`."
     ir_cache::Bool = false
+    "A line on stderr at the end of each phase of the compilation (collecting the world, emitting
+    the functions, finishing the module, writing, validating and optimizing it), with what it
+    did and its elapsed time."
+    progress::Bool = false
     image_pointer_fields::Vector{Tuple{Any,Symbol}} = Tuple{Any,Symbol}[]
     extra_patches::Vector{String} = String[]
     patch_bindings::Vector{Pair{Symbol,Any}} = Pair{Symbol,Any}[]
@@ -101,6 +105,8 @@ mutable struct CGModule
     start::Vector{Inst}
     "How the program uses exceptions (`:none`, `:control`, `:values`: see `exceptions.jl`)."
     exceptions::Symbol
+    "Time spent structurizing the IR of the functions emitted (ns), with `config.progress`."
+    structurize_ns::UInt64
 end
 
 function CGModule(world::ClosedWorld, config::Config, exceptions::Symbol=exception_mode(world))
@@ -108,7 +114,7 @@ function CGModule(world::ClosedWorld, config::Config, exceptions::Symbol=excepti
     types = Types(m)
     cgm = CGModule(world, m, types, config, IdDict{Core.MethodInstance,FuncInfo}(),
                    FuncInfo[], nothing, Dict{Any,Any}(), Pair{Core.MethodInstance,Unsupported}[],
-                   Inst[], exceptions)
+                   Inst[], exceptions, UInt64(0))
     cgm.image = Image(cgm)
     return cgm
 end
