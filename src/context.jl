@@ -19,6 +19,12 @@ The configuration of the code generator:
   of the import module `julia`, which `js/julia.mjs` provides; `:wasi`, WASI preview 1
   (`wasi_snapshot_preview1`), for WASI runtimes (wasmtime, Node's `node:wasi`) and for
   JavaScript through `js/julia.mjs`;
+- `import_libraries`: libraries whose functions the host provides, declared by the program
+  (`host = :wasi` only): a `ccall((:name, "lib"), RT, (ArgT...), args...)` of one is a call
+  of the Wasm import `lib.name`, with 32- and 64-bit integer arguments and result (or `Cvoid`
+  for none). The code generator neither specifies nor provides these functions: they are the
+  program's interface with a host of its own. The names WasmCodegen uses for its own
+  imports (`wasi_snapshot_preview1`, `julia` and `julia_*`) cannot be declared;
 - `image_pointer_fields`: the `(type, field name)`s whose pointers of the build process
   (addresses without an owner) the image may hold as they are; any other non-null one is an
   unsupported construct;
@@ -55,6 +61,7 @@ Base.@kwdef struct Config
     patch_bindings::Vector{Pair{Symbol,Any}} = Pair{Symbol,Any}[]
     abi_version::Union{Nothing,Pair{String,Int32}} = nothing
     pre_image_hooks::Vector{Any} = Any[]
+    import_libraries::Vector{String} = String[]
 end
 
 """

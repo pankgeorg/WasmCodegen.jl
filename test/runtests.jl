@@ -25,6 +25,7 @@ WasmCodegen.with_trim_patches() do _, _
     include("regressions.jl")
     include("ir_cache.jl")
     include("hosts.jl")
+    include("import_libraries.jl")
     include("ptrbytes.jl")
     include("typeof_any.jl")
     include("invoke_cycle.jl")
