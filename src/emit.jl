@@ -82,6 +82,7 @@ function emit_function!(cgm::CGModule, info::FuncInfo)
     collect_ssatypes!(fc.ssatypes, sci.entry)
     analyze_uses!(fc, sci.entry)
     analyze_ptr_carries!(fc, sci.entry)
+    analyze_split_unions!(fc, sci.entry)
     bind_arguments!(fc)
     bind_handler_args!(fc, sci.entry)
     emit_block!(fc, sci.entry)
@@ -237,7 +238,7 @@ function emit_block!(fc::FnCtx, block)
         elseif stmt isa Core.UpsilonNode
             emit_upsilon!(fc, idx, stmt)
         else
-            res = emit_stmt_or_trap!(fc, stmt, typ)
+            res = emit_stmt_or_trap!(fc, stmt, typ, idx)
             if res !== nothing
                 if res isa CGVal && res.kind !== Bottom && typ !== Union{}
                     res = try
@@ -333,7 +334,7 @@ end
 # A statement; where it cannot be compiled, a trap, and the error is recorded: with
 # `trim = :safe` the compilation fails at the end with every such error (as juliac's
 # verifier reports them all), with `trim = :unsafe` the trap stays.
-function emit_stmt_or_trap!(fc::FnCtx, @nospecialize(stmt), @nospecialize(typ))
+function emit_stmt_or_trap!(fc::FnCtx, @nospecialize(stmt), @nospecialize(typ), idx::Int)
     # (a statement that fails leaves no partial code: its instructions are dropped)
     mark = length(fc.b.func.body)
     stack = copy(fc.b.stack)
@@ -341,6 +342,7 @@ function emit_stmt_or_trap!(fc::FnCtx, @nospecialize(stmt), @nospecialize(typ))
     inits = copy(fc.b.inits)
     depth = fc.depth
     try
+        idx in fc.uses.splitunions && return emit_split_field!(fc, stmt, typ)
         return emit_stmt!(fc, stmt, typ)
     catch err
         err isa Unsupported || rethrow()
@@ -477,9 +479,11 @@ struct Uses
     projections::Dict{Tuple{Int,Int},Vector{Int}}
     "The pointer loop carries that keep the origin of their initial value (`analyze_ptr_carries!`)."
     ptrcarries::Set{Int}
+    "The fields at run-time indices that are split unions (`analyze_split_unions!`)."
+    splitunions::Set{Int}
 end
 Uses() = Uses(Dict{Int,Int}(), Dict{Int,Tuple{Any,Int}}(), Dict{Int,Any}(), Dict{Tuple{Int,Int},Vector{Int}}(),
-              Set{Int}())
+              Set{Int}(), Set{Int}())
 
 """
     analyze_uses!(fc, block)
@@ -521,6 +525,77 @@ function analyze_uses!(fc::FnCtx, block)
         else
             use!(x)
         end
+    end
+end
+
+const IR_NODES = Union{Core.PiNode,Core.UpsilonNode,Core.PhiNode,Core.PhiCNode,Core.ReturnNode,
+                       Core.GotoIfNot,Core.EnterNode}
+
+"""
+    analyze_split_unions!(fc, block)
+
+Find the fields at run-time indices, of a union of concrete types, that are only tested with
+`isa` against a type known at compile time that each member is or is not a subtype of, and
+narrowed, to a member or to a union of some of them that is itself only so used
+(`fc.uses.splitunions`): the union split of an element of a tuple of mixed types (`t[k]`).
+Such a field is a `SplitUnion`, no object (see `emit_split_field!`).
+"""
+function analyze_split_unions!(fc::FnCtx, block)
+    world = fc.cgm.world.world
+    resolve(@nospecialize(x)) = x isa QuoteNode ? Some{Any}(x.value) :
+        x isa GlobalRef ? const_global(world, x.mod, x.name) :
+        x isa Union{Core.SSAValue,Core.Argument,IRStructurizer.BlockArgument,Expr} ? nothing : Some{Any}(x)
+    iscall(st, f) = st isa Expr && st.head === :call && resolve(st.args[1]) == Some{Any}(f)
+    fields = Int[]
+    # every use of each value, and those a split union serves: `isa`s (by type) and narrowings
+    uses = Dict{Int,Int}()
+    isas = Dict{Int,Vector{Any}}()
+    narrowed = Dict{Int,Vector{Int}}()
+    function count!(@nospecialize(x))
+        if x isa Core.SSAValue
+            uses[x.id] = get(uses, x.id, 0) + 1
+        elseif x isa IRStructurizer.Block
+            scan!(x)
+        elseif x isa Expr || x isa AbstractVector || x isa Tuple
+            foreach(count!, x isa Expr ? x.args : x)
+        elseif x isa IR_NODES || parentmodule(typeof(x)) === IRStructurizer
+            for i in 1:nfields(x)
+                isdefined(x, i) && count!(getfield(x, i))
+            end
+        end
+    end
+    function scan!(b)
+        for inst in IRStructurizer.instructions(b)
+            st = inst[:stmt]
+            count!(st)
+            if iscall(st, Core.getfield) && length(st.args) in (3, 4) && resolve(st.args[3]) === nothing
+                push!(fields, inst.ssa_idx)
+            elseif iscall(st, Core.isa) && length(st.args) == 3 && st.args[2] isa Core.SSAValue
+                S = resolve(st.args[3])
+                S !== nothing && something(S) isa Type &&
+                    push!(get!(Vector{Any}, isas, st.args[2].id), something(S))
+            elseif st isa Core.PiNode && st.val isa Core.SSAValue
+                push!(get!(Vector{Int}, narrowed, st.val.id), inst.ssa_idx)
+            end
+        end
+        b.terminator === nothing || count!(b.terminator)
+    end
+    scan!(block)
+    function splittable(id, ms)
+        ts, ps = get(isas, id, ()), get(narrowed, id, ())
+        length(ts) + length(ps) == get(uses, id, 0) > 0 || return false
+        all(T -> all(M -> M <: T || typeintersect(M, T) === Union{}, ms), ts) || return false
+        for p in ps
+            P = fc.ssatypes[p]
+            any(M -> M === P, ms) && continue
+            (P isa Union && all(Q -> any(M -> M === Q, ms), Base.uniontypes(P)) && splittable(p, ms)) || return false
+        end
+        return true
+    end
+    for id in fields
+        T = fc.ssatypes[id]
+        (T isa Union && all(isconcretetype, Base.uniontypes(T))) || continue
+        splittable(id, Base.uniontypes(T)) && push!(fc.uses.splitunions, id)
     end
 end
 
@@ -731,7 +806,7 @@ function emit_cfop!(fc::FnCtx, op::IRStructurizer.WhileOp, @nospecialize(typ))
             fc.opidx = inst.ssa_idx
             fc.ssavals[inst.ssa_idx] = emit_cfop!(fc, stmt, typ_i)
         else
-            res = emit_stmt_or_trap!(fc, stmt, typ_i)
+            res = emit_stmt_or_trap!(fc, stmt, typ_i, inst.ssa_idx)
             res isa CGVal && res.kind !== Bottom && typ_i !== Union{} &&
                 (res = convert_repr(fc, res, typ_i))
             res === nothing || (fc.ssavals[inst.ssa_idx] = res)
@@ -816,6 +891,11 @@ function emit_pi!(fc::FnCtx, v::CGVal, @nospecialize(T))
     assign!(fc, res, v)
     end!(fc.b)
     return res
+end
+
+function emit_pi!(fc::FnCtx, v::SplitUnion, @nospecialize(T))
+    m = findfirst(M -> M === T, v.members)
+    return m === nothing ? SplitUnion(T, v.members, v.tag, v.vals) : v.vals[m]
 end
 
 function emit_expr!(fc::FnCtx, ex::Expr, @nospecialize(typ))
