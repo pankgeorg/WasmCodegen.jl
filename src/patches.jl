@@ -18,7 +18,8 @@ const TRIM_PATCHES = [joinpath(@__DIR__, "trim", "juliac-trim-base.jl"),
                       joinpath(@__DIR__, "trim", "wasm-memory.jl"),
                       joinpath(@__DIR__, "trim", "wasm-versions.jl"),
                       joinpath(@__DIR__, "trim", "wasm-show.jl"),
-                      joinpath(@__DIR__, "trim", "wasm-print.jl")]
+                      joinpath(@__DIR__, "trim", "wasm-print.jl"),
+                      joinpath(@__DIR__, "trim", "wasm-dicts.jl")]
 
 # the constants the patches rebind (methods are restored by deleting their replacements)
 const PATCHED_CONSTS = [(Base, :invokelatest)]
