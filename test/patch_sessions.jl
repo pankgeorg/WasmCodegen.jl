@@ -114,6 +114,9 @@ through_invoke(x::Int) = invoke(invoked, Tuple{Number}, x)
 @inline kwreplaced(x::Int; k::Int = 1)::Int = helper(x) + k
 WasmCodegen.Runtime.@wasm_method kwreplaced(x::Int; k::Int = 1) = x + k
 through_kw(x::Int) = kwreplaced(x) * 2
+# a finalizer registered by Base (an IOStream's `close`): the verifier finds it among the
+# module's own code
+first_byte(path::String) = (io = open(path); try read(io, UInt8) finally close(io) end)
 end
 
 @testset "methods of WASM_METHODS and the verifier" begin
@@ -127,6 +130,7 @@ end
     @test_throws WasmCodegen.TrimFailure WasmCodegen.compile(T.through_invoke, (Int,); config=WasmCodegen.Config(verify=:error))
     c = WasmCodegen.compile(T.through_kw, (Int,); config=WasmCodegen.Config(verify=:error))
     @test wasm_run(c, "through_kw", 20; rettype=Int) == 42
+    @test WasmCodegen.trim_check([WasmCodegen.entry_instance(T.first_byte, (String,))]) isa String
 end
 
 # no method of `WASM_METHODS` is more `:consistent` than the native one it replaces: inference
