@@ -23,6 +23,12 @@ The configuration of the code generator:
   `:julia_io`, the host's events (`sleep` on its timers: `Runtime.Host`) and its file modes
   and symbolic links of any target for the filesystem (`js/julia_io.mjs`; waiting needs
   JavaScript Promise Integration);
+- `foreign_functions`: C functions the program implements in Julia, as `(name, library) => f`:
+  a `ccall((name, library), ...)` naming that library (a constant string) is a call of `f`
+  with the call's arguments as they are (pointers stay pointers), and `f` must return a value
+  of the call's return type. For the C libraries a Wasm module does not have, e.g. PCRE2's
+  functions (library `"libpcre2-8"`) for Base's `Regex`; the image holds a `Regex`'s
+  compiled pattern as null, so a `Regex` constant is compiled again by these functions;
 - `image_pointer_fields`: the `(type, field name)`s whose pointers of the build process
   (addresses without an owner) the image may hold as they are; any other non-null one is an
   unsupported construct;
@@ -60,6 +66,7 @@ Base.@kwdef struct Config
     abi_version::Union{Nothing,Pair{String,Int32}} = nothing
     pre_image_hooks::Vector{Any} = Any[]
     host_extensions::Vector{Symbol} = Symbol[]
+    foreign_functions::Vector{Pair{Tuple{Symbol,String},Any}} = Pair{Tuple{Symbol,String},Any}[]
     "`:none`: a program of one task (waits that need another task throw); `:jspi`: Julia
     Tasks, each on its own stack (JavaScript Promise Integration), for `host = :wasi` with
     the `:julia_io` extension: the host provides the `julia_task` imports (`js/julia_task.mjs`)."

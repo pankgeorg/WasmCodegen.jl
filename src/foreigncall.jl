@@ -34,6 +34,8 @@ function foreigncall_library(@nospecialize(x))
         nothing
     end
     lib isa QuoteNode && (lib = lib.value)
+    # (a constant naming it: `Base.PCRE.PCRE_LIB`)
+    lib isa GlobalRef && isconst(lib.mod, lib.name) && (lib = getglobal(lib.mod, lib.name))
     return lib isa String ? lib : nothing
 end
 
@@ -79,6 +81,37 @@ function emit_import_ccall!(fc::FnCtx, lib::String, name::Symbol, ex::Expr, args
     return RT === Cvoid ? ghost(Nothing, nothing) : pop_val!(fc, RT)
 end
 
+"The Julia function `Config(foreign_functions)` gives for `ccall((name, lib), ...)`, or nothing."
+function foreign_function(config::Config, name, lib)
+    (name === nothing || lib === nothing) && return nothing
+    for ((n, l), f) in config.foreign_functions
+        n === name && l == lib && return f
+    end
+    return nothing
+end
+
+"""
+    emit_foreign_function!(fc, f, name, lib, args, typ) -> CGVal
+
+`ccall((name, lib), ...)` of a C function the program implements (`Config(foreign_functions)`):
+a call of `f` with the arguments as they are, which must return the call's type `typ`.
+"""
+function emit_foreign_function!(fc::FnCtx, @nospecialize(f), name::Symbol, lib::String, args::Vector{Any},
+                                @nospecialize(typ))
+    res = emit_runtime_ccall!(fc, RuntimeCcall(f, fill(:val, length(args))), args, typ)
+    res.typ === typ || (typ === Nothing && res.kind === Ghost) ||
+        unsupported("the foreign function ", f, " for ", lib, ".", name, " returns ", res.typ,
+                    ", not the call's ", typ)
+    return res
+end
+
+"Check `Config(foreign_functions)`: each names a library."
+function check_foreign_functions(config::Config)
+    for ((name, lib), _) in config.foreign_functions
+        isempty(lib) && throw(ArgumentError("Config(foreign_functions): $name has an empty library name"))
+    end
+end
+
 function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     name = foreigncall_name(ex.args[1])
     nargs = length(ex.args[3]::Core.SimpleVector)
@@ -87,6 +120,8 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     if lib !== nothing && lib in IMPORT_LIBRARIES && name !== nothing
         return emit_import_ccall!(fc, lib, name, ex, args)
     end
+    f = foreign_function(fc.cgm.config, name, lib)
+    f === nothing || return emit_foreign_function!(fc, f, name::Symbol, lib::String, args, typ)
     if name === nothing && is_llvmcall(ex.args[5])
         iname = llvm_intrinsic_name(ex.args[1])
         iname === nothing || return emit_llvm_intrinsic!(fc, iname, args, typ)

@@ -59,6 +59,7 @@ end
 
 function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool, world::UInt)
     config.host in (:js, :wasi) || throw(ArgumentError("Config: host must be :js or :wasi, got $(repr(config.host))"))
+    check_foreign_functions(config)
     for e in entries
         config.host === :wasi && e.name in WASI_EXPORTS &&
             throw(ArgumentError("the entry point $(e.f) is exported as \"$(e.name)\", a name WASI reserves: give it another (`Entry(f, argtypes; name)`)"))
