@@ -80,10 +80,16 @@ const MAX_INVOKE_ROUNDS = 8
 """
     trim_check(entries; world, onlywarn=false, extensions=()) -> String
 
-Check the entry points as `juliac --trim=safe` does: native inference collects the code
-they run (`Compiler.typeinf_ext_toplevel`), and juliac's verifier checks it. Returns the
-verifier's report, and throws a [`TrimFailure`](@ref) if it found errors (unless
-`onlywarn`). This is the subset of Julia the code generator targets.
+Check the entry points as `juliac --trim=safe` does: inference collects the code they run, as
+`Compiler.typeinf_ext_toplevel` does, and juliac's verifier checks it. Returns the verifier's
+report, and throws a [`TrimFailure`](@ref) if it found errors (unless `onlywarn`). This is the
+subset of Julia the code generator targets.
+
+The inference is the module's own (`WasmInterpreter`, see `verify_inference`): a call that
+an overlay method table (`Runtime.WASM_METHODS`, an extension's) has a method for is
+inferred, and inlined, as that method, so the
+verifier checks the code the module compiles. (Native inference would inline the native body
+of such a method into its callers, where it can no longer be told apart from their own code.)
 
 An `:invoke` of a method instance without a code instance (one inferred only as part of a
 recursion cycle, or whose cached code the patches invalidated) is a static call, which the
@@ -95,10 +101,9 @@ types, stay unresolved invokes.)
 """
 function trim_check(entries::Vector{Core.MethodInstance}; world::UInt=Base.get_world_counter(),
                     onlywarn::Bool=false, extensions=())
-    args = VERSION >= v"1.13-" ? (CC.TRIM_UNSAFE, false) : (CC.TRIM_UNSAFE,)
     replacement = Replacements(world, extensions)
     roots = Any[entries...]
-    codeinfos = CC.typeinf_ext_toplevel(copy(roots), UInt[world], args...)
+    codeinfos = verify_inference(roots, world, extensions)
     for _ in 1:MAX_INVOKE_ROUNDS
         # (and the methods of the overlay method tables the module compiles in place of the
         # native ones called, verified as entries)
@@ -106,7 +111,7 @@ function trim_check(entries::Vector{Core.MethodInstance}; world::UInt=Base.get_w
                          [uncompiled_invoke_targets(codeinfos); replacement_targets(codeinfos, replacement)])
         isempty(targets) && break
         append!(roots, targets)
-        codeinfos = CC.typeinf_ext_toplevel(copy(roots), UInt[world], args...)
+        codeinfos = verify_inference(roots, world, extensions)
     end
     link_invoke_targets!(codeinfos)
     io = IOBuffer()
@@ -121,13 +126,34 @@ function trim_check(entries::Vector{Core.MethodInstance}; world::UInt=Base.get_w
     return String(take!(io))
 end
 
-# the code instances of `codeinfos` the verifier links invokes to, by method instance: native
-# ones valid in the current world, of the instance itself (`get_verify_typeinf_trim`'s)
+"""
+    verify_inference(roots, world, extensions=()) -> codeinfos
+
+The (CodeInstance, CodeInfo) pairs of the code `roots` run, as `Compiler.typeinf_ext_toplevel`
+collects them for juliac's verifier, inferred by the module's interpreter (`WasmInterpreter`):
+with the methods of the overlay method tables (of the host's extensions `extensions` and
+`Runtime.WASM_METHODS`) in place of the native ones they replace.
+"""
+function verify_inference(roots::Vector{Any}, world::UInt, extensions=())
+    interp = WasmInterpreter(; world, extensions)
+    codeinfos = Any[]
+    wq = CC.CompilationQueue(; interp)
+    ilq = CC.CompilationQueue(; interp)
+    append!(wq, roots)
+    CC.compile!(codeinfos, wq; invokelatest_queue=ilq, COMPILE_KWARGS...)
+    CC.compile!(codeinfos, ilq; invokelatest_queue=ilq, COMPILE_KWARGS...)
+    return codeinfos
+end
+
+# the code instances of `codeinfos` the verifier links invokes to, by method instance: those
+# (native, or the module's interpreter's) valid in the current world, of the instance itself
+# (`get_verify_typeinf_trim`'s)
 function linkable_code(codeinfos::Vector{Any})
     now = Base.get_world_counter()
     code = IdDict{Core.MethodInstance,Core.CodeInstance}()
     for item in codeinfos
-        item isa Core.CodeInstance && item.owner === nothing && item.min_world <= now <= item.max_world &&
+        item isa Core.CodeInstance && (item.owner === nothing || item.owner isa WasmCacheOwner) &&
+            item.min_world <= now <= item.max_world &&
             CC.get_ci_mi(item) === item.def && (code[item.def] = item)
     end
     return code
@@ -305,9 +331,10 @@ reach. (Natively, such a method may call the method before the patches with
 `Runtime.original`, which the verifier rejects.) A replaced method or `Runtime.original`
 reached otherwise (from an entry) is verified too.
 
-The calls are those of native inference: a replacement whose call native inference folds
-away or inlines is not verified (its dynamic calls are still unsupported constructs when the
-module is emitted).
+The calls are those of the module's inference (`verify_inference`), which already infers a
+call of a replaced method as its replacement, and inlines the replacement where it inlines:
+what is left of the bookkeeping below is for code that still reaches a native method a
+replacement replaces (as `Runtime.original` does).
 """
 function verify_trim(io::IO, codeinfos::Vector{Any}, entries::Vector{Core.MethodInstance},
                      replacement::Replacements, onlywarn::Bool)
