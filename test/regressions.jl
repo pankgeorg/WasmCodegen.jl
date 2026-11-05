@@ -112,7 +112,86 @@ rg_vt_field(n::Int) = (a = rg_id(Any[RGVt((n, "a"))])[1]; b = rg_id(Any[RG_VT])[
 rg_svd(x::Float64) = (s = svdvals([x 2x; 3x 4x]); (s[1] / x, s[2] / x, svdvals(fill(x, 1, 1))[1] / x))
 rg_eig(x::Float64) = (e = eigvals(Symmetric([2x x 0; x 3x x; 0 x 4x])); (e[1] / x, e[2] / x, e[3] / x))
 
+# closures capturing a variable inferred as a small Union: `apply_type` and `new` of a type
+# known only to be one of a few (as Pkg's registry and download functions have)
+@noinline rg_callit(g) = g()
+@noinline rg_pick(flag::Bool) = flag ? [1, 2, 3] : ["a", "b"]
+@noinline rg_maybe_str(n::Int) = n > 0 ? string("s", n) : nothing
+@noinline rg_maybe_tup(n::Int) = n > 0 ? (SubString("abcd", 1, n), Dict(1 => n)) : nothing
+function rg_closure_vec(flag::Bool)
+    v = rg_pick(flag)
+    return rg_callit(() -> length(v) * 10 + (v isa Vector{Int} ? 1 : 2))
+end
+function rg_closure_nothing(n::Int)
+    s = string("ab", "c"^max(n, 0))
+    m = rg_maybe_str(n)
+    k = n + 1
+    return rg_callit(() -> (m === nothing ? 0 : length(m)) + length(s) * k)
+end
+function rg_closure_tuple(n::Int)
+    t = rg_maybe_tup(n)
+    return rg_callit(() -> t === nothing ? -1 : length(t[1]) + t[2][1])
+end
+# a `new` of one of a few types whose field is not correlated with the choice: a TypeError
+# where the field does not fit, as natively
+struct RGUnionBox{T}; x::T; end
+mutable struct RGMutableBox{T}; x::T; end
+@noinline rg_unionpick(flag::Bool) = flag ? 42 : 2.5
+@generated function rg_unionfield(flag::Bool, pick::Bool)
+    newex = Expr(:new, :(flag ? RGUnionBox{Int} : RGUnionBox{Float64}), :x)
+    quote
+        x = rg_unionpick(pick)
+        b = $newex
+        b isa RGUnionBox{Int} ? (1, Float64(b.x)) : (2, b.x)
+    end
+end
+@generated rg_mutable(flag::Bool, x::Float64) =
+    Expr(:new, :(flag ? RGMutableBox{Int} : RGMutableBox{Float64}), :x)
+function rg_mutablefield(flag::Bool, x::Float64)
+    b = rg_mutable(flag, x)
+    return b isa RGMutableBox{Int} ? Float64(b.x) : b.x
+end
+# (caught, with a `finally`)
+function rg_catch_new(flag::Bool, pick::Bool)
+    cleaned = Ref(0)
+    r = try
+        try
+            rg_unionfield(flag, pick)[1]
+        finally
+            cleaned[] += 1
+        end
+    catch e
+        e isa TypeError ? (e.func === :new ? 10 : 20) + (e.expected === Int ? 1 : e.expected === Float64 ? 2 : 3) : 30
+    end
+    return (r, cleaned[])
+end
+function rg_catch_mutable(flag::Bool, x::Float64)
+    try
+        rg_mutablefield(flag, x)
+    catch e
+        e isa TypeError && e.func === :new && e.got === x ? -1.0 : -2.0
+    end
+end
 @testset "regressions" begin
+    @wtest rg_unionfield(true, true)
+    @wtest rg_unionfield(false, false)
+    @wtest rg_mutablefield(false, 2.5)
+    for flag in (true, false), pick in (true, false)
+        @wtest rg_catch_new(flag, pick)
+    end
+    @wtest rg_catch_mutable(true, 2.5)
+    @wtest rg_catch_mutable(false, 2.5)
+    # (a union of type objects other than `Type{T}`s is not split)
+    @test WasmCodegen.split_types(Union{DataType,UnionAll}) === nothing
+    @test WasmCodegen.split_types(Union{Type{Int},Type{Float64}}) == Any[Int, Float64] ||
+          WasmCodegen.split_types(Union{Type{Int},Type{Float64}}) == Any[Float64, Int]
+    for flag in (true, false)
+        @wtest rg_closure_vec(flag)
+    end
+    for n in (-1, 0, 3)
+        @wtest rg_closure_nothing(n)
+        @wtest rg_closure_tuple(n)
+    end
     for i in 1:5
         @wtest rg_typekeys(i)
     end
