@@ -220,3 +220,58 @@ handlers around it: the message is also written to `Core.stderr` before the erro
     Core.println(Core.stderr, msg)
     error(msg)
 end
+
+## `Core.apply_type` and `new` of types known only at run time (see `reflection.jl`)
+
+"""
+    new_as(C, x1, …, xn)
+
+`new(C, x1, …, xn)` of fields of any type, as `jl_new_structv` does natively: each field is
+checked (`TypeError(:new, "", fieldtype, value)`, the first that does not fit), then the
+object is built (as an `Any`). A case of `new` of a type known only at run time, compiled for
+each concrete type of the module it may be (`new_func!`).
+"""
+function new_as end
+
+# (the generated body: checks in field order, then `new` of the checked values)
+function new_as_body(@nospecialize(C), n::Int)
+    xs = [Symbol(:x, i) for i in 1:n]
+    body = Expr(:block)
+    for i in 1:n
+        FT = fieldtype(C, i)
+        push!(body.args, :($(xs[i]) isa $FT || throw(TypeError(:new, "", $FT, $(xs[i])))))
+    end
+    push!(body.args, :(return Ref{Any}($(Expr(:new, C, (:($(xs[i])::$(fieldtype(C, i))) for i in 1:n)...)))[]))
+    return body
+end
+
+"The most fields `new` of a type known only at run time is compiled for."
+const MAX_NEW_FIELDS = 16
+for n in 0:MAX_NEW_FIELDS
+    xs = [Symbol(:x, i) for i in 1:n]
+    @eval @generated function new_as(::Type{C}, $(xs...)) where {C}
+        return new_as_body(C, $n)
+    end
+end
+
+"""
+The error of `new(T, …)` of a type known only at run time that is not a concrete type of the
+module with that many fields: natively the `TypeError` of a type that is not a concrete
+`DataType` (and the same for a type the module does not have, which no value of it can need).
+"""
+@noinline throw_new_not_concrete(@nospecialize(T)) = throw(TypeError(:new, "", DataType, T))
+
+"""
+The error of `Core.apply_type(W, …)` whose result is not one of the module's types (`msg`
+names `W`): types are not made at run time. (Natively also the error of an application that
+is not valid, `Vector{3}`, which cannot be told apart here.)
+"""
+# (`apply_type` does not throw for inference, which may have removed the handlers around it:
+# the message is also written to `Core.stderr`, as `throw_typeof_unknown`'s)
+@noinline function throw_apply_type_unknown(msg::String)
+    Core.println(Core.stderr, "WasmCodegen: ", msg)
+    error(msg)
+end
+
+"The error of `new(T, …)` of a concrete type `T` with a number of fields it cannot have."
+@noinline throw_invalid_struct_allocation() = error("invalid struct allocation")

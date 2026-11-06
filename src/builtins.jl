@@ -399,7 +399,7 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
     elseif f === Core.apply_type
         all(a -> a isa CGVal && isconstant(a), args) &&
             return const_value(fc, Core.apply_type(map(constant_value, args)...))
-        unsupported("apply_type of types not known at compile time")
+        return emit_apply_type!(fc, args, typ)
     end
     unsupported("the builtin ", f)
 end
