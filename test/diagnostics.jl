@@ -4,8 +4,8 @@ module BoundedDiagnostics
 struct W{A,B} end
 nest(T, k) = k == 0 ? T : (S = nest(T, k - 1); W{S,S})
 big() = nest(Int, 18)   # printed in full: 2.6 MB (no const binding: not printed as an alias)
-const SINK = Ref{Any}(1)
-apply_dynamic(x) = W{typeof(x), SINK[]}
+const WRAP = Ref{Any}(W)   # a wrapper not known at compile time: `apply_type` stays unsupported
+apply_dynamic(x) = WRAP[]{typeof(x), 1}
 id(x) = x
 wherearg(x::T) where T = x
 loop(n::Int) = (s = 0; for k in 1:n; s += k; end; s)
