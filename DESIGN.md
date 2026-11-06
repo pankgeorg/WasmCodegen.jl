@@ -445,7 +445,17 @@ pointers of the build process are.
   compared (`===`) and hashed (`objectid`, not the native one) by its elements, and tested
   by them for tuple types; `typeof` of it is `Tuple`. These cases are compiled until
   they, and the values of the type maps, add no types, and the tables are built after
-  them and the image. Printing a type (juliac's `show`,
+  them and the image. `Core.apply_type` and `new` of types known only at run time
+  (a closure capturing a variable of a small union is `new(apply_type(#f, typeof(v)), v)`)
+  are the builtins at run time, as natively (`jl_f_apply_type`, `jl_new_structv`), over the
+  module's types: `apply_type(W, ps...)` calls `jl_apply_type_<W>`, the instantiations of
+  `W` the module has (the closed world's cache of them), found by their parameters (type
+  objects by reference, other values with `jl_egal`); one the module does not have is an
+  error (written to `Core.stderr` too: `apply_type` does not throw for inference).
+  `new(T, xs...)` calls `jl_new_<n>`, which goes by the type id of `T` to `Runtime.new_as`
+  compiled for each concrete type of the module some `new` site's `T` may be by inference
+  (`T` of type `DataType`, which would be every type, is not supported): it checks the
+  fields (`TypeError(:new, ...)`) and builds the object, as `jl_new_structv`. Printing a type (juliac's `show`,
   which reflects on it) is a foldable function returning its name as a Symbol, so that
   inference computes it for a type known at compile time (a `Union` or `UnionAll` is not
   a constant for inference: printing one at run time needs reflection, not supported).
