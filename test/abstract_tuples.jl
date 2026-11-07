@@ -114,6 +114,12 @@ struct AtUnnamed
     a::Int
 end
 @noinline unnamed(i::Int) = Base.inferencebarrier(AtUnnamed(i))
+# `isa` of a tuple type with free type variables: natively false (`<:` of the value's type),
+# also of a tuple whose concrete type the module does not have (an object of `Tuple`)
+# (the type a constant of the code, as inference leaves one: not a global's binding)
+@eval at_isa_free(i::Int) = let F = $(let T = TypeVar(:T); Tuple{T,T}; end)
+    ((pick(i), pick(i)) isa F, (unnamed(i), i) isa F, (pick(i),) isa Tuple{Any})
+end
 function at_unnamed_ok(i::Int)
     t, u = (unnamed(i), i), (unnamed(i), id(i))
     return (t[1] isa AtUnnamed, (t[1]::AtUnnamed).a, t === u, t[2] === u[2], objectid(t) == objectid(u))
@@ -134,6 +140,7 @@ at_unnamed_typeof(i::Int) = id(typeof(id((unnamed(i),)))) === Tuple{Int}
         @wtest at_string(i)
         @wtest at_error(i)
         @wtest at_unnamed_ok(i)
+        @wtest at_isa_free(i)
     end
     for i in 0:2
         @wtest at_bounds(i)

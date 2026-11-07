@@ -984,6 +984,9 @@ function emit_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
     ts = fc.cgm.types
     T isa UnionAll && (D = tuple_datatype(T)) !== nothing && (T = D)
     if lx.kind === Boxed && lx.elements !== nothing && S <: Tuple && T isa DataType && T <: Tuple
+        # (of a tuple type with free type variables, `Tuple{T,T}` of a `T` not bound: natively by
+        # `<:` of the value's type, false for every concrete type; as an object, by the module's)
+        Base.has_free_typevars(T) && return emit_isa!(fc, convert_repr(fc, x, Any), T)
         return tuple_array_isa!(fc, x, T)
     end
     if is_union_tuple(S)
@@ -1036,7 +1039,7 @@ function emit_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
     # subtypes (known when the module is complete)
     isa_types!() = (push_val!(fc, x); emit!(fc.b, :struct_get, ts.jlvalue, 0);
                     call!(fc.b, isa_predicate!(fc.cgm, T)); pop_val!(fc, Bool))
-    (T isa DataType && T <: Tuple && !(Tuple <: T)) || return isa_types!()
+    (T isa DataType && T <: Tuple && !(Tuple <: T) && !Base.has_free_typevars(T)) || return isa_types!()
     # (or, of a tuple type, a tuple whose concrete type the module does not have: an object of
     # `Tuple`, see `tuple_canon_func!`, of its elements)
     res = new_val!(fc, Bool)
