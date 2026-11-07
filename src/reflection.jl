@@ -747,10 +747,12 @@ tuple_from_func!(cgm::CGModule, @nospecialize(S)) = get!(cgm.helpers, (:tuple_fr
               ValType[l.leaves[1].type])
 end
 
-# the concrete tuple types of the module of the tuple type of unknown length `S`
+# the concrete tuple types of the module a value of the tuple type of unknown length `S` may
+# have: natively `Tuple{typeof(x)...}` of its elements, which may not be a subtype of `S` (of
+# an element `Int` of an `S` of `Type{<:Integer}`s, `Tuple{DataType}`)
 function tuple_case_types(ts::Types, @nospecialize(S))
     return [(id, C) for (id, C) in enumerate(ts.typelist)
-            if C isa DataType && C <: Tuple && isconcretetype(C) && C <: S && C !== S]
+            if C isa DataType && C <: Tuple && isconcretetype(C) && C !== S && typeintersect(C, S) !== Union{}]
 end
 
 # the cases of the tuple helpers (the number added)

@@ -61,17 +61,25 @@ function make_tuple(fc::FnCtx, @nospecialize(T), vals::Vector{CGVal})
     l.kind === Boxed && l.elements !== nothing && return new_tuple_array!(fc, T, vals)
     if !isconcretetype(T) && !is_inline_tuple(T)
         # the concrete tuple type of the values (of a constant, its type: a type object's kind)
-        T = Tuple{(isconstant(v) && !isconcretetype(v.typ) ? typeof(constant_value(v)) : v.typ for v in vals)...}
-        isconcretetype(T) || unsupported("a tuple of abstract type ", T)
+        S = Tuple{(isconstant(v) && !isconcretetype(v.typ) ? typeof(constant_value(v)) : v.typ for v in vals)...}
+        isconcretetype(S) && return emit_new!(fc, S, vals)
+        Base.has_free_typevars(S) && unsupported("a tuple of abstract type ", S)
+        # of values whose types are known only at run time: natively `jl_f_tuple` makes the
+        # tuple's type of theirs; here the module's concrete tuple type of them, found at run
+        # time as for any tuple of unknown length as an object (`tuple_canon_func!`), else an
+        # object of `Tuple` (`typeof` of it the closed world's error)
+        return convert_repr(fc, new_tuple_array!(fc, Tuple, vals), T)
     end
     return emit_new!(fc, T, vals)
 end
 
-"The elements of the tuple value `t`."
+"The elements of the tuple value `t` (of a tuple type of element types not concrete: by its type)."
 function tuple_elements(fc::FnCtx, t::CGVal)
     T = t.typ
-    (T isa DataType && T <: Tuple && isconcretetype(T)) ||
+    (T isa DataType && T <: Tuple && !Base.isvatuple(T) && !Base.has_free_typevars(T)) ||
         unsupported("the elements of a tuple of type ", T)
+    getfield_by_type(T) && return CGVal[get_field_any!(fc, t, i, fieldtype(T, i)) for i in 1:fieldcount(T)]
+    isconcretetype(T) || is_inline_tuple(T) || unsupported("the elements of a tuple of type ", T)
     return CGVal[get_field(fc, t, i) for i in 1:fieldcount(T)]
 end
 
