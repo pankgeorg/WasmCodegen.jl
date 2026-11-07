@@ -216,7 +216,8 @@ compile(f, argtypes::Tuple; kw...) = compile([Entry(f, argtypes)]; kw...)
 # the WebAssembly features the code generator uses, for Binaryen
 const WASM_FEATURES = `--enable-gc --enable-reference-types --enable-multivalue --enable-bulk-memory
                        --enable-nontrapping-float-to-int --enable-sign-ext
-                       --enable-exception-handling --enable-tail-call --enable-mutable-globals`
+                       --enable-exception-handling --enable-tail-call --enable-mutable-globals
+                       --enable-simd --enable-relaxed-simd`
 
 """
     wasm_opt(bytes, options) -> Vector{UInt8}

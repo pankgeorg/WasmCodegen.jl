@@ -154,6 +154,9 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     args = Any[operand(fc, a) for a in ex.args[6:5+nargs]]
     lib = foreigncall_library(ex.args[1])
     # (a function the program implements, before the host's of a library it declares)
+    if name isa Symbol && startswith(String(name), "wasm_simd_")
+        return emit_simd!(fc, String(name)[11:end], args, typ)   # SIMD128 (simd128.jl)
+    end
     f = foreign_function(fc.cgm.config, name, lib)
     f === nothing || return emit_foreign_function!(fc, f, name::Symbol, lib::String, ex, args, typ)
     if lib !== nothing && name !== nothing && (lib in IMPORT_LIBRARIES || lib in fc.cgm.config.import_libraries)
