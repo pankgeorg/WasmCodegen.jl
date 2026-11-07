@@ -123,7 +123,7 @@ function leb128(x::Integer)
     return out
 end
 
-# the SIMD instructions used (prefix 0xfd), added to WasmBuilder's table on first use: name =>
+# the SIMD instructions used (prefix 0xfd): name =>
 # (opcode, immediates, params, results). A lane index or shuffle lane (< 32) is a `u32`
 # immediate, whose LEB128 encoding is the one byte the format has.
 const SIMD_INSTRUCTIONS = Dict{Symbol,Tuple{Int,Tuple,Tuple,Tuple}}(
@@ -142,15 +142,18 @@ const SIMD_INSTRUCTIONS = Dict{Symbol,Tuple{Int,Tuple,Tuple,Tuple}}(
     :f32x4_relaxed_madd => (0x105, (), (V128, V128, V128), (V128,)),
     :f64x2_relaxed_madd => (0x107, (), (V128, V128, V128), (V128,)))
 
-# emit the SIMD instruction `name` with the immediates `imms`
-function simd!(fc::FnCtx, name::Symbol, imms...)
-    if !haskey(WasmBuilder.INSTRUCTIONS, name)
-        code, ik, params, results = SIMD_INSTRUCTIONS[name]
+# the SIMD instructions, added to WasmBuilder's table when WasmCodegen is loaded (`__init__`),
+# before any compilation (until WasmBuilder has them)
+function define_simd_instructions!()
+    for (name, (code, ik, params, results)) in SIMD_INSTRUCTIONS
+        haskey(WasmBuilder.INSTRUCTIONS, name) && continue
         WasmBuilder.definst!(name, UInt8[0xfd; leb128(code)], ik;
                              sig=(ValType[params...], ValType[results...]))
     end
-    emit!(fc.b, name, imms...)
 end
+
+# emit the SIMD instruction `name` with the immediates `imms`
+simd!(fc::FnCtx, name::Symbol, imms...) = emit!(fc.b, name, imms...)
 
 ## lowering
 

@@ -90,6 +90,75 @@ end
 end
 dot_d2(n::Int) = (x = [Float64(i) for i in 1:n]; y = [Float64(n - i) for i in 1:n]; GC.@preserve x y vdot(pointer(x), pointer(y), n))
 
+# control flow: definitions selected by a branch, nested merges, a loop that may run zero times,
+# try/catch with the vector updated before a throw
+function branchy(k::Int)
+    a = mkvec(D2, i -> k + i); b = mkvec(D2, i -> 2i - k)
+    v = isodd(k) ? S.add(a, b) : S.mul(a, b)
+    w = S.sub(v, a)
+    if k > 2
+        w = k > 4 ? S.muladd(w, b, a) : S.neg(w)
+    end
+    acc = S.splat(D2, 0.0)
+    for i in 1:k-3
+        acc = S.add(acc, w)
+    end
+    return lanes(S.add(acc, w))
+end
+function vtry(k::Int)
+    v = mkvec(F4, i -> i + k)
+    try
+        v = S.mul(v, v)
+        k > 2 && throw(DomainError(k))
+        v = S.add(v, v)
+    catch
+        v = S.sub(v, mkvec(F4, i -> 1))
+    end
+    return lanes(S.add(v, v))
+end
+# vectors through an immutable field, the elements of an array, a function that is not inlined
+struct Holder
+    v::D2
+    x::Float64
+end
+@noinline passvec(v::D2, w::D2) = S.mul(v, w)
+function through(k::Int)
+    a = S.add(mkvec(D2, i -> i), mkvec(D2, i -> k))
+    h = Holder(a, 1.0)
+    arr = [a, S.neg(a)]
+    r = passvec(h.v, arr[2])
+    return lanes(S.add(r, arr[1])), h.x
+end
+
+# floating-point edges, as bits (isequal does not tell NaNs apart): signed zeros, signed NaNs
+# with payloads, infinities, subnormals through neg, abs, shuffles and loads/stores
+ubits(v::NTuple{N,VecElement{T}}) where {N,T} = ntuple(i -> reinterpret(Base.uinttype(T), v[i].value), Val(N))
+const ODD_D = (-0.0, reinterpret(Float64, 0xfff8000000000123), Inf, 5.0e-324)
+const ODD_F = (-0.0f0, reinterpret(Float32, 0x7fc00123), -Inf32, 1.0f-45)
+@noinline function roundtrip!(p::Ptr{T}, ::Type{V}) where {T,V}
+    S.vstore(S.shuffle(S.vload(V, p), Val(ntuple(i -> fieldcount(V) - i, fieldcount(V)))), p)
+end
+function edges_d2(k::Int)
+    a = (VecElement(ODD_D[mod1(k, 4)]), VecElement(ODD_D[mod1(k + 1, 4)]))
+    x = [ODD_D...]
+    GC.@preserve x roundtrip!(pointer(x), D2)
+    s = S.add(a, (VecElement(-Inf), VecElement(5.0e-324)))
+    return ubits(S.neg(a)), ubits(S.abs(a)), ubits(S.shuffle(a, Val((1, 0)))),
+           ntuple(i -> reinterpret(UInt64, x[i]), 4), isnan.(lanes(s)), lanes(S.sqrt((VecElement(-1.0), VecElement(4.0))))[2]
+end
+function edges_f4(k::Int)
+    a = ntuple(i -> VecElement(ODD_F[mod1(i + k, 4)]), Val(4))
+    x = [ODD_F...]
+    GC.@preserve x roundtrip!(pointer(x), F4)
+    return ubits(S.neg(a)), ubits(S.abs(a)), ubits(S.shuffle(a, Val((3, 1, 2, 0)))), ntuple(i -> reinterpret(UInt32, x[i]), 4),
+           isnan(lanes(S.sqrt(mkvec(F4, i -> -i)))[1])
+end
+# a multiply-add whose fused and unfused results differ (either is a correct `muladd`)
+function madd_rounding(k::Int)
+    a = 1.0 + 2.0^-30; b = 1.0 - 2.0^-30
+    return lanes(S.muladd(S.splat(D2, a), S.splat(D2, b), S.splat(D2, -1.0 * k)))[1]
+end
+
 has_inst(f, op) = any(i -> i.op === op, (i for g in wcompile(f, (Int,)).cgm.mod.funcs for i in g.body))
 
 @testset "SIMD128" begin
@@ -116,7 +185,23 @@ has_inst(f, op) = any(i -> i.op === op, (i for g in wcompile(f, (Int,)).cgm.mod.
     @test has_inst(ops_d2, :f64x2_add) && has_inst(ops_d2, :f64x2_relaxed_madd)
     @test has_inst(ops_f4, :f32x4_mul) && has_inst(shuffles_f4, :i8x16_shuffle)
     @test has_inst(axpy_d2, :f64x2_relaxed_madd)
-    c = WasmCodegen.compile(axpy_d2, (Int,); config=test_config(relaxed_simd=false))
-    @test !any(i -> i.op === :f64x2_relaxed_madd, (i for g in c.cgm.mod.funcs for i in g.body))
-    @test wasm_run(c, "axpy_d2", 9; rettype=Float64) == axpy_d2(9)
+    for k in (1, 3, 4, 6)
+        @wtest branchy(k)
+        @wtest vtry(k)
+        @wtest through(k)
+    end
+    for k in 1:4
+        @wtest edges_d2(k)
+        @wtest edges_f4(k)
+    end
+    r = wasm_run(wcompile(madd_rounding, (Int,)), "madd_rounding", 1; rettype=Float64)
+    @test r == 0.0 || r == -2.0^-60
+    # without relaxed SIMD: a multiply and an add, for every shape, in the optimized module
+    relaxed(bytes) = any(i -> bytes[i] == 0xfd && bytes[i+2] == 0x02 && bytes[i+1] in (0x85, 0x87), 1:length(bytes)-2)
+    @test relaxed(wcompile(ops_d2, (Int,)).bytes) && relaxed(wcompile(ops_f4, (Int,)).bytes)
+    for (f, name) in ((ops_d2, "ops_d2"), (ops_f4, "ops_f4"), (ops_f2, "ops_f2"), (axpy_d2, "axpy_d2"))
+        c = WasmCodegen.compile(f, (Int,); config=test_config(relaxed_simd=false))
+        @test !relaxed(c.bytes)
+        @test isequal(wasm_run(c, name, 5; rettype=Base.return_types(f, (Int,))[1]), f(5))
+    end
 end
