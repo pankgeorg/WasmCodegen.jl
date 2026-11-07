@@ -1,7 +1,8 @@
 # Tuples of unknown length as fields (`Tuple{Vararg{Union{UInt64,String}}}`, a VersionNumber's
 # prerelease and build parts): `===` against `()`, comparison, isempty/length/iterate/getindex;
 # also in a module that limits inference to one method per call (`@max_methods 1`, as Pkg's
-# modules do).
+# modules do). Tuples of unknown length of singletons (`Tuple{Vararg{Nothing}}`, the `ntuple` of
+# `selectdim`'s indices), whose elements are not stored.
 
 module VarargTupleTests
 
@@ -49,7 +50,27 @@ function vn_maxmethods1(i::Int)
     return (MaxMethods1.same(v, VS[i]), p === (), length(p), v.build === (), MaxMethods1.npre(v))
 end
 
+# tuples of singletons of a run-time length (ntuple's ladder: up to 10 and beyond)
+struct Unit end
+ghost_len(n::Int) = length(ntuple(Returns(nothing), n))
+ghost_empty(n::Int) = ntuple(Returns(nothing), n) === ()
+ghost_elems(n::Int) = (t = ntuple(Returns(Unit()), n); c = 0; for x in t; c += x === Unit(); end; (c, t[end] === Unit()))
+ghost_colons(n::Int) = (t = ntuple(Returns(:), n); (length(t), isempty(t) || t[1] === (:)))
+# (selectdim's indices: `ntuple(Returns(:), d - 1)` for its BoundsError)
+vec_selectdim(n::Int, d::Int) = (y = collect(1.0:n); selectdim(y, d, 1) .*= 2; sum(y))
+
 @testset "tuples of unknown length" begin
+    @testset "of singletons" begin
+        for n in (0, 1, 3, 10, 11)
+            @wtest ghost_len(n)
+            @wtest ghost_empty(n)
+            @wtest ghost_colons(n)
+        end
+        for n in (1, 4, 12)
+            @wtest ghost_elems(n)
+        end
+        @wtest vec_selectdim(5, 1)
+    end
     for f in (vn_parts, vn_iter, vn_maxmethods1)
         @testset "$(nameof(f))" begin
             for i in 1:N
