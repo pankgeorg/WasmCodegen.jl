@@ -398,8 +398,10 @@ function load_bits!(fc::FnCtx, p::CGVal, byte, off::Int, n::Int, @nospecialize(P
         return acc
     end
     stg = P === nothing ? nothing : view_storage(P)
-    if stg !== nothing && storage_bytes(stg) == n && ptr_owner(p) isa Int
-        # an aligned whole element of the owner's typed view: one array.get, no call
+    typed = stg !== nothing && storage_bytes(stg) == n && ptr_owner(p) isa Int
+    if typed
+        # an aligned whole element of the owner's typed view: one array.get, no call; else
+        # as without a typed view (the byte view of an owner of bytes, then the helpers)
         arr, boff = typed_view_offset!(fc, p, b, off, stg)
         if!(fc.b)
         emit!(fc.b, :local_get, arr)
@@ -409,12 +411,6 @@ function load_bits!(fc::FnCtx, p::CGVal, byte, off::Int, n::Int, @nospecialize(P
         storage_to_bits!(fc.b, stg)
         emit!(fc.b, :local_set, acc)
         else!(fc.b)
-        emit!(fc.b, :local_get, b); off != 0 && (emit!(fc.b, :i64_const, off); emit!(fc.b, :i64_add))
-        push_leaf!(fc, ptr_owner(p))
-        call!(fc.b, ptr_byte_helper!(fc.cgm, n == 8 ? :load8 : :load4))
-        emit!(fc.b, :local_set, acc)
-        end!(fc.b)
-        return acc
     end
     view = byte_view!(fc, ptr_owner(p))
     if view !== nothing
@@ -452,6 +448,7 @@ function load_bits!(fc::FnCtx, p::CGVal, byte, off::Int, n::Int, @nospecialize(P
         call!(fc.b, ptr_byte_helper!(fc.cgm, n == 8 ? :load8 : :load4))
         emit!(fc.b, :local_set, acc)
         view === nothing || end!(fc.b)
+        typed && end!(fc.b)
         return acc
     end
     emit!(fc.b, :i64_const, 0); emit!(fc.b, :local_set, acc)
@@ -467,6 +464,7 @@ function load_bits!(fc::FnCtx, p::CGVal, byte, off::Int, n::Int, @nospecialize(P
         emit!(fc.b, :local_get, acc); emit!(fc.b, :i64_or); emit!(fc.b, :local_set, acc)
     end
     view === nothing || end!(fc.b)
+    typed && end!(fc.b)
     return acc
 end
 
@@ -1300,7 +1298,11 @@ function typed_view!(fc::FnCtx, owner::Int, stg)
         (new_local!(fc, jlvalue_ref(ts)), new_local!(fc, RefType(at, true)),
          new_local!(fc, I64), new_local!(fc, I64))
     end
-    cown == -1 && return (arr, base, len)
+    if cown < 0
+        # a pointer argument's view: made at function entry, once an access uses it
+        cown == -1 && (fc.typedviews[(owner, stg)] = (-2, arr, base, len))
+        return (arr, base, len)
+    end
     emit!(fc.b, :local_get, owner); emit!(fc.b, :local_get, cown); emit!(fc.b, :ref_eq)
     emit!(fc.b, :i32_eqz)
     if!(fc.b)
@@ -1364,9 +1366,10 @@ function finish_typed_view!(cgm::CGModule, f::Func, stg, owners)
 end
 
 # The typed views of the pointer arguments of the function (of `Ptr{Float64}`, `Ptr{Int32}`,
-# ...), made at its entry: an argument's owner local is never assigned, and pointers moved by
-# arithmetic keep it, so the view dominates every access through them and needs no check of
-# the owner.
+# ...): their locals now (marked -1: not used yet), their making at function entry once the
+# body is emitted, for the views an access used (marked -2; `entry_ptr_views!`). An argument's
+# owner local is never assigned, and pointers moved by arithmetic keep it, so a view made at
+# entry dominates every access through them and needs no check of the owner.
 function bind_ptr_views!(fc::FnCtx)
     ts = fc.cgm.types
     for a in fc.args
@@ -1376,10 +1379,17 @@ function bind_ptr_views!(fc::FnCtx)
         owner = a.leaves[2]
         owner isa Int || continue
         at = array_type!(ts, stg)
-        arr, base, len = new_local!(fc, RefType(at, true)), new_local!(fc, I64), new_local!(fc, I64)
-        emit!(fc.b, :local_get, owner)
-        call!(fc.b, ptr_byte_helper!(fc.cgm, (:view, stg)))
-        emit!(fc.b, :local_set, len); emit!(fc.b, :local_set, base); emit!(fc.b, :local_set, arr)
-        fc.typedviews[(owner, stg)] = (-1, arr, base, len)
+        fc.typedviews[(owner, stg)] = (-1, new_local!(fc, RefType(at, true)), new_local!(fc, I64), new_local!(fc, I64))
     end
+end
+
+# the making of the used views of pointer arguments, prepended to the function's body
+function entry_ptr_views!(fc::FnCtx)
+    insts = Inst[]
+    for ((owner, stg), (cown, arr, base, len)) in fc.typedviews
+        cown == -2 || continue
+        append!(insts, (Inst(:local_get, owner), Inst(:call, ptr_byte_helper!(fc.cgm, (:view, stg))),
+                        Inst(:local_set, len), Inst(:local_set, base), Inst(:local_set, arr)))
+    end
+    isempty(insts) || prepend!(fc.b.func.body, insts)
 end

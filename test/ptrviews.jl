@@ -89,6 +89,86 @@ string_f64(k::Int) = (s = repeat("01234567", k); GC.@preserve s sumf64(Ptr{Float
 @noinline maybe_load(p::Ptr{Float64}) = p == C_NULL ? -1.0 : unsafe_load(p)
 null_arg(n::Int) = maybe_load(Ptr{Float64}(UInt(0))) + n
 
+# views whose first access runs on one path only, refreshed on one path, in try/catch, with
+# several owners, two storages through one owner, a reassigned pointer argument
+mutable struct Two
+    p::Ptr{Float64}
+    q::Ptr{Float64}
+end
+@noinline function path_first(b::Two, k::Int)
+    p = k > 0 ? b.p : b.q
+    s = 0.0
+    if isodd(k)
+        s += unsafe_load(p, 1)           # the first access, on one arm only
+    else
+        unsafe_store!(p, 2.5, 2)
+    end
+    s += unsafe_load(p, 3)               # after the join
+    for i in 1:4
+        i == 2 && continue               # an iteration without access
+        s += unsafe_load(p, i)
+        isodd(i + k) && (p = b.q)        # the owner changes on one path
+    end
+    return s + unsafe_load(p, 4)
+end
+@noinline function in_try(b::Two, k::Int)
+    s = 0.0
+    p = b.p
+    try
+        s += unsafe_load(p, 1)
+        k > 2 && error("k")
+        p = b.q
+        s += unsafe_load(p, 2)
+    catch
+        p = b.q
+        s += 10 * unsafe_load(p, 3)
+    end
+    return s + unsafe_load(p, 1)
+end
+function paths(k::Int)
+    x = [1.0, 2.0, 3.0, 4.0]; y = [10.0, 20.0, 30.0, 40.0]
+    GC.@preserve x y begin
+        b = Two(pointer(x), pointer(y))
+        return path_first(b, k), in_try(b, k), sum(x), sum(y)
+    end
+end
+@noinline function rotate(ps::NTuple{3,Ptr{Float64}}, n::Int)
+    s = 0.0
+    for i in 1:n
+        p = ps[mod1(i, 3)]
+        s = 2s + unsafe_load(p, mod1(i, 4))
+        unsafe_store!(p, Float64(i), mod1(i + 1, 4))
+    end
+    return s
+end
+function three_owners(n::Int)
+    a = [1.0, 2.0, 3.0, 4.0]; b = [5.0, 6.0, 7.0, 8.0]; c = [9.0, 10.0, 11.0, 12.0]
+    GC.@preserve a b c (s = rotate((pointer(a), pointer(b), pointer(c)), n))
+    return s, sum(a), sum(b), sum(c)
+end
+@noinline function two_storages(p::Ptr{Float64}, n::Int)
+    q = Ptr{Int64}(p)                    # the same owner, another storage (no view: the helpers)
+    s = 0.0
+    for i in 1:n
+        s += unsafe_load(p, i) + (unsafe_load(q, i) % 1000)
+        unsafe_store!(q, reinterpret(Int64, Float64(i)), i)
+    end
+    return s
+end
+two_storage(n::Int) = (v = [0.5i for i in 1:n]; GC.@preserve v (two_storages(pointer(v), n), sum(v)))
+@noinline function reassigned(p::Ptr{Float64}, q::Ptr{Float64}, n::Int)
+    s = 0.0
+    for i in 1:n
+        s = 3s + unsafe_load(p, i)
+        p = q                            # a new value, not the argument's local
+    end
+    return s
+end
+reassign(n::Int) = (a = [1.0 * i for i in 1:n]; b = [-2.0 * i for i in 1:n]; GC.@preserve a b reassigned(pointer(a), pointer(b), n))
+# an argument never dereferenced: no view made for it
+@noinline passthru(p::Ptr{Float64}, n::Int) = p + 8n
+untouched(n::Int) = (v = zeros(4); GC.@preserve v Int(passthru(pointer(v), n) - pointer(v)))
+
 @testset "typed views" begin
     @wtest ev_f64(9)
     @wtest ev_f32(9)
@@ -101,8 +181,20 @@ null_arg(n::Int) = maybe_load(Ptr{Float64}(UInt(0))) + n
     @wtest other_storage(5)
     @wtest string_f64(3)
     @wtest null_arg(4)
-    # accesses through views, not helper calls only
-    fnames(f) = Set(g.name for g in wcompile(f, (Int,)).cgm.mod.funcs)
-    @test "jl_ptr_view_f64" in fnames(ev_f64)
-    @test "jl_ptr_view_i32" in fnames(ev_i32)
+    for k in (-2, -1, 1, 2, 3, 4)
+        @wtest paths(k)
+    end
+    @wtest three_owners(10)
+    @wtest two_storage(6)
+    @wtest reassign(5)
+    @wtest untouched(3)
+    # the accessing function's own code: inline array accesses through the view made at its
+    # entry; and no view for an argument that is never dereferenced
+    body(f, name) = [i for (mi, info) in wcompile(f, (Int,)).cgm.funcs if mi.def isa Method && mi.def.name === name
+                     for i in info.func.body]
+    calls(is) = Set(i.imm[1].name for i in is if i.op === :call)
+    b = body(ev_f64, :scale!)
+    @test any(i -> i.op === :array_get, b) && any(i -> i.op === :array_set, b) && "jl_ptr_view_f64" in calls(b)
+    @test "jl_ptr_view_i32" in calls(body(ev_i32, :scale!))
+    @test !("jl_ptr_view_f64" in calls(body(untouched, :passthru)))
 end

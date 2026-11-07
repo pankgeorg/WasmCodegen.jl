@@ -158,6 +158,7 @@ function emit_function!(cgm::CGModule, info::FuncInfo)
     bind_handler_args!(fc, sci.entry)
     emit_block!(fc, sci.entry)
     is_unreachable(b) || unreachable!(b)
+    entry_ptr_views!(fc)
     finish!(b)
     return info
 end
