@@ -658,11 +658,13 @@ end
 """
     ptr_byte_helper!(cgm, kind) -> Func
 
-`jl_ptr_load_byte(address, owner) -> i32` or `jl_ptr_store_byte(address, owner, byte)`:
-a byte of the memory a pointer without a static origin points into, found from its
-owner's kind at run time; or `jl_ptr_byte_view(owner) -> (array, base, len)`, the byte view
-of an owner (`byte_view!`). Their bodies are generated with the module's types
-(`finish_pointers!`).
+`jl_ptr_load_byte(address, owner) -> i32` or `jl_ptr_store_byte(address, owner, byte)`
+(`kind` `:load`, `:store`): a byte of the memory a pointer without a static origin points
+into, found from its owner's kind at run time; `jl_ptr_load_bits4/8(address, owner) -> i64` or
+`jl_ptr_store_bits4/8(address, owner, bits)` (`:load4`, `:load8`, `:store4`, `:store8`): 4 or 8
+bytes at once (see `finish_typed_ptr_helper!`); or `jl_ptr_byte_view(owner) -> (array, base,
+len)` (`:view`), the byte view of an owner (`byte_view!`). Their bodies are generated with the
+module's types (`finish_pointers!`).
 """
 function ptr_byte_helper!(cgm::CGModule, kind::Symbol)
     get!(cgm.helpers, (:ptr, kind)) do
@@ -1077,9 +1079,15 @@ function finish_pointers!(cgm::CGModule)
 end
 
 # the body of `jl_ptr_load_bits{n}(address, owner) -> i64` or
-# `jl_ptr_store_bits{n}(address, owner, bits)`: of an owner whose array elements are `n` bytes
-# (a memory of Float64, of Int32, ...; a leaf of a memory of ComplexF64, ...) at an offset
-# aligned to one, a single `array.get`/`array.set`; else byte by byte through the byte helpers
+# `jl_ptr_store_bits{n}(address, owner, bits)`, by the owner's type id:
+# - an owner whose array elements are stored in `n` bytes (a memory of Float64, of Int32, of
+#   ComplexF64, ...), at an offset aligned to one: a single `array.get`/`array.set`;
+# - an owner of bytes (a string, a symbol, a memory of bytes), the `n` bytes within its array:
+#   `n` byte accesses;
+# - a memory of inline structs whose leaves are stored with a stride, a leaf of `n` bytes at the
+#   offset: a single `array.get`/`array.set`;
+# - otherwise byte by byte through the byte helpers (misaligned, across elements or leaves,
+#   objects' fields, the NUL past a string's end, the traps of unaddressable owners).
 function finish_typed_ptr_helper!(cgm::CGModule, f::Func, kind::Symbol, owners, leafmems)
     n = kind in (:load8, :store8) ? 8 : 4
     load = kind in (:load8, :load4)
@@ -1121,15 +1129,66 @@ function finish_typed_ptr_helper!(cgm::CGModule, f::Func, kind::Symbol, owners, 
         return!(b)
         end!(b)
     end
+    # owners of bytes (strings, symbols, memories of bytes): the n bytes of their byte array,
+    # when within it (the NUL past a string's end, and the rest, below), with no calls
+    rem = add_local!(f, I64)
+    for ((st, at, stg), ids) in owners
+        stg === I8 || continue
+        a = get!(() -> add_local!(f, RefType(at, true)), arrays, at)
+        for (k, id) in enumerate(ids)
+            emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+            k > 1 && emit!(b, :i32_or)
+        end
+        if!(b)
+        emit!(b, :local_get, 1); emit!(b, :ref_cast, st)
+        emit!(b, :struct_get, st, DATA_FIELD)
+        emit!(b, :local_tee, a)
+        emit!(b, :array_len); emit!(b, :i64_extend_i32_u); emit!(b, :local_set, rem)
+        # off < len and len - off >= n
+        emit!(b, :local_get, off); emit!(b, :local_get, rem); emit!(b, :i64_lt_u)
+        emit!(b, :local_get, rem); emit!(b, :local_get, off); emit!(b, :i64_sub)
+        emit!(b, :i64_const, n); emit!(b, :i64_ge_u)
+        emit!(b, :i32_and)
+        if!(b)
+        if load
+            emit!(b, :i64_const, 0); emit!(b, :local_set, idx)
+            for j in 0:n-1
+                emit!(b, :local_get, a)
+                emit!(b, :local_get, off); emit!(b, :i32_wrap_i64)
+                j > 0 && (emit!(b, :i32_const, j); emit!(b, :i32_add))
+                emit!(b, :array_get_u, at)
+                emit!(b, :i64_extend_i32_u)
+                j > 0 && (emit!(b, :i64_const, 8j); emit!(b, :i64_shl))
+                emit!(b, :local_get, idx); emit!(b, :i64_or); emit!(b, :local_set, idx)
+            end
+            emit!(b, :local_get, idx)
+        else
+            for j in 0:n-1
+                emit!(b, :local_get, a)
+                emit!(b, :local_get, off); emit!(b, :i32_wrap_i64)
+                j > 0 && (emit!(b, :i32_const, j); emit!(b, :i32_add))
+                emit!(b, :local_get, 2)
+                j > 0 && (emit!(b, :i64_const, 8j); emit!(b, :i64_shr_u))
+                emit!(b, :i32_wrap_i64)
+                emit!(b, :array_set, at)
+            end
+        end
+        return!(b)
+        end!(b)
+        end!(b)
+    end
+    # memories of inline structs whose leaves are stored with a stride: a leaf of n bytes at the
+    # offset (the type id tested first, then the offset in the element once)
     for (id, st, at, stg, esz, stride, leaves) in leafmems
         storage_bytes(stg) == n || continue
-        for (j, loff, ln) in leaves
-            ln == n || continue
-            a = get!(() -> add_local!(f, RefType(at, true)), arrays, at)
-            emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
-            emit!(b, :local_get, off); emit!(b, :i64_const, esz); emit!(b, :i64_rem_u)
-            emit!(b, :i64_const, loff); emit!(b, :i64_eq)
-            emit!(b, :i32_and)
+        cands = [(j, loff) for (j, loff, ln) in leaves if ln == n]
+        isempty(cands) && continue
+        a = get!(() -> add_local!(f, RefType(at, true)), arrays, at)
+        emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+        if!(b)
+        emit!(b, :local_get, off); emit!(b, :i64_const, esz); emit!(b, :i64_rem_u); emit!(b, :local_set, rem)
+        for (j, loff) in cands
+            emit!(b, :local_get, rem); emit!(b, :i64_const, loff); emit!(b, :i64_eq)
             if!(b)
             emit!(b, :local_get, 1); emit!(b, :ref_cast, st)
             emit!(b, :struct_get, st, DATA_FIELD)
@@ -1147,6 +1206,7 @@ function finish_typed_ptr_helper!(cgm::CGModule, f::Func, kind::Symbol, owners, 
             return!(b)
             end!(b)
         end
+        end!(b)
     end
     # otherwise, byte by byte
     if load

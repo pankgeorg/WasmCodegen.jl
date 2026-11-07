@@ -97,6 +97,48 @@ function string_words(k::Int)
     end
 end
 
+# a memory of inline structs with leaves of mixed sizes (a leaf memory: 4-byte leaf, padding,
+# 8-byte leaf): the whole 8-byte leaf, a 4-byte access within it, and an 8-byte access over the
+# small leaf and the padding (the padding's bytes are masked off: natively unspecified)
+struct Mix
+    a::UInt32
+    b::UInt64
+end
+function mixed_leaves(n::Int)
+    v = [Mix(UInt32(0x11223344 + i), 0x0102030405060708 * UInt64(i)) for i in 1:n]
+    s = UInt64(0)
+    GC.@preserve v begin
+        p = Ptr{UInt8}(pointer(v))
+        for i in 0:n-1
+            o = 16i
+            s = 3s + ldoff(UInt64, p, o + 8) + ldoff(UInt32, p, o + 12) + (ldoff(UInt64, p, o) & 0xffffffff)
+            stoff(p, o + 8, 0xa0a0a0a0a0a0a0a0 + UInt64(i))
+            stoff(p, o, UInt32(i))
+        end
+    end
+    return s, sum(x.a for x in v), sum(x.b for x in v)
+end
+# an object's fields: an 8-byte load and store at offset 4, over two fields
+function object_span(k::Int)
+    r = Ref(Pair2(1.5 * k, Int32(k), Int32(7)))
+    GC.@preserve r begin
+        p = Ptr{UInt8}(pointer_from_objref(r))
+        x = ldoff(UInt64, p, 4)
+        stoff(p, 4, 0x0102030405060708)
+    end
+    return x, r[]
+end
+# 8-byte stores and loads over two 4-byte elements (aligned to 8 and not)
+function across_elements(o::Int)
+    a = Int32[i for i in 1:8]
+    GC.@preserve a begin
+        p = Ptr{UInt8}(pointer(a))
+        x = ldoff(UInt64, p, o)
+        stoff(p, o, 0x1111111122222222)
+    end
+    return x, sum(i * a[i] for i in 1:8)
+end
+
 # memcmp (== of vectors of isbits), memmove and memset (unsafe_copyto!, fill!) through pointers
 @noinline cmpbytes(p::Ptr{UInt8}, q::Ptr{UInt8}, n::Int) =
     ccall(:memcmp, Cint, (Ptr{UInt8}, Ptr{UInt8}, Csize_t), p, q, n)
@@ -119,6 +161,9 @@ function memops(oa::Int, ob::Int, n::Int)
     end
     return c1, c2, c3, sum(i * a[i] for i in 1:16), sum(i * b[i] for i in 1:16)
 end
+no_owner_load(i::Int) = ld(Ptr{Float64}(UInt(64i)), 1)
+refs_load(i::Int) = (v = Any[1.0, "x"]; GC.@preserve v ld(Ptr{Float64}(pointer(v)), i))
+out_of_range_load(i::Int) = (v = [1.0, 2.0]; GC.@preserve v ld(pointer(v), i))
 vec_eq(n::Int, k::Int) = (a = collect(1:n); b = collect(1:n); k > 0 && (b[k] = 0); a == b)
 
 @testset "typed pointer loads and stores" begin
@@ -138,8 +183,24 @@ vec_eq(n::Int, k::Int) = (a = collect(1:n); b = collect(1:n); k > 0 && (b[k] = 0
     @wtest vec_eq(100, 0)
     @wtest vec_eq(100, 77)
     @wtest vec_eq(3, 2)
-    # an 8-byte load or store through such a pointer is one call of the typed helpers (not 8 byte calls)
-    fnames(f) = Set(g.name for g in wcompile(f, (Int,)).cgm.mod.funcs)
-    @test issubset(("jl_ptr_load_bits8", "jl_ptr_store_bits8"), fnames(f64_rw))
-    @test issubset(("jl_ptr_load_bits4", "jl_ptr_store_bits4"), fnames(i32_rw))
+    @wtest mixed_leaves(4)
+    @wtest object_span(3)
+    @wtest across_elements(0)
+    @wtest across_elements(4)
+    # the functions doing the accesses call the typed helpers, and no byte helper themselves
+    function calls_of(f, name)
+        c = wcompile(f, (Int,))
+        Set(i.imm[1].name for (mi, info) in c.cgm.funcs if mi.def isa Method && mi.def.name === name
+            for i in info.func.body if i.op === :call)
+    end
+    @test "jl_ptr_load_bits8" in calls_of(f64_rw, :ld) && !("jl_ptr_load_byte" in calls_of(f64_rw, :ld))
+    @test "jl_ptr_store_bits8" in calls_of(f64_rw, :st) && !("jl_ptr_store_byte" in calls_of(f64_rw, :st))
+    @test "jl_ptr_load_bits4" in calls_of(i32_rw, :ld) && "jl_ptr_store_bits4" in calls_of(i32_rw, :st)
+    # traps (natively undefined: not run natively): a pointer without owner, a memory of
+    # references, an access out of the owner's range
+    trap(f, args...) = (r = wasm_run(wcompile(f, map(typeof, args)), string(nameof(f)), args...; rettype=Float64);
+                        r isa Tuple && r[1] === :trap)
+    @test trap(no_owner_load, 1)
+    @test trap(refs_load, 1)
+    @test trap(out_of_range_load, 100)
 end
