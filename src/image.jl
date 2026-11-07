@@ -584,8 +584,10 @@ function memory_global!(img::Image, mem; tuple_reset::Union{Nothing,Bool}=nothin
     g = add_array_global!(img, nothing, ml.array, n, fixed ? elems : Inst[], !fixed)
     obj = memory_object_global!(img, mem, g)
     if !fixed
-        # set by the start function, element by element
+        # set by the start function, element by element, but for the null references:
+        # array.new_default created every slot null (a hash table's unused slots stay so)
         for (i, e) in enumerate(elems)
+            e.op === :ref_null && continue
             push!(img.init, Inst(:global_get, g), Inst(:i32_const, i - 1), e,
                   Inst(:array_set, ml.array))
         end
