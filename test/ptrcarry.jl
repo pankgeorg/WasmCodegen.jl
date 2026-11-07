@@ -132,11 +132,12 @@ end
 carry_previous(a::Int, b::Int, c::Int, n::Int) = carry_previous_owner([[a], [b], [c]], n)
 
 # whether the function compiled for `f` itself accesses memory through pointers without
-# origin (calls the byte-wise helpers); other functions of the module may (Base's copies)
+# origin (calls the run-time helpers, byte-wise or of 4/8 bytes); other functions of the module
+# may (Base's copies)
 function uses_byte_access(c, f)
     infos = [info for (mi, info) in c.cgm.funcs if mi.def isa Method && mi.def.name === nameof(f)]
     isempty(infos) && error("no function compiled for ", f)
-    bytewise(i) = i.op === :call && occursin(r"jl_ptr_(load|store)_byte", i.imm[1].name)
+    bytewise(i) = i.op === :call && occursin(r"jl_ptr_(load|store)_(byte|bits[48])", i.imm[1].name)
     return any(info -> any(bytewise, info.func.body), infos)
 end
 
