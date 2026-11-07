@@ -151,6 +151,15 @@ function pool()
 end
 
 # the root task's state before any other task exists (first in `main`)
+# the build's root task, held weakly (as a per-task cache's key): the module's root task, the one
+# `main` runs in; a spawned task is another
+const ROOT_REF = WeakRef(Base.roottask)
+function root_ref()
+    t = @async current_task() !== Base.roottask && ROOT_REF.value === Base.roottask
+    println(Core.stdout, "root ref ", ROOT_REF.value === current_task(), " ", ROOT_REF.value === Base.roottask,
+            " ", fetch(t)::Bool)
+end
+
 function root_state()
     task_local_storage(:root, 1)
     println(Core.stdout, "root tls ", task_local_storage(:root)::Int, " started ", istaskstarted(current_task()))
@@ -564,6 +573,7 @@ end
 
 function main()::Int32
     root_state()
+    root_ref()
     producer_consumer()
     condition_notify()
     sleeps()
