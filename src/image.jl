@@ -330,6 +330,11 @@ The global of the object `x` (of a boxed type), serializing it (and the objects 
 to) on first use.
 """
 function object_global!(img::Image, @nospecialize(x))
+    # The build's root task is the module's own, as a native image has it: the loading process's
+    # root task, not a copy (src/staticdata.c, `TagRef` 0). Its fields (task-local storage, ...)
+    # are not serialized: a value that refers to it (the key of a per-task cache, a WeakRef) does
+    # not bring them in.
+    x === Base.roottask && return root_task_global!(img.cgm)
     g = get(img.globals, x, nothing)
     if g !== nothing
         note_reach!(img, x)
@@ -404,6 +409,10 @@ function new_object_global!(img::Image, @nospecialize(x))
         return opaque_object_global!(img, x)
     elseif any(R -> T === R, RUNTIME_TYPES)
         unsupported("serializing the runtime object ", x, " of type ", T)
+    elseif T === Task
+        # (the root task is the module's own, `object_global!`) as natively: "Task cannot be
+        # serialized" (src/staticdata.c, `jl_queue_for_serialization`)
+        unsupported("serializing a Task of the build (other than its root task)")
     elseif T <: Ptr || T === Ptr
         unsupported("serializing a pointer")
     elseif l.elements !== nothing
@@ -810,7 +819,9 @@ function finish_image!(cgm::CGModule)
     isempty(img.init) && isempty(img.patches) && isempty(img.late) && !img.failed && return
     f = add_func!(cgm.mod, "jl_init_image", ValType[], ValType[])
     b = Builder(cgm.mod, f)
-    for inst in img.init
+    ninit = length(img.init)
+    for k in 1:ninit
+        inst = img.init[k]
         emit!(b, inst.op, inst.imm...)
     end
     # field and element values set once every global exists (cycles, shells of mutable objects);
@@ -849,6 +860,12 @@ function finish_image!(cgm::CGModule)
         end
     end
     empty!(img.patches)
+    # what serializing the values of the patches added to the start function (the fields of the
+    # root task, the elements of a large memory), after them: they only store into objects
+    for k in ninit+1:length(img.init)
+        inst = img.init[k]
+        emit!(b, inst.op, inst.imm...)
+    end
     for inst in img.late
         emit!(b, inst.op, inst.imm...)
     end
