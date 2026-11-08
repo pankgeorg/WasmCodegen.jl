@@ -74,7 +74,14 @@ end
 # the constant value of a boundscheck argument (true where not known: checking is allowed)
 boundscheck_value(bc) = bc isa CGVal && isconstant(bc) ? constant_value(bc)::Bool : true
 
-typename_str(@nospecialize(T)) = sprint(show, T; context=:compact => true)
+# the name of the type `T` for the names of helpers and globals, which are for debugging: its
+# name without its parameters (printing a type takes as long as its parameters are large, and
+# the types of a program's closures and generated functions can take seconds)
+function typename_str(@nospecialize(T))
+    U = Base.unwrap_unionall(T)
+    U isa DataType && return string(U.name.name)
+    return U isa Union ? "Union" : U === Union{} ? "Bottom" : "T"
+end
 
 "`memoryrefget(r, order, boundscheck)`, by a helper per element type."
 function outlined_memoryrefget!(fc::FnCtx, r::CGVal, bc, @nospecialize(typ))

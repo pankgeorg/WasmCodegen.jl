@@ -9,7 +9,7 @@ The function `(typeid::i32) -> i32` testing whether a type id is that of a subty
 """
 function isa_predicate!(cgm::CGModule, @nospecialize(T))
     get!(cgm.helpers, (:isa, T)) do
-        add_func!(cgm.mod, string("jl_isa_", replace(string(T), r"[^A-Za-z0-9_]" => "_")),
+        add_func!(cgm.mod, helper_name(cgm, "isa_" * typename_str(T)),
                   ValType[I32], ValType[I32])
     end
 end

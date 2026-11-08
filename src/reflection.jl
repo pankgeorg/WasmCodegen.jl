@@ -259,7 +259,7 @@ over the module's types of whether each is a `T`; of another object, by its type
 """
 type_isa_func!(cgm::CGModule, @nospecialize(T)) = get!(cgm.helpers, (:type_isa, T)) do
     jl = jlvalue_ref(cgm.types)
-    add_func!(cgm.mod, string("jl_type_isa_", replace(string(T), r"[^A-Za-z0-9_]" => "_")), ValType[jl], ValType[I32])
+    add_func!(cgm.mod, helper_name(cgm, "type_isa_" * typename_str(T)), ValType[jl], ValType[I32])
 end
 
 function finish_type_isa!(cgm::CGModule)
@@ -549,7 +549,7 @@ function getfield_any_func!(cgm::CGModule, @nospecialize(T), f::Union{Symbol,Int
     note_case_owner!(cgm, (:getfield_any_owners, T, f))
     return get!(cgm.helpers, (:getfield_any, T, f)) do
         jl = jlvalue_ref(cgm.types)
-        add_func!(cgm.mod, string("jl_getfield_any_", replace(string(T, "_", f), r"[^A-Za-z0-9_]" => "_")),
+        add_func!(cgm.mod, helper_name(cgm, string("getfield_any_", typename_str(T), "_", f)),
                   ValType[jl], ValType[jl])
     end::Func
 end
@@ -709,7 +709,7 @@ their elements (`jl_egal` the function comparing others).
 tuple_egal_func!(cgm::CGModule, @nospecialize(S), egal::Func) = get!(cgm.helpers, (:tuple_egal, S)) do
     l = layout(cgm.types, S)
     r = RefType(l.wtype, true)
-    h = add_func!(cgm.mod, "jl_tuple_egal_" * typename_str(S), ValType[r, r], ValType[I32])
+    h = add_func!(cgm.mod, helper_name(cgm, "tuple_egal_" * typename_str(S)), ValType[r, r], ValType[I32])
     b = Builder(cgm.mod, h)
     emit!(b, :local_get, 0); emit!(b, :local_get, 1); emit!(b, :ref_eq)
     if!(b); emit!(b, :i32_const, 1); return!(b); end!(b)
@@ -736,14 +736,14 @@ end
 "`jl_tuple_canon(x::S) -> \$JlValue`: the tuple `x` of the tuple type of unknown length `S` as an object."
 tuple_canon_func!(cgm::CGModule, @nospecialize(S)) = get!(cgm.helpers, (:tuple_canon, S)) do
     l = layout(cgm.types, S)
-    add_func!(cgm.mod, "jl_tuple_canon_" * typename_str(S), ValType[l.leaves[1].type],
+    add_func!(cgm.mod, helper_name(cgm, "tuple_canon_" * typename_str(S)), ValType[l.leaves[1].type],
               ValType[jlvalue_ref(cgm.types)])
 end
 
 "`jl_tuple_from(x::\$JlValue) -> S`: the tuple object `x` as a value of the tuple type of unknown length `S`."
 tuple_from_func!(cgm::CGModule, @nospecialize(S)) = get!(cgm.helpers, (:tuple_from, S)) do
     l = layout(cgm.types, S)
-    add_func!(cgm.mod, "jl_tuple_from_" * typename_str(S), ValType[jlvalue_ref(cgm.types)],
+    add_func!(cgm.mod, helper_name(cgm, "tuple_from_" * typename_str(S)), ValType[jlvalue_ref(cgm.types)],
               ValType[l.leaves[1].type])
 end
 
@@ -969,9 +969,10 @@ function emit_apply_type!(fc::FnCtx, args::Vector{Any}, @nospecialize(typ))
     cgm = fc.cgm
     h = get!(cgm.helpers, (:apply_type, W, n)) do
         jl = jlvalue_ref(cgm.types)
-        f = add_func!(cgm.mod, "jl_apply_type_" * replace(typename_str(W), r"[^A-Za-z0-9_]" => "_"),
+        f = add_func!(cgm.mod, helper_name(cgm, "apply_type_" * typename_str(W)),
                       ValType[jl for _ in 1:n], ValType[jl])
-        msg = string("Core.apply_type(", W, ", …): the type is not one of this module's (types are not made at run time)")
+        # (`W` printed as far as a diagnostic is: a wrapper of fixed parameters can be large)
+        msg = string("Core.apply_type(", limited_sprint(print, W), ", …): the type is not one of this module's (types are not made at run time)")
         # (the native errors of parameters that may not be ones, or outside the bounds)
         argtypes = (Val{W}, ntuple(_ -> Any, n)...)
         (; func=f, msg=object_global!(cgm.image, msg),
