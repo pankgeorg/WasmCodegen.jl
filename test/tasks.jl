@@ -118,6 +118,14 @@ end
     @test !occursin("julia_task", String(copy(c.bytes))) && !occursin("jl_task_entry", String(copy(c.bytes)))
     @test_throws ArgumentError WasmCodegen.compile([Entry(+, (Int, Int))]; config=WasmCodegen.Config(tasks=:jspi))
     @test_throws ArgumentError WasmCodegen.compile([Entry(+, (Int, Int))]; config=WasmCodegen.Config(tasks=:threads))
+    # Threads.@threads in a program of one task: unsupported (its task), with the hint
+    e = try
+        WasmCodegen.compile([Entry(P.threads_loops, ())]); nothing
+    catch e
+        e
+    end
+    @test e isa WasmCodegen.UnsupportedConstructs
+    @test occursin("jl_new_task", sprint(showerror, e)) && occursin("Threads.@threads", sprint(showerror, e))
 end
 
 end # TasksTests

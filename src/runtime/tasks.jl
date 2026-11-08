@@ -127,6 +127,16 @@ is_started(t::Task) = is_root(t) || t._state !== task_state_runnable || haskey(I
 "`jl_get_task_tid`: the one thread's (0) once it was set (the task scheduled, or run), else -1."
 task_tid(t::Task) = is_root(t) || t.pad00 != 0x00 ? Int16(0) : Int16(-1)
 
+"""
+The depth of nested threaded regions (`Threads.@threads`' `threading_run`), as the C runtime's
+`_threadedregion`: `jl_enter_threaded_region` and `jl_exit_threaded_region` count it, and
+`jl_in_threaded_region` reads it (`@threads :static` refuses to start inside a region).
+"""
+const THREADED_REGION = Ref{Cint}(0)
+enter_threaded_region() = (THREADED_REGION[] += Cint(1); nothing)
+exit_threaded_region() = (THREADED_REGION[] -= Cint(1); nothing)
+in_threaded_region() = THREADED_REGION[] != Cint(0) ? Cint(1) : Cint(0)
+
 "`jl_set_task_tid`: the task's thread, once (the one thread's: 0); 0 if it is another's."
 function set_task_tid(t::Task, tid::Cint)
     was = task_tid(t)

@@ -595,8 +595,87 @@ function main()::Int32
     many_timers()
     sync_typed_channel()
     sync_own_wait()
+    threads_loops()
     println(Core.stdout, "done")
     return Int32(0)
+end
+
+# Threads.@threads on the one thread: the schedules, a reduction into a preallocated array,
+# @spawn inside the loop, the thread ids, a nested `:static` loop (refused, as natively in a
+# threaded region) and an error in the body (a CompositeException of TaskFailedExceptions)
+function threads_failure(e)
+    e isa CompositeException || return "other"
+    f = e.exceptions[1]
+    f isa TaskFailedException || return "other"
+    x = f.task.result   # (the failed task's exception)
+    m = x isa ErrorException ? x.msg : nothing
+    msg = m isa String ? m : "other"
+    return string("CompositeException ", length(e.exceptions), " TaskFailedException ", msg)
+end
+function threads_loops()
+    n = 10
+    acc = zeros(Int, n)
+    Threads.@threads for i in 1:n
+        acc[i] = i * i
+    end
+    println(Core.stdout, "threads default ", sum(acc))
+    fill!(acc, 0)
+    Threads.@threads :dynamic for i in 1:n
+        acc[i] = 2i
+    end
+    println(Core.stdout, "threads dynamic ", sum(acc))
+    fill!(acc, 0)
+    Threads.@threads :static for i in 1:n
+        acc[i] = 3i
+    end
+    println(Core.stdout, "threads static ", sum(acc))
+    fill!(acc, 0)
+    Threads.@threads :greedy for i in 1:n
+        acc[i] = 4i
+    end
+    println(Core.stdout, "threads greedy ", sum(acc))
+    ts = Vector{Task}(undef, n)
+    Threads.@threads for i in 1:n
+        ts[i] = Threads.@spawn (yield(); i + 100)
+    end
+    s = 0
+    for t in ts
+        s += fetch(t)::Int
+    end
+    println(Core.stdout, "threads spawn ", s)
+    ids = zeros(Int, n)
+    Threads.@threads :static for i in 1:n
+        ids[i] = Threads.threadid()
+    end
+    println(Core.stdout, "threads ids ", ids[1], " ", all(==(ids[1]), ids), " nthreads ",
+            Threads.nthreads(), " ", Threads.nthreads(:default), " ", Threads.threadpoolsize(),
+            " outside ", Threads.threadid())
+    r = try
+        Threads.@threads for i in 1:2
+            Threads.@threads :static for j in 1:2
+                acc[j] = j
+            end
+        end
+        "no error"
+    catch e
+        threads_failure(e)
+    end
+    println(Core.stdout, "threads nested ", r)
+    r = try
+        Threads.@threads for i in 1:n
+            i == 3 && error("boom ", i)
+            acc[i] = i
+        end
+        "no error"
+    catch e
+        threads_failure(e)
+    end
+    println(Core.stdout, "threads error ", r)
+    # (after an error, the region is left: a :static loop runs again)
+    Threads.@threads :static for i in 1:n
+        acc[i] = 5i
+    end
+    println(Core.stdout, "threads after ", sum(acc))
 end
 
 # `n` round trips between two tasks over yield(): the elapsed ns
