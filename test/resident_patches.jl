@@ -69,8 +69,10 @@ end
     result(c, f, n, rettype) = wasm_run(c, string(nameof(f)), n; rettype)
     # (Base's, before the installation)
     pkg = Base.PkgId(Base.UUID("a6a1e1a2-3b4c-4d5e-8f90-0a1b2c3d4e5f"), "ResidentProbe")
+    listed = mktempdir()
+    foreach(name -> touch(joinpath(listed, name)), ("b.jl", "a.txt", "é"))
     natively() = [repr(pkg => "path"), repr([pkg]), sprint(show, Vector{Pair{Base.PkgId,Int}}), repr(R.apple),
-                  sprint(show, R.norm2), sprint(show, Base.Order.Forward), Base.active_project(), pwd(), readdir(@__DIR__)]
+                  sprint(show, R.norm2), sprint(show, Base.Order.Forward), Base.active_project(), pwd(), readdir(listed)]
     native = natively()
     # each in a session of its own
     stock = [compiled(f) for (f, _, _) in programs]
