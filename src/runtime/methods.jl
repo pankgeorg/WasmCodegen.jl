@@ -28,13 +28,13 @@ macro wasm_method(def)
     return esc(:(Base.Experimental.@overlay $(GlobalRef(@__MODULE__, :WASM_METHODS)) $def))
 end
 
-"The world before the patches of the open session (see `with_trim_patches`)."
+"The world before the transient or resident patches (see `with_trim_patches`, `install_trim_patches!`)."
 const PRE_PATCH_WORLD = Ref{UInt}(typemax(UInt))
 
 """
     original(f, args...; kw...)
 
-`f(args...; kw...)` in the world before the patches of the open session: natively, a runtime
+`f(args...; kw...)` in the world before the transient or resident patches: natively, a runtime
 function a patch calls can call the method the patch replaced.
 """
 original(f, args...; kw...) = Base.invoke_in_world(PRE_PATCH_WORLD[], f, args...; kw...)
