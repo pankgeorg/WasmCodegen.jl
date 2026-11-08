@@ -224,7 +224,10 @@ output with Node's and native Julia's.
 - **The program's world.** The program is inferred in a world with juliac's trim patches
   (method redefinitions from JuliaC.jl) and the pseudo-runtime's own (`src/trim`), such
   as IO through a host import instead of libuv. The patches are deleted afterwards. The
-  compiler itself runs in the world it was loaded in.
+  compiler itself runs in the world it was loaded in. A long-lived process (a compile server,
+  a system image) can install the patches once with `install_trim_patches!()` instead, so that
+  compilations do not invalidate the native code of the packages it keeps loaded
+  ([DESIGN.md](DESIGN.md) §1).
 - **Collecting.** `Core.Compiler.compile!` with a Wasm interpreter, as juliac's
   `typeinf_ext_toplevel` does, so the code compiled is the code juliac compiles.
 - **Structuring.** Each function's IR is turned into structured control flow by
