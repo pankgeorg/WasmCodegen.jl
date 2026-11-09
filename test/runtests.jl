@@ -21,7 +21,7 @@ const SESSION_TESTS = [
     "getfield_any", "invoke_cycle", "reflection_rt", "rt_types", "printing", "runtime", "idset", "unset",
     "image_pointers", "vararg_tuples", "split_unions", "versions", "specialize", "invokelatest",
     "staging", "env", "fs", "event", "diagnostics", "type_hash", "foreign_functions",
-    "verifier", "juliac/runtests"]
+    "verifier", "root_task", "juliac/runtests"]
 # the files that open sessions with other patches themselves
 const OWN_SESSION_TESTS = ["patch_sessions", "tasks"]
 

@@ -137,9 +137,15 @@ function current_task_global!(cgm::CGModule)
         push!(init, default_inst(st isa PackedType ? I32 : st))
     end
     push!(init, Inst(:struct_new, l.wtype))
-    # (mutable with tasks: a task switch sets it, `Runtime.Tasks.set_current!`)
-    g = add_global!(cgm.mod, "jl_current_task", RefType(l.wtype, false), cgm.config.tasks === :jspi, init)
+    # the root task: the module's own, which the image refers to for the build's (`root_task_global!`)
+    jspi = cgm.config.tasks === :jspi
+    root = add_global!(cgm.mod, jspi ? "jl_root_task" : "jl_current_task", RefType(l.wtype, false), false, init)
+    # (with tasks, the current task is a global of its own, mutable: a task switch sets it,
+    # `Runtime.Tasks.set_current!`; it starts as the root task. Without, it is the root task.)
+    g = jspi ?
+        add_global!(cgm.mod, "jl_current_task", RefType(l.wtype, false), true, Inst[Inst(:global_get, root)]) : root
     cgm.helpers[:current_task] = g
+    cgm.helpers[:root_task] = root
     # the root task holds `nothing` (not a null reference) in the fields `jl_init_root_task` sets,
     # so that `task_local_storage` creates its IdDict as natively; `code` stays undefined
     nothing_g = singleton_global!(cgm.image, Nothing)
@@ -158,6 +164,17 @@ function current_task_global!(cgm::CGModule)
         push!(cgm.image.init, Inst(:global_get, g), Inst(:call, entropy), Inst(:struct_set, l.wtype, w))
     end
     return g
+end
+
+"""
+    root_task_global!(cgm) -> Global
+
+The module's root task (an immutable global): the task its code starts in, which
+[`current_task_global!`](@ref) creates.
+"""
+function root_task_global!(cgm::CGModule)
+    current_task_global!(cgm)
+    return cgm.helpers[:root_task]::Global
 end
 
 """
