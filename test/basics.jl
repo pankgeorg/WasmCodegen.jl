@@ -38,6 +38,29 @@ divs(a::Int, b::Int) = (div(a, b), rem(a, b))
     @wtest divs(1, 0)
 end
 
+# byte swaps of floats: `bswap`, `hton` and `ntoh` of a Float64 or Float32 are the intrinsic
+# `bswap_int` of the float, natively a swap of its bits (in and out by their bits, so that NaN
+# payloads are compared too)
+bswap_f64(b::UInt64) = (x = reinterpret(Float64, b);
+    (reinterpret(UInt64, bswap(x)), reinterpret(UInt64, hton(x)), reinterpret(UInt64, ntoh(x)), reinterpret(UInt64, ntoh(hton(x)))))
+bswap_f32(b::UInt32) = (x = reinterpret(Float32, b);
+    (reinterpret(UInt32, bswap(x)), reinterpret(UInt32, hton(x)), reinterpret(UInt32, ntoh(x)), reinterpret(UInt32, ntoh(hton(x)))))
+# (a swapped float used as a float)
+bswap_twice(x::Float64, y::Float32) = (bswap(bswap(x)) + 1.0, bswap(bswap(y)) * 2.0f0)
+
+@testset "byte swaps of floats" begin
+    # 1.5, -0.0, a quiet NaN with a payload, a signalling NaN, the smallest subnormal, and one
+    # whose swap is a NaN
+    for b in (reinterpret(UInt64, 1.5), reinterpret(UInt64, -0.0), 0x7ff8000000000001, 0x7ff0000000000001,
+              0x0000000000000001, 0x00000000000ff87f)
+        @wtest bswap_f64(b)
+    end
+    for b in (reinterpret(UInt32, 1.5f0), reinterpret(UInt32, -0.0f0), 0x7fc00001, 0x7f800001, 0x00000001, 0x0000c07f)
+        @wtest bswap_f32(b)
+    end
+    @wtest bswap_twice(1.5, 2.25f0)
+end
+
 i128ops(a::Int64, b::Int64) = (x = Int128(a) * Int128(b) * 1000; (x + 1, x - 7, x * 3, x ÷ 7, x % 7, x < 0, x >> 70, x << 3, leading_zeros(x), Int64(x >> 64)))
 u128div(a::UInt64, b::UInt64) = (x = UInt128(a) << 64 | b; (x ÷ UInt128(12345), x % UInt128(12345), x * x, count_ones(x)))
 cmp_rational(x::Float64) = x < 1 // 10^5
