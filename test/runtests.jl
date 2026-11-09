@@ -22,7 +22,7 @@ const SESSION_TESTS = [
     "image_pointers", "ptrtyped", "ptrviews", "simd128", "vararg_tuples", "abstract_tuples", "split_unions",
     "versions", "specialize", "invokelatest",
     "staging", "env", "fs", "event", "diagnostics", "type_hash", "foreign_functions",
-    "verifier", "root_task", "juliac/runtests"]
+    "verifier", "root_task", "type_names", "juliac/runtests"]
 # the files that open sessions with other patches themselves
 const OWN_SESSION_TESTS = ["patch_sessions", "tasks", "resident_patches"]
 

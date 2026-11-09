@@ -453,7 +453,7 @@ function type_object_global!(img::Image, @nospecialize(x::Type))
     st = type_object_type!(ts)
     init = Inst[Inst(:i32_const, typeid!(ts, typeof(x))), native_id_hash(img, x),
                 Inst(:i32_const, typeid!(ts, x)), Inst(:struct_new, st)]
-    name = "jl_type_" * replace(string(x), r"[^A-Za-z0-9_]" => "_")
+    name = string("jl_type_", replace(typename_str(x), r"[^A-Za-z0-9_]" => "_"), "_", typeid!(ts, x))
     g = add_global!(img.cgm.mod, name, RefType(st, false), false, init)
     img.globals[x] = g
     return g
