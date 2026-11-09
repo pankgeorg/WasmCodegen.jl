@@ -148,12 +148,33 @@ function bind_handler_args!(fc::FnCtx, block)
     end
 end
 
-"An upsilon: its value assigned to the handler argument it feeds."
+"""
+An upsilon: its value assigned to the handler argument it feeds, if it is of the argument's
+type. The argument's type is what the handler can see, and a value assigned after the try's
+last statement that may throw is one it never sees, so it may be of another type (the value a
+`return` passes through a `finally` feeds the catch's argument, of type `Union{}`). As natively
+(`emit_upsilonnode`'s stores, which allow mismatches), such a value is not assigned: never
+where it cannot be of the argument's type, else only where a test finds it is.
+"""
 function emit_upsilon!(fc::FnCtx, idx::Int, u::Core.UpsilonNode)
     dst = get(fc.upsilons, idx, nothing)
-    (dst === nothing || !isdefined(u, :val)) && return
-    v = convert_repr(fc, operand(fc, u.val), dst.typ)
-    v.kind === Bottom && return
+    (dst === nothing || dst.kind === Bottom || !isdefined(u, :val)) && return
+    v = operand(fc, u.val)
+    S, T = v.typ, dst.typ
+    if !(S <: T)
+        typeintersect(S, T) === Union{} && return
+        if (v.kind === Boxed && layout(fc, S).wtype == fc.cgm.types.jlvalue) || is_union_tuple(S)
+            t = emit_isa!(fc, v, T)
+            if !isconstant(t)
+                push_val!(fc, t)
+                if!(fc.b)
+                assign!(fc, dst, v)
+                end!(fc.b)
+                return
+            end
+            constant_value(t) || return
+        end
+    end
     assign!(fc, dst, v)
 end
 

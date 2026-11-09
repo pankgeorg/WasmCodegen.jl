@@ -114,6 +114,62 @@ function return_finally(i::Int, r::Base.RefValue{Int})
     return r[]
 end
 return_through_finally(i::Int) = (r = Ref(0); return_finally(i, r) + 1000 * r[])
+# a return out of the try of try/catch/finally (and of a try/catch in a try/finally): the
+# value it returns also feeds the catch, which never reads it (its argument is of type Union{})
+@noinline coded_work(i::Int) = i > 2 ? throw(CodedError(i)) : i + 1
+function return_catch_finally(i::Int, r::Base.RefValue{Int})
+    try
+        return coded_work(i)
+    catch
+        return -1
+    finally
+        r[] += 10
+    end
+end
+return_through_catch_finally(i::Int) = (r = Ref(0); return_catch_finally(i, r) + 1000 * r[])
+function return_nested_catch_finally(i::Int)
+    r = Ref(0)
+    v = i * 3
+    x = try
+        try
+            coded_work(i)
+            return v + r[]
+        catch e
+            (e::CodedError).code
+        end
+    finally
+        r[] += 1
+    end
+    return x + 100 * r[]
+end
+# a variable assigned after the try's last statement that may throw: the catch's argument is
+# of the type the catch can see, not of the type assigned (another type, or a wider one)
+function catch_sees_other_type(i::Int)
+    x = "s"
+    try
+        x = coded_work(i)
+    catch
+    end
+    return x isa Int ? x : length(x)
+end
+function catch_sees_narrower_type(i::Int)
+    x = 1
+    try
+        coded_work(i)
+        x = i > 1 ? nothing : i
+    catch
+    end
+    return x === nothing ? -7 : x
+end
+function catch_sees_narrower_boxed(i::Int)
+    x = 1
+    try
+        coded_work(i)
+        x = Base.inferencebarrier(i > 1 ? "z" : i)
+    catch
+    end
+    return x isa Int ? x : -9
+end
 function catch_nested(i::Int)
     acc = 0
     try
@@ -145,6 +201,11 @@ uncaught(i::Int) = i > 0 ? throw(CodedError(i)) : (try i catch; -1 end)
         @wtest catch_custom(i + 3)
         @wtest catch_inexact(i)
         @wtest return_through_finally(i)
+        @wtest return_through_catch_finally(i)
+        @wtest return_nested_catch_finally(i)
+        @wtest catch_sees_other_type(i)
+        @wtest catch_sees_narrower_type(i)
+        @wtest catch_sees_narrower_boxed(i)
     end
     for i in 1:4
         @wtest catch_parse(i)
