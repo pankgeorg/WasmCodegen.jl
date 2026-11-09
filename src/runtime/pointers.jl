@@ -4,14 +4,33 @@
 
 "`memmove(dst, src, n)`: the `n` bytes at `src` copied to `dst`, which may overlap."
 function ptr_memmove(dst::Ptr{UInt8}, src::Ptr{UInt8}, n::UInt)
+    # by 8-byte words when both are aligned to 8 (one array access each for a memory of
+    # 8-byte elements), the rest byte by byte
+    words = (UInt(dst) | UInt(src)) % UInt(8) == 0
     if dst > src
         i = n
+        if words
+            while i % UInt(8) != 0
+                unsafe_store!(dst, unsafe_load(src, i), i)
+                i -= 1
+            end
+            while i > 0
+                unsafe_store!(Ptr{UInt64}(dst + (i - 8)), unsafe_load(Ptr{UInt64}(src + (i - 8))))
+                i -= UInt(8)
+            end
+        end
         while i > 0
             unsafe_store!(dst, unsafe_load(src, i), i)
             i -= 1
         end
     else
         i = UInt(1)
+        if words
+            while i + UInt(7) <= n
+                unsafe_store!(Ptr{UInt64}(dst + (i - 1)), unsafe_load(Ptr{UInt64}(src + (i - 1))))
+                i += UInt(8)
+            end
+        end
         while i <= n
             unsafe_store!(dst, unsafe_load(src, i), i)
             i += 1
@@ -23,6 +42,13 @@ end
 "`memset(p, b, n)`: the `n` bytes at `p` set to `b`."
 function ptr_memset(p::Ptr{UInt8}, b::UInt8, n::UInt)
     i = UInt(1)
+    if UInt(p) % UInt(8) == 0
+        w = UInt64(b) * 0x0101010101010101
+        while i + UInt(7) <= n
+            unsafe_store!(Ptr{UInt64}(p + (i - 1)), w)
+            i += UInt(8)
+        end
+    end
     while i <= n
         unsafe_store!(p, b, i)
         i += 1
@@ -33,6 +59,14 @@ end
 "`memcmp(a, b, n)`: the sign of the first difference of the `n` bytes at `a` and `b`."
 function ptr_memcmp(a::Ptr{UInt8}, b::Ptr{UInt8}, n::UInt)
     i = UInt(1)
+    # 8 bytes at a time while both are aligned to 8 and equal (one array access each for a
+    # memory of 8-byte elements), then byte by byte (which also orders the first difference)
+    if (UInt(a) | UInt(b)) % UInt(8) == 0
+        while i + UInt(7) <= n
+            unsafe_load(Ptr{UInt64}(a + (i - 1))) == unsafe_load(Ptr{UInt64}(b + (i - 1))) || break
+            i += UInt(8)
+        end
+    end
     while i <= n
         x, y = unsafe_load(a, i), unsafe_load(b, i)
         x == y || return x < y ? Int32(-1) : Int32(1)
