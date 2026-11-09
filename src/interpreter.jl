@@ -86,37 +86,65 @@ end
 WasmMethodTable(world::UInt, extensions=()) = WasmMethodTable(world, Runtime.overlay_tables(extensions))
 
 # (`CC.OverlayMethodTable`'s, for a list of tables: the matches of each table but those a
-# match of an earlier table covers, up to the first table whose last match covers `sig`)
+# match of an earlier table covers, up to the first table whose last match covers `sig`. A
+# patch installed as an overlay (`install_trim_patches!`) replaces only the method of its own
+# signature, as the method a session defines does: a later table's match more specific than it
+# is kept, before it, and the tables after it are still looked at.)
 function CC.findall(@nospecialize(sig::Type), t::WasmMethodTable; limit::Int=-1)
     matches = Any[]
     min_world, max_world = typemin(UInt), typemax(UInt)
-    ambig = false
+    ambig = resident = false
     for mt in Union{Nothing,Core.MethodTable}[t.tables; nothing]
         result = CC._findall(sig, mt, t.world, limit)
         result === nothing && return nothing
         earlier = length(matches)
         for match in result.matches
-            dominated = any(i -> (match::Core.MethodMatch).method.sig <: (matches[i]::Core.MethodMatch).method.sig,
-                            1:earlier)
-            dominated || push!(matches, match)
+            m = (match::Core.MethodMatch).method
+            k = findfirst(i -> m.sig <: (matches[i]::Core.MethodMatch).method.sig, 1:earlier)
+            if k === nothing
+                push!(matches, match)
+            elseif is_resident_overlay(matches[k].method) && !(matches[k].method.sig <: m.sig)
+                insert!(matches, k, match)
+                earlier += 1
+                resident = true
+            end
         end
         min_world = max(min_world, result.valid_worlds.min_world)
         max_world = min(max_world, result.valid_worlds.max_world)
         ambig |= result.ambig
         nr = length(result)
-        nr ≥ 1 && result[nr].fully_covers && break
+        nr ≥ 1 && result[nr].fully_covers || continue
+        is_resident_overlay(result[nr].method) || break
+        resident = true
+    end
+    if resident
+        # (the matches after one that covers `sig` are not called; and as many as `limit`)
+        k = findfirst(m -> (m::Core.MethodMatch).fully_covers, matches)
+        k === nothing || resize!(matches, k)
+        limit ≥ 0 && length(matches) > limit && return nothing
     end
     return CC.MethodLookupResult(matches, CC.WorldRange(min_world, max_world), ambig)
 end
 
-# (the match of the first table that has one)
+# (the match of the first table that has one; for a patch installed as an overlay, the native
+# match if it is more specific, as in `findall`)
 function CC.findsup(@nospecialize(sig::Type), t::WasmMethodTable)
     min_world, max_world = typemin(UInt), typemax(UInt)
     for mt in Union{Nothing,Core.MethodTable}[t.tables; nothing]
         match, valid_worlds = CC._findsup(sig, mt, t.world)
         min_world = max(min_world, valid_worlds.min_world)
         max_world = min(max_world, valid_worlds.max_world)
-        match === nothing || return match, CC.WorldRange(min_world, max_world)
+        match === nothing && continue
+        if mt !== nothing && is_resident_overlay(match.method)
+            native, valid_worlds = CC._findsup(sig, nothing, t.world)
+            min_world = max(min_world, valid_worlds.min_world)
+            max_world = min(max_world, valid_worlds.max_world)
+            if native !== nothing && native.method.sig <: match.method.sig &&
+                    !(match.method.sig <: native.method.sig)
+                match = native
+            end
+        end
+        return match, CC.WorldRange(min_world, max_world)
     end
     return nothing, CC.WorldRange(min_world, max_world)
 end
@@ -176,11 +204,41 @@ end
 CC.get_max_methods(interp::WasmInterpreter, sv::CC.AbsIntState) =
     max(something(CC.get_max_methods_for_module(sv), 0), CC.get_max_methods(interp))
 
+# A resident session (`install_trim_patches!`) leaves `Base.invokelatest` the builtin
+# `Core.invokelatest`, which the process itself needs, where juliac's patches rebind it to
+# `invokelatest_trimmed`, a direct call (a trimmed program's world does not advance). So the
+# builtin called (directly, or applied to splatted arguments) is inferred as
+# `invokelatest_trimmed`, and is replaced by it before the optimizer: the code a session
+# compiles.
+function CC.optimize(interp::WasmInterpreter, opt::CC.OptimizationState, caller::CC.InferenceResult)
+    direct = DIRECT_INVOKELATEST[]
+    direct === nothing || direct_invokelatest!(opt, direct)
+    return @invoke CC.optimize(interp::CC.AbstractInterpreter, opt::CC.OptimizationState,
+                               caller::CC.InferenceResult)
+end
+
+function direct_invokelatest!(opt::CC.OptimizationState, @nospecialize(direct))
+    src = opt.src
+    isconst(x, f) = CC.singleton_type(CC.argextype(x, src, opt.sptypes)) === f
+    for stmt in src.code
+        call = Meta.isexpr(stmt, :(=)) ? stmt.args[2] : stmt
+        Meta.isexpr(call, :call) && !isempty(call.args) || continue
+        k = length(call.args) ≥ 3 && isconst(call.args[1], Core._apply_iterate) ? 3 : 1
+        isconst(call.args[k], Core.invokelatest) && (call.args[k] = direct)
+    end
+    return nothing
+end
+
 function CC.abstract_call_known(interp::WasmInterpreter, @nospecialize(f),
                                 arginfo::CC.ArgInfo, si::CC.StmtInfo, sv::CC.InferenceState,
                                 max_methods::Int=CC.get_max_methods(interp, f, sv))
     folded = fold_target_intrinsic(f, arginfo.argtypes)
     folded === nothing || return CC.Future{CC.CallMeta}(folded)
+    direct = DIRECT_INVOKELATEST[]
+    if f === Core.invokelatest && direct !== nothing
+        argtypes = Any[CC.Const(direct); arginfo.argtypes[2:end]]
+        return CC.abstract_call_known(interp, direct, CC.ArgInfo(arginfo.fargs, argtypes), si, sv, max_methods)
+    end
     return @invoke CC.abstract_call_known(interp::CC.AbstractInterpreter, f::Any,
                                           arginfo::CC.ArgInfo, si::CC.StmtInfo,
                                           sv::CC.InferenceState, max_methods::Int)

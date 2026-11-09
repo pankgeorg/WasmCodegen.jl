@@ -23,7 +23,7 @@ const SESSION_TESTS = [
     "staging", "env", "fs", "event", "diagnostics", "type_hash", "foreign_functions",
     "verifier", "root_task", "juliac/runtests"]
 # the files that open sessions with other patches themselves
-const OWN_SESSION_TESTS = ["patch_sessions", "tasks"]
+const OWN_SESSION_TESTS = ["patch_sessions", "tasks", "resident_patches"]
 
 # in each worker, once: the harness, the programs and the references of printing.jl (with
 # Base's printing: before the patches), in `Main`; the names they define, which each test's

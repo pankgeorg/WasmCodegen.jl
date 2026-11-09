@@ -88,6 +88,41 @@ are defined in a new world for a compilation (or a session of compilations,
 afterwards (deleting a method that replaced another restores it; the one constant juliac
 rebinds, `Base.invokelatest`, is rebound).
 
+**Resident patches** (`install_trim_patches!`). Deleting the patches invalidates the native
+code of whatever depends on the methods they replace, in every package loaded, not only the
+compiler's. A process that compiles one program after another while its packages stay warm (a
+compile server, a system image) can instead define them once, for its life: compilations then
+share that session and define no method. In one process, a ModelingToolkit `mtkcompile` that
+took 1.6 s took 141 s after a single session of patches. Installed, the patches invalidate
+once (the first `mtkcompile` after the installation pays it; a system image built with them
+does not), and the next models' `mtkcompile` took about 2 s. The module is the one a session compiles: its code,
+types, imports and exports are byte-identical; data and globals hold addresses and unused
+capacity of the build process's objects, which differ from process to process anyway.
+
+The process's own Base is then patched for its life, so the patches that would break it are
+methods of `WASM_METHODS` instead (applied while the files are included, before macro
+expansion, so the files are the session's). On Julia 1.13 the installation defines 229 methods
+(keyword, closure and generated methods included): 206 real methods and 23 overlays. The
+overlays are the startup, initialization, project, artifact and lazy-library stubs
+(`reinit_stdio`, `init_active_project`, `set_active_project`, the `__init__`s, `_artifact_str`,
+`string(::LazyLibraryPath)`, ...), the logger lookup, `invokelatest_gr` (`Base.invokelatest`
+keeps Core's binding), and the simplified printers of types, type names, functions and enums:
+the package loader sends `repr`s of `PkgId`s to a precompiling process as code, which then had
+`PkgId` for `Base.PkgId`. A function an overlay replaces that the native module does not have
+(`wait_forever` on 1.12, some initializers) is declared without methods, for the overlay to
+have a function, and an initializer is a native no-op, since loading a module calls it. These overlays replace only the native method of their own
+signature, as the patch's method does in a session: native methods more specific than one
+(Base's `show(::IO, ::Core.TypeofBottom)`, a package's `show` of its enum) are still the ones
+called (by `findall` and `findsup`), where an overlay of `WasmMethodTable` otherwise hides
+every method it covers. The real methods do natively what Base does (IO and the file
+system through the runtime, whose functions call the methods before the installation:
+`Runtime.original`; paths split by bytes; Random's vector operations element by element), or
+change only messages (assertions, deprecations) and specialization (`max_args`). The one
+constant juliac rebinds is not rebound: the process's `Base.invokelatest` stays the builtin
+`Core.invokelatest`, so where a program calls the builtin (directly, or applied to splatted
+arguments), the module's interpreter infers it as juliac's `invokelatest_trimmed` and replaces
+it with that before optimizing, as the rebinding does in a session.
+
 **The compiler runs in its own world**: the world WasmCodegen was loaded in. All of
 `compile` runs through `invoke_in_world(COMPILER_WORLD, ...)`, so the compiler's native
 code stays valid whatever is defined or deleted later (patches, the program, packages
