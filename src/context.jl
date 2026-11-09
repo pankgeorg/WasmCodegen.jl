@@ -65,6 +65,10 @@ Base.@kwdef struct Config
     The code generator emits simple code (a local per value) and leaves allocating locals,
     putting values on the operand stack and the rest to it."
     optimize::Union{Nothing,Cmd} = `-O3`
+    "Whether `muladd` of SIMD vectors (`SIMD128.muladd`) is relaxed SIMD's `relaxed_madd`, fused where
+    the hardware has FMA (as `Base.muladd` may be); else a multiply and an add, for hosts without
+    relaxed SIMD."
+    relaxed_simd::Bool = true
     "The structured IR of each function is kept for the session (the process) and reused by every
     later compilation that has the same function: keyed by its CodeInstance and the module's
     exception mode. Pays off when compilations share code, e.g. a solver compiled for many models
@@ -210,13 +214,15 @@ mutable struct FnCtx
     "The typed views of pointer owners, by (owner local, storage): (the owner they were made for,
     or -1 when made at function entry, array, base, length) (see `typed_view!`)."
     typedviews::Dict{Tuple{Int,StorageType},NTuple{4,Int}}
+    "The v128 locals of SIMD vectors, by their leaf locals (see simd128.jl)."
+    v128s::Dict{Vector{Int},Int}
 end
 
 FnCtx(cgm::CGModule, info::FuncInfo, sci, b::Builder, args::Vector{CGVal}=CGVal[]) =
     FnCtx(cgm, info, sci, b, args, Dict{Int,Any}(), Dict{Int,CGVal}(), LoopTarget[], 0,
           Vector{CGVal}[], Dict{Int,Any}(), Set{Int}(), Uses(), Bool[], 0, TryTarget[],
           Dict{Int,CGVal}(), Dict{Int,Int}(), Dict{Int,NTuple{4,Int}}(),
-          Dict{Tuple{Int,StorageType},NTuple{4,Int}}())
+          Dict{Tuple{Int,StorageType},NTuple{4,Int}}(), Dict{Vector{Int},Int}())
 
 layout(fc::FnCtx, @nospecialize(T)) = layout(fc.cgm.types, T)
 valtypes(fc::FnCtx, @nospecialize(T)) = valtypes(fc.cgm.types, T)

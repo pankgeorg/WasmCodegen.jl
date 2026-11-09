@@ -67,6 +67,7 @@ include("foreigncall.jl")
 include("cfunctions.jl")
 include("runtime_ccalls.jl")
 include("pointers.jl")
+include("simd128.jl")
 include("image.jl")
 include("overlays.jl")
 include("host.jl")
@@ -77,6 +78,7 @@ include("driver.jl")
 export compile, Entry, Config, UnsupportedConstructs, install_trim_patches!
 
 function __init__()
+    define_simd_instructions!()
     COMPILER_WORLD[] = Base.get_world_counter()
     Runtime.BUILD_JLOPTIONS[] = Runtime.sanitized_jloptions()
 end
