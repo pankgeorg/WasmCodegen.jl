@@ -108,6 +108,11 @@ rg_vt_storage(n::Int) = (x = tuple(Vector{Any}(collect(1:n))...)::NTuple{70,Int}
 struct RGVt; t::Tuple{Vararg{Union{Int,String}}}; end
 const RG_VT = RGVt((3, "a"))
 rg_vt_field(n::Int) = (a = rg_id(Any[RGVt((n, "a"))])[1]; b = rg_id(Any[RG_VT])[1]; (a === b, objectid(a) == objectid(b)))
+# (`isa` against tuple types of a `where` over the vararg's type, with a free variable in the data type)
+const RG_TV_A = Tuple{T,Vararg{T}} where T
+const RG_TV_B = Tuple{Vararg{T}} where T<:Real
+const RG_TV_VALUES = Any[(1.0, 2.0), (1, 2.5), (1, 2), ("a", "b"), ()]
+rg_vt_typevar(i::Int) = (x = RG_TV_VALUES[i]; (x isa RG_TV_A, x isa RG_TV_B))
 
 # singular values and symmetric eigenvalues of extreme magnitudes (scaled, as LAPACK does)
 rg_svd(x::Float64) = (s = svdvals([x 2x; 3x 4x]); (s[1] / x, s[2] / x, svdvals(fill(x, 1, 1))[1] / x))
@@ -385,6 +390,9 @@ const RG_HOLES = Vector{Any}(undef, 2)
     @wtest rg_vt_absent_egal(17)
     @wtest rg_vt_storage(70)
     @wtest rg_vt_field(3); @wtest rg_vt_field(4)
+    for i in 1:5
+        @wtest rg_vt_typevar(i)
+    end
     @wtest rg_type_tuple(true); @wtest rg_type_tuple(false)
     @wtest rg_type_tuple_loop(1); @wtest rg_type_tuple_loop(2)
     @wtest rg_type_many(1.5)

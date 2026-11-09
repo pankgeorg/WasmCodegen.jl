@@ -940,6 +940,7 @@ function tuple_datatype(@nospecialize(T))
     U = Base.unwrap_unionall(T)
     (U isa DataType && U.name === Tuple.name && Base.isvatuple(U)) || return nothing
     D = Tuple{U.parameters[1:end-1]..., Vararg{Base.unwrapva(U.parameters[end])}}
+    Base.has_free_typevars(D) && return nothing
     return D == T ? D : nothing
 end
 
