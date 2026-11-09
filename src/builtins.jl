@@ -194,7 +194,9 @@ function get_field(fc::FnCtx, x::CGVal, i::Int)
         end
         fl = layout(fc, FT)
         fl.kind === Ghost && return ghost(FT, something(ghost_value(FT)))
-        return CGVal(FT, fl.kind, x.leaves[l.fields[i]])
+        v = CGVal(FT, fl.kind, x.leaves[l.fields[i]])
+        check_field_defined!(fc, T, i, v)
+        return v
     elseif l.kind === Boxed && l.elements !== nothing
         return tuple_array_get!(fc, x, const_value(fc, i))
     elseif l.kind === Boxed && !isempty(l.fields)
@@ -207,11 +209,7 @@ function get_field(fc::FnCtx, x::CGVal, i::Int)
             emit!(fc.b, fields[w].storage isa PackedType ? :struct_get_u : :struct_get, l.wtype, w - 1)
         end
         v = pop_val!(fc, FT)
-        if fl.kind === Boxed && i > fieldcount(T) - T.name.n_uninitialized && !zero_defined(FT)
-            # a field constructors may leave undefined: reading it undefined is an error
-            push_val!(fc, v); emit!(fc.b, :ref_is_null)
-            if!(fc.b); throw_error!(fc, Runtime.throw_undefref_error); end!(fc.b)
-        end
+        check_field_defined!(fc, T, i, v)
         return v
     elseif T === Core.TypeName && fieldname(T, i) === :name
         push_val!(fc, x)
@@ -233,6 +231,44 @@ function get_field(fc::FnCtx, x::CGVal, i::Int)
     else
         unsupported("a field of a value of type ", T)
     end
+end
+
+# whether the field `i` of `T` may be undefined: one constructors may leave out
+maybe_undef_field(@nospecialize(T), i::Int) =
+    T isa DataType && i > fieldcount(T) - T.name.n_uninitialized
+
+"""
+    undef_leaf(ts, FT) -> Union{Int,Nothing}
+
+Of a field of declared type `FT`: the leaf whose null reference is the field undefined, as
+natively its first pointer is (`jl_field_isdefined`, `undefref_check`: the field's own pointer,
+or of an inline type, its first pointer, `first_ptr`); `nothing` where natively the field is
+always defined (no pointers: an isbits value or union).
+"""
+function undef_leaf(ts::Types, @nospecialize(FT))
+    Base.allocatedinline(FT) || return 1   # a pointer natively: one reference here
+    (FT isa DataType && !Base.datatype_pointerfree(FT)) || return nothing
+    is_memoryref_type(FT) && return 1       # (its memory: the address is an offset)
+    l = layout(ts, FT)
+    l.kind === Boxed && return 1            # (a large one, an object here: null if unset)
+    l.kind === Inline || return nothing
+    for j in 1:fieldcount(FT)
+        k = undef_leaf(ts, fieldtype(FT, j))
+        k === nothing || return first(l.fields[j]) - 1 + k
+    end
+    return nothing
+end
+
+# reading the field `i` of `T`, `v`, where constructors may leave it out: an UndefRefError if
+# it is undefined (its `undef_leaf` null), as natively
+function check_field_defined!(fc::FnCtx, @nospecialize(T), i::Int, v::CGVal)
+    maybe_undef_field(T, i) || return
+    FT = fieldtype(T, i)
+    zero_defined(FT) && return
+    k = undef_leaf(fc.cgm.types, FT)
+    (k === nothing || v.kind === Ghost || v.kind === Bottom) && return
+    push_leaf!(fc, v.leaves[k]); emit!(fc.b, :ref_is_null)
+    if!(fc.b); throw_error!(fc, Runtime.throw_undefref_error); end!(fc.b)
 end
 
 # a leaf holding `x`'s reference (its local, or a new local for a constant)
@@ -462,19 +498,24 @@ function emit_isdefined!(fc::FnCtx, x::CGVal, i::Int)
     any(R -> T === R, OPAQUE_RUNTIME_TYPES) &&
         unsupported("isdefined on a field of the runtime object type ", T, " (serialized with its header only)")
     l = layout(fc, T)
-    if l.kind === Boxed && !isempty(l.fields)
-        FT = fieldtype(T, i)
-        fls = field_leaves(fc.cgm.types, FT)
-        if !isempty(fls) && fls[1].type isa RefType
-            tmp = materialize!(fc, x)
-            push_leaf!(fc, tmp)
-            emit!(fc.b, :struct_get, l.wtype, first(l.fields[i]) - 1)
-            emit!(fc.b, :ref_is_null)
-            emit!(fc.b, :i32_eqz)
-            return pop_val!(fc, Bool)
-        end
+    # (natively a field constructors cannot leave out is defined; one they may is defined
+    # where its pointer, or an inline value's first pointer, is not null: `undef_leaf`)
+    (maybe_undef_field(T, i) && !isempty(l.fields) && l.elements === nothing) ||
+        return const_value(fc, true)
+    k = undef_leaf(fc.cgm.types, fieldtype(T, i))
+    k === nothing && return const_value(fc, true)
+    if l.kind === Boxed
+        tmp = materialize!(fc, x)
+        push_leaf!(fc, tmp)
+        emit!(fc.b, :struct_get, l.wtype, l.fields[i][k] - 1)
+    elseif l.kind === Inline
+        push_leaf!(fc, x.leaves[l.fields[i][k]])
+    else
+        return const_value(fc, true)
     end
-    return const_value(fc, true)
+    emit!(fc.b, :ref_is_null)
+    emit!(fc.b, :i32_eqz)
+    return pop_val!(fc, Bool)
 end
 
 """

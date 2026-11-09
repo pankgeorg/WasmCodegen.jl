@@ -18,7 +18,7 @@ const SESSION_TESTS = [
     "basics", "cfunctions", "data", "random", "dicts", "object_graphs", "globals", "exceptions",
     "coverage", "linalg", "eachindex_trim", "task_fields", "ptrcarry", "regressions", "exprs",
     "ir_cache", "progress", "hosts", "import_libraries", "ptrbytes", "ptrhash", "typeof_any",
-    "getfield_any", "invoke_cycle", "reflection_rt", "printing", "runtime", "idset", "unset",
+    "getfield_any", "invoke_cycle", "reflection_rt", "rt_types", "printing", "runtime", "idset", "unset",
     "image_pointers", "vararg_tuples", "split_unions", "versions", "specialize", "invokelatest",
     "staging", "env", "fs", "event", "diagnostics", "type_hash", "foreign_functions",
     "verifier", "juliac/runtests"]

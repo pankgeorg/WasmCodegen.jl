@@ -258,7 +258,7 @@ end
 `new(C, x1, …, xn)` of fields of any type, as `jl_new_structv` does natively: each field is
 checked (`TypeError(:new, "", fieldtype, value)`, the first that does not fit), then the
 object is built (as an `Any`). A case of `new` of a type known only at run time, compiled for
-each concrete type of the module it may be (`new_func!`).
+each concrete type of the module it may be (`add_new_cases!`, `emit_new_rt!`).
 """
 function new_as end
 
@@ -292,8 +292,9 @@ module with that many fields: natively the `TypeError` of a type that is not a c
 
 """
 The error of `Core.apply_type(W, …)` whose result is not one of the module's types (`msg`
-names `W`): types are not made at run time. (An application that is not valid is natively's
-`TypeError` before it: `apply_type_check`.)
+names `W`): the closed-world limit, not a native error. The application is valid (natively's
+errors of one that is not come before it, `apply_type_check`), but types are not made at run
+time: the module has the types its code names.
 """
 # (`apply_type` does not throw for inference, which may have removed the handlers around it:
 # the message is also written to `Core.stderr`, as `throw_typeof_unknown`'s)
@@ -304,6 +305,28 @@ end
 
 "The error of `new(T, …)` of a concrete type `T` with a number of fields it cannot have."
 @noinline throw_invalid_struct_allocation() = error("invalid struct allocation")
+
+"""
+The error of `new(T, …)` of a type known only at run time that is a concrete type the module
+compiled no case of `new` for: the closed-world limit (the type was not among the module's
+when its cases were compiled, or `new` of it is not supported: `String`, `Memory`, …), not a
+native error.
+"""
+@noinline throw_new_closed_world() = error(string(
+    "WasmCodegen: closed-world limit: `new` of a type known only at run time that this module ",
+    "compiled no constructor case for (not among its types when the cases were compiled, or ",
+    "one `new` is not supported for)"))
+
+"""
+The error of `Core.apply_type(Tuple, …)` of a last parameter that is a `Vararg`, which changes
+the number of parameters (`Tuple{Int, Vararg{Int,2}}` is `Tuple{Int,Int,Int}`): not supported.
+"""
+@noinline function throw_apply_type_vararg()
+    msg = string("WasmCodegen: Core.apply_type(Tuple, …) of a Vararg last parameter is not supported ",
+                 "(it changes the number of parameters, known only at run time)")
+    Core.println(Core.stderr, msg)
+    error(msg)
+end
 
 ## the errors of `Core.apply_type` of parameters known only at run time (`jl_f_apply_type`,
 ## `jl_apply_type`, `check_datatype_parameters`): checked where the parameters are not those of
@@ -354,7 +377,7 @@ function apply_type_valid_body(@nospecialize(W), ps)
     for (i, p) in enumerate(ps)
         if W === Tuple
             push!(body.args, :(if $p isa Core.TypeofVararg
-                                   $(i == n ? nothing : :(throw(TypeError(:Tuple, "non-final parameter", Type, $p))))
+                                   $(i == n ? :(throw_apply_type_vararg()) : :(throw(TypeError(:Tuple, "non-final parameter", Type, $p))))
                                elseif !valid_type_param($p)
                                    throw(TypeError(:Tuple, "parameter", Type, $p))
                                end))
@@ -412,10 +435,38 @@ function apply_type_bounds(@nospecialize(W), n::Int)
     return checks
 end
 
-# the checks of `jl_f_apply_type`, then the bounds of `jl_apply_type` (`apply_type_bounds`)
+# the checks of `jl_f_apply_type`, then the bounds of `jl_apply_type` (`apply_type_bounds`);
+# of `Tuple`, then `inst_datatype_inner`'s of a `Union{}` element; of more parameters than `W`
+# has variables, `jl_apply_type`'s error once past them (no bound of theirs is checked natively:
+# a wrapper's are left to `check_datatype_parameters`, which is not reached)
 function apply_type_check_body(@nospecialize(W), ps)
     body = apply_type_valid_body(W, ps)
     pop!(body.args)
+    if W === Tuple
+        for p in ps
+            push!(body.args, :($p === Union{} && error("Tuple field type cannot be Union{}")))
+        end
+        push!(body.args, :(return nothing))
+        return body
+    end
+    U = Base.unwrap_unionall(W)
+    vars = TypeVar[]
+    w = W
+    while w isa UnionAll
+        push!(vars, w.var); w = w.body
+    end
+    if length(ps) > length(vars)
+        # (natively the loop of `jl_apply_type`: each variable's bound as it instantiates, but a
+        # wrapper's first, left to `check_datatype_parameters`, which is not reached)
+        for (i, f, v) in apply_type_bounds(W, length(vars))
+            (v === vars[i] && !(i == 1 && U isa DataType && W === U.name.wrapper)) || continue
+            p = ps[i]
+            push!(body.args, :(within_typevar($p, $(QuoteNode(v.lb)), $(QuoteNode(v.ub))) ||
+                               throw(type_error_rt($(QuoteNode(f)), $(String(v.name)), $(QuoteNode(v)), $p))))
+        end
+        push!(body.args, :(error($(string("too many parameters for type ", U isa DataType ? String(U.name.name) : "")))))
+        return body
+    end
     for (i, f, v) in apply_type_bounds(W, length(ps))
         p = ps[i]
         push!(body.args, :(within_typevar($p, $(QuoteNode(v.lb)), $(QuoteNode(v.ub))) ||

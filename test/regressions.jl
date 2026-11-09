@@ -260,7 +260,7 @@ function rg_bad_param(i::Int, which::Int)
     end
 end
 # a parameter substitution drops (natively `RG_VTUPLE{0,T}` is `Tuple{}`, whose bound of `T` is
-# not checked): here an error, never that type (DESIGN.md)
+# not checked): refused when compiling (`apply_type_shape`, DESIGN.md)
 function rg_erased_bound(n::Int)
     p = RG_PARAMS[2]
     try
@@ -329,20 +329,22 @@ const RG_HOLES = Vector{Any}(undef, 2)
     for n in 1:2
         @wtest rg_valtype_caught(n)
     end
-    # (natively 0: `Val{3}` is a type no code of the module names, an error here, written to
-    # stderr too, as inference may have removed the handler: `apply_type` does not throw for it)
+    # (natively 0: `Val{3}` is a type no code of the module names, the closed-world limit
+    # here, an error written to stderr too, as inference may have removed the handler)
     let r = wasm_run(wcompile(rg_valtype_caught, (Int,)), "rg_valtype_caught", 3; rettype=Int)
         @test r == -1 || (r isa Tuple && r[1] === :trap)
-        @test occursin("not one of this module's", LAST_OUTPUT[])
+        @test occursin("closed-world limit", LAST_OUTPUT[])
     end
     # (of valid parameters, applications whose types code names: others are the closed world's
     # error, as `Val{3}` above)
     for (i, which) in ((1, 1), (1, 2), (2, 1), (2, 2), (3, 1), (3, 2), (3, 3), (4, 1), (4, 2), (4, 3), (4, 4), (5, 4))
         @wtest rg_bad_param(i, which)
     end
+    # (an alias that may erase parameters is refused when compiling: natively `RG_VTUPLE{0,T}`
+    # is `Tuple{}`, a type the module may have, which a lookup by parameters would miss)
     @test rg_erased_bound(0) == 1
-    let r = wasm_run(wcompile(rg_erased_bound, (Int,)), "rg_erased_bound", 0; rettype=Int)
-        @test r in (-1, -2) || (r isa Tuple && r[1] === :trap)
+    let err = try wcompile(rg_erased_bound, (Int,)); nothing catch e; e end
+        @test err isa WasmCodegen.UnsupportedConstructs && occursin("tuple type alias", sprint(showerror, err))
     end
     for flag in (true, false)
         @wtest rg_never_caught(flag)

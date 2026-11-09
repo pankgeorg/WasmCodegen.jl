@@ -463,24 +463,51 @@ as other pointers of the build process are.
   them and the image. `Core.apply_type` and `new` of types known only at run time
   (a closure capturing a variable of a small union is `new(apply_type(#f, typeof(v)), v)`)
   are the builtins at run time, as natively (`jl_f_apply_type`, `jl_new_structv`), over the
-  module's types: `apply_type(W, ps...)` calls `jl_apply_type_<W>`, the instantiations of
-  `W` the module has (the closed world's cache of them), found by their parameters (type
-  objects by reference, other values with `jl_egal`); one the module does not have is an
-  error (written to `Core.stderr` too: `apply_type` does not throw for inference). Before
-  it, parameters that may not be ones, or outside their variable's bounds, are native's
-  `TypeError` (`Runtime.apply_type_check`). Some native errors and results are the closed
-  world's error instead: a bound that depends on an earlier parameter (`S<:T`) and the
-  checks made while making the type (a `NamedTuple`'s names, a `Vararg`'s count). So are
-  erased parameters: an instantiation whose parameters do not all appear in it (`Tuple{}` of
-  `NTuple{0,T}`) is never found by them, and an erased parameter outside its bound is a
-  `TypeError` natively skipped once it is erased. And of an alias, whose bounds and its
-  type's are checked each list in turn, where natively they interleave, the `TypeError` may
-  name another parameter than native's first.
-  `new(T, xs...)` calls `jl_new_<n>`, which goes by the type id of `T` to `Runtime.new_as`
-  compiled for each concrete type of the module some `new` site's `T` may be by inference
-  (`T` of type `DataType`, which would be every type, is not supported; the cases of a
-  program function's site are the program's code, with its errors): it checks the
-  fields (`TypeError(:new, ...)`) and builds the object, as `jl_new_structv`. Printing a type (juliac's `show`,
+  module's types. `apply_type(W, ps...)` calls `jl_apply_type_<W>`, the instantiations of
+  `W` the module has (the closed world's cache of them), found by their parameters: other
+  values than types with `jl_egal`, types by reference to each of the module's type objects
+  that natively gives the same type in their place (the cache takes a type equal to the
+  parameter, `typekey_eq`, after normalizing it: `Val{Tuple{S,S} where S}` is
+  `Val{Tuple{T,T} where T}`), decided by applying `W` to them when the module is finished.
+  Where none matches, parameters that may not be ones, or outside their variable's bounds,
+  are native's `TypeError` (`Runtime.apply_type_check`, its `expected` the `TypeVar`), as are
+  a `Union{}` element of a tuple type and too many parameters; else the closed-world limit:
+  an error that says the type is valid but was not compiled into the module (types are not
+  made at run time: the module has the types its code names), written to `Core.stderr` too,
+  as inference may treat the call as not throwing (it does where the types of the parameters
+  make the application valid) and remove the handlers around it. Some native errors are the
+  closed-world limit instead: a bound that depends on an earlier parameter (`S<:T`) and the
+  checks made while making the type (a `NamedTuple`'s names); and of an alias, whose bounds
+  and its type's are checked each list in turn, where natively they interleave, the
+  `TypeError` may name another parameter than native's first. Supported shapes, where one
+  recovered parameter list per type is a complete inverse (no parameter erased, so a type
+  the module has is never reported missing): `Tuple`, and a `UnionAll` each of whose type
+  variables is a parameter of the type it makes and nowhere else in it (`Val`, `Vector`,
+  `Dict`, a closure's type), with at most 16 parameters. Refused when compiling: an alias
+  that may erase or normalize parameters away (`NTuple{0,T}` is `Tuple{}` for every `T`),
+  `Type`, a partial application (a `UnionAll` made at run time), a wrapper not known at
+  compile time, and a parameter of a tuple type inference says is a `Vararg` (it changes the
+  number of parameters; a last one it cannot rule out is an error at run time that says it
+  is not supported). `new(T, xs...)` calls `jl_new_<n>`, which goes by the type id of `T` to
+  `Runtime.new_as` compiled for each concrete type of the module some `new` site's `T` may be
+  by inference, `Type{<:X}` (`T` of type `DataType` or `Type`, which would be every type, is
+  not supported; nor are more than 16 fields): it checks the fields (`TypeError(:new, ...)`,
+  without converting) and builds the object, as `jl_new_structv`; a case that always throws
+  (a field of type `Union{}`) returns nothing. A wrong number of fields is the native
+  "invalid struct allocation", a type that is not concrete the native `TypeError`; a concrete
+  type with no case (one the module had not when its cases were compiled, or `String`,
+  `Memory`, ... `new` is not supported for) is the closed-world limit. The cases of a program
+  function's site are the program's code, with its errors. The rows and cases are compiled
+  in the fixed point of the runtime cases above, which ends: each (helper, type) pair is
+  considered once, and what a row or a case adds is a parameter or field type of a type the
+  module has (a part of it), or a type of the closed world's code, of which there are
+  finitely many. Their size is linear in the rows (each row tests each parameter): with
+  `progress` the sizes are reported per wrapper and number of parameters and per number of
+  fields, and above 512 rows a warning says so. (They keep dictionaries of their own, as
+  `by_type` does, sharing `getfield_any`'s promotion of cases: the source of the type id, the
+  result and the arity differ.) A field constructors may leave out is undefined natively
+  where its pointer, or an inline value's first pointer, is null: `isdefined` and reading it
+  test that reference leaf. Printing a type (juliac's `show`,
   which reflects on it) is a foldable function returning its name as a Symbol, so that
   inference computes it for a type known at compile time (a `Union` or `UnionAll` is not
   a constant for inference: printing one at run time needs reflection, not supported).
