@@ -703,6 +703,8 @@ end
 # the element at the (1-based, Int) index `idx` of the array in local `arr`, stored as `ml`
 function array_element_get!(fc::FnCtx, arr::Int, ml::MemoryLayout, idx::CGVal)
     E = ml.elem.T
+    # (an element without leaves is not stored: the singleton)
+    ml.elem.kind === Ghost && return ghost(E, something(ghost_value(E)))
     pos = new_local!(fc, I32)
     push_val!(fc, idx)
     emit!(fc.b, :i32_wrap_i64)
@@ -758,6 +760,14 @@ function new_tuple_array!(fc::FnCtx, @nospecialize(T), args::Vector{CGVal})
     ts = fc.cgm.types
     emit!(fc.b, :i32_const, typeid!(ts, T))
     emit!(fc.b, :i32_const, 0)
+    if ml.elem.kind === Ghost || ml.elem.kind === Bottom
+        # (elements without leaves, `Tuple{Vararg{Nothing}}`: the array's length is the tuple's,
+        # as in `convert_tuple_array!`)
+        emit!(fc.b, :i32_const, length(args) * ml.stride)
+        emit!(fc.b, :array_new_default, ml.array)
+        emit!(fc.b, :struct_new, l.wtype)
+        return pop_val!(fc, T)
+    end
     for a in args
         v = convert_repr(fc, a, E)
         if ml.boxed
