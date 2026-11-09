@@ -154,9 +154,11 @@ function emit_function!(cgm::CGModule, info::FuncInfo)
     analyze_ptr_carries!(fc, sci.entry)
     analyze_split_unions!(fc, sci.entry)
     bind_arguments!(fc)
+    bind_ptr_views!(fc)
     bind_handler_args!(fc, sci.entry)
     emit_block!(fc, sci.entry)
     is_unreachable(b) || unreachable!(b)
+    entry_ptr_views!(fc)
     finish!(b)
     return info
 end
