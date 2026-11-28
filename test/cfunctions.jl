@@ -135,6 +135,17 @@ function catch_wrong(x::Float64)
     keep = @cfunction(fromint, Float64, (Int32,))
     return caught(z -> ccall(OTHER[], Float64, (Int32,), Int32(1)) + ccall(keep, Float64, (Int32,), Int32(2)), x)
 end
+# a signature no `cfunction` of the module has: an ErrorException when the call is reached, and
+# no error of a call that is not (a list of callbacks that stays empty)
+catch_unmade(x::Float64) = caught(bad_call, x)
+const CALLBACKS = Ptr{Cvoid}[]
+function unreached(x::Float64)
+    s = x
+    for p in CALLBACKS
+        s += ccall(p, Float64, (Float64, Float64, Float64), x, x, x)
+    end
+    return s
+end
 
 ## what is reported
 
@@ -145,7 +156,6 @@ ignored(x::Float64) = x + 1.0
 void_of_value(x::Float64) = @cfunction(ignored, Cvoid, (Float64,))
 constant_target(x::Float64) = ccall(Ptr{Cvoid}(UInt(0x1234)), Float64, (Float64,), x)
 null_target(x::Float64) = ccall(Ptr{Cvoid}(UInt(0)), Float64, (Float64,), x)
-no_cfunction(x::Float64, p::Ptr{Cvoid}) = ccall(p, Float64, (Float64,), x)
 variadic(x::Float64) = ccall(@cfunction(add1, Float64, (Float64,)), Float64, (Float64, Float64...), x, x)
 mutable struct Cell
     x::Int
@@ -191,6 +201,9 @@ end
     c = compile([Entry(P.catch_null, (Float64,)), Entry(P.catch_wrong, (Float64,))]; config = WasmCodegen.Config(verify = :off))
     @test wasm_run(c, "catch_null", 1.0; rettype = Float64) === P.catch_null(1.0)
     @test wasm_run(c, "catch_wrong", 1.0; rettype = Float64) === 11.0
+    c = compile([Entry(P.catch_unmade, (Float64,)), Entry(P.unreached, (Float64,))]; config = WasmCodegen.Config(verify = :off))
+    @test wasm_run(c, "catch_unmade", 1.0; rettype = Float64) === 11.0
+    @test wasm_run(c, "unreached", 1.5; rettype = Float64) === P.unreached(1.5)
 
     function report(f, argtypes)
         e = try
@@ -207,8 +220,6 @@ end
     @test occursin("a cfunction whose function returns", report(P.void_of_value, (Float64,)))
     @test occursin("a pointer of the build process", report(P.constant_target, (Float64,)))
     @test occursin("a ccall through the constant pointer", report(P.null_target, (Float64,)))
-    @test occursin("which no cfunction of the module has", report(P.no_cfunction, (Float64, Ptr{Cvoid})))
-    @test occursin("which no cfunction of the module has", report(P.bad_call, (Float64,)))
     @test occursin("a variadic ccall", report(P.variadic, (Float64,)))
     # what native Julia copies (a mutable struct by value) or cannot compile (an argument of no
     # size, a result by value that holds references)

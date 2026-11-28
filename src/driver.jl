@@ -213,7 +213,6 @@ function emit_module(w::ClosedWorld, mis::Vector{Core.MethodInstance}, entries::
         EXCEPTION_MODES[m] > EXCEPTION_MODES[mode] || break
         mode = m
     end
-    check_cfunction_calls!(cgm)
     if cgm.config.trim === :safe && !isempty(cgm.diagnostics)
         throw(UnsupportedConstructs(cgm.diagnostics))
     end

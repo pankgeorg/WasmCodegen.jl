@@ -2,8 +2,9 @@
 # table of them, as a C program compiled to Wasm has: a `cfunction` pointer has no owner, its
 # address is `CFUNCTION_BASE` plus the function's slot (from 1), and a `ccall` through a pointer
 # finds the slot, checks the function's Wasm type against the call's signature and calls it. A
-# signature no `cfunction` of the module has is reported when the module is compiled; a pointer
-# that is not a function of its call's signature is an error of the program when it is called.
+# pointer that is not a function of its call's signature is an error of the program when it is
+# called, also when no `cfunction` of the module has that signature: such a call compiles, as
+# natively, since a program may never reach it (a list of callbacks that stays empty).
 #
 # The two sides of a call declare their types separately: a `cfunction` says `Ref{T}` where the
 # `ccall` says `Ptr{Cvoid}` or `Any`, all of them C pointers. So every C pointer has one Wasm
@@ -174,20 +175,6 @@ function finish_cfunctions!(cgm::CGModule)
     return
 end
 
-"Report the calls through pointers whose signature no `cfunction` of the module has."
-function check_cfunction_calls!(cgm::CGModule)
-    calls = get(cgm.helpers, :cfunction_calls, nothing)
-    calls === nothing && return
-    _, _, funcs = cfunction_table!(cgm)
-    for (sig, (mi, rt, argts)) in calls
-        any(f -> f.type == sig, funcs) && continue
-        err = Unsupported("a ccall through a pointer with the signature ", argts, " -> ", rt,
-                          ", which no cfunction of the module has")
-        push!(err.context, mi)
-        push!(cgm.diagnostics, mi => err)
-    end
-end
-
 "`Expr(:cfunction, Ptr{Cvoid}, f, rt, argts, cc)`: the pointer to `f` for a function known at compile time."
 function emit_cfunction!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     typ === Ptr{Cvoid} || unsupported("a cfunction of a closure value (a ", typ, ")")
@@ -259,8 +246,6 @@ function emit_indirect_ccall!(fc::FnCtx, target::CGVal, ex::Expr, args::Vector{A
     cgm = fc.cgm
     params, results = c_signature(cgm, rt, argts)
     sig = WasmBuilder.functype!(cgm.mod, params, results)
-    calls = get!(() -> Dict{TypeRef,Any}(), cgm.helpers, :cfunction_calls)
-    haskey(calls, sig) || (calls[sig] = (fc.info.mi, rt, argts))
     for (v, T) in zip(args, argts)
         push_c_value!(fc, v::CGVal, T)
     end
